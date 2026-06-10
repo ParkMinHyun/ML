@@ -383,7 +383,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return PreExecutionMetrics(
             budgetMs = timeoutMs - System.currentTimeMillis(),
             memorySnapshot = deviceState.memorySnapshot,
-            powerThermalSnapshot = deviceState.powerThermalSnapshot,
+            thermalSnapshot = deviceState.thermalSnapshot,
             storageSnapshot = deviceState.storageSnapshot,
         )
     }

@@ -56,7 +56,7 @@ fun NodeExecutionMetrics.toEntity(
         inputImageWidth = inputImageSize.width,
         inputImageHeight = inputImageSize.height,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
-        powerThermalSnapshot = preExecution.powerThermalSnapshot.toEntity(),
+        thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
         storageSnapshot = preExecution.storageSnapshot.toEntity(),
         gcSnapshot = postExecution.gcSnapshot?.toEntity(),
         cpuProcessingSnapshot = postExecution.cpuProcessingSnapshot?.toEntity(),
@@ -130,10 +130,8 @@ fun MemorySnapshot.toEntity(): MemorySnapshotEntity {
     )
 }
 
-fun PowerThermalSnapshot.toEntity(): PowerThermalSnapshotEntity {
-    return PowerThermalSnapshotEntity(
-        isPowerSaveMode = isPowerSaveMode,
-        isCharging = isCharging,
+fun ThermalSnapshot.toEntity(): ThermalSnapshotEntity {
+    return ThermalSnapshotEntity(
         overheatLevel = overheatLevel,
         thermalStatus = thermalStatus,
         thermalHeadroom = thermalHeadroom,
@@ -159,7 +157,7 @@ fun SavingExecutionMetrics.toEntity(
         resultImageHeight = resultImageSize.height,
         resultImageFormat = resultImageFormat,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
-        powerThermalSnapshot = preExecution.powerThermalSnapshot.toEntity(),
+        thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
         storageSnapshot = preExecution.storageSnapshot.toEntity(),
         gcSnapshot = postExecution.gcSnapshot?.toEntity(),
         cpuProcessingSnapshot = postExecution.cpuProcessingSnapshot?.toEntity(),
@@ -216,7 +214,7 @@ fun SavingExecutionMetricsEntity.toModel(): SavingExecutionMetrics {
         preExecutionMetrics = PreExecutionMetrics(
             budgetMs = budgetMs,
             memorySnapshot = memorySnapshot.toModel(),
-            powerThermalSnapshot = powerThermalSnapshot.toModel(),
+            thermalSnapshot = thermalSnapshot.toModel(),
             storageSnapshot = storageSnapshot.toModel(),
         ),
         postExecutionMetrics = PostExecutionMetrics(
@@ -250,7 +248,7 @@ private fun NodeExecutionMetricsEntity.toPreExecutionMetrics(): PreExecutionMetr
     return PreExecutionMetrics(
         budgetMs = budgetMs,
         memorySnapshot = memorySnapshot.toModel(),
-        powerThermalSnapshot = powerThermalSnapshot.toModel(),
+        thermalSnapshot = thermalSnapshot.toModel(),
         storageSnapshot = storageSnapshot.toModel(),
     )
 }
@@ -289,10 +287,8 @@ fun MemorySnapshotEntity.toModel(): MemorySnapshot {
     )
 }
 
-fun PowerThermalSnapshotEntity.toModel(): PowerThermalSnapshot {
-    return PowerThermalSnapshot(
-        isPowerSaveMode = isPowerSaveMode,
-        isCharging = isCharging,
+fun ThermalSnapshotEntity.toModel(): ThermalSnapshot {
+    return ThermalSnapshot(
         overheatLevel = overheatLevel,
         thermalStatus = thermalStatus,
         thermalHeadroom = thermalHeadroom,

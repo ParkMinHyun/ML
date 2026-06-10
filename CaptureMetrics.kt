@@ -47,7 +47,7 @@ sealed interface NodeParams {
 data class PreExecutionMetrics(
     val budgetMs: Long,
     val memorySnapshot: MemorySnapshot,
-    val powerThermalSnapshot: PowerThermalSnapshot,
+    val thermalSnapshot: ThermalSnapshot,
     val storageSnapshot: StorageSnapshot,
 )
 

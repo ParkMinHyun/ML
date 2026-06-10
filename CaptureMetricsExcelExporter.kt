@@ -213,11 +213,9 @@ class CaptureMetricsExcelExporter(
             Column("nativeHeapAllocatedPercent") { it.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
 
             // pre-execution power / thermal snapshot
-            Column("isPowerSaveMode") { it.node.preExecutionMetrics.powerThermalSnapshot.isPowerSaveMode },
-            Column("isCharging") { it.node.preExecutionMetrics.powerThermalSnapshot.isCharging },
-            Column("overheatLevel") { it.node.preExecutionMetrics.powerThermalSnapshot.overheatLevel },
-            Column("thermalStatus") { it.node.preExecutionMetrics.powerThermalSnapshot.thermalStatus },
-            Column("thermalHeadroom") { it.node.preExecutionMetrics.powerThermalSnapshot.thermalHeadroom },
+            Column("overheatLevel") { it.node.preExecutionMetrics.thermalSnapshot.overheatLevel },
+            Column("thermalStatus") { it.node.preExecutionMetrics.thermalSnapshot.thermalStatus },
+            Column("thermalHeadroom") { it.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
 
             // pre-execution storage snapshot
             Column("storageUsedPercent") { it.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
@@ -257,11 +255,9 @@ class CaptureMetricsExcelExporter(
             Column("nativeHeapAllocatedPercent") { it.saving.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
 
             // pre-execution power / thermal snapshot
-            Column("isPowerSaveMode") { it.saving.preExecutionMetrics.powerThermalSnapshot.isPowerSaveMode },
-            Column("isCharging") { it.saving.preExecutionMetrics.powerThermalSnapshot.isCharging },
-            Column("overheatLevel") { it.saving.preExecutionMetrics.powerThermalSnapshot.overheatLevel },
-            Column("thermalStatus") { it.saving.preExecutionMetrics.powerThermalSnapshot.thermalStatus },
-            Column("thermalHeadroom") { it.saving.preExecutionMetrics.powerThermalSnapshot.thermalHeadroom },
+            Column("overheatLevel") { it.saving.preExecutionMetrics.thermalSnapshot.overheatLevel },
+            Column("thermalStatus") { it.saving.preExecutionMetrics.thermalSnapshot.thermalStatus },
+            Column("thermalHeadroom") { it.saving.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
 
             // pre-execution storage snapshot
             Column("storageUsedPercent") { it.saving.preExecutionMetrics.storageSnapshot.storageUsedPercent },

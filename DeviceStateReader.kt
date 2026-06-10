@@ -1,7 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
 import android.app.ActivityManager
-import android.os.BatteryManager
 import android.os.Debug
 import android.os.Environment
 import android.os.PowerManager
@@ -18,7 +17,6 @@ import kotlinx.coroutines.runBlocking
 class DeviceStateReader(
     private val activityManager: ActivityManager,
     private val powerManager: PowerManager,
-    private val batteryManager: BatteryManager,
     private val overheatLevelSupplier: Supplier<Int>,
 ) {
 
@@ -34,8 +32,8 @@ class DeviceStateReader(
                 readMemoryState()
             }
 
-            val readingPowerThermalState = async(Dispatchers.IO) {
-                readPowerThermalState()
+            val readingThermalState = async(Dispatchers.IO) {
+                readThermalState()
             }
 
             val readingStorageState = async(Dispatchers.IO) {
@@ -44,7 +42,7 @@ class DeviceStateReader(
 
             DeviceStateSnapshot(
                 memorySnapshot = readingMemoryState.await(),
-                powerThermalSnapshot = readingPowerThermalState.await(),
+                thermalSnapshot = readingThermalState.await(),
                 storageSnapshot = readingStorageState.await(),
             )
         }
@@ -83,7 +81,7 @@ class DeviceStateReader(
         )
     }
 
-    private fun readPowerThermalState(): PowerThermalSnapshot {
+    private fun readThermalState(): ThermalSnapshot {
         val thermalStatus = powerManager.currentThermalStatus
 
         val thermalHeadroom = powerManager.getThermalHeadroom(0)
@@ -91,9 +89,7 @@ class DeviceStateReader(
             ?.let { (round(it * 1000) / 1000f) }
             ?: -1f
 
-        return PowerThermalSnapshot(
-            isPowerSaveMode = powerManager.isPowerSaveMode,
-            isCharging = batteryManager.isCharging,
+        return ThermalSnapshot(
             overheatLevel = overheatLevelSupplier.get(),
             thermalStatus = thermalStatus,
             thermalHeadroom = thermalHeadroom,

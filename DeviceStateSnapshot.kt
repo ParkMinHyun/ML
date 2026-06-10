@@ -2,7 +2,7 @@ package com.samsung.android.camera.core2.ml
 
 data class DeviceStateSnapshot(
     val memorySnapshot: MemorySnapshot,
-    val powerThermalSnapshot: PowerThermalSnapshot,
+    val thermalSnapshot: ThermalSnapshot,
     val storageSnapshot: StorageSnapshot,
 )
 
@@ -13,9 +13,7 @@ data class MemorySnapshot(
     val nativeHeapAllocatedPercent: Int,
 )
 
-data class PowerThermalSnapshot(
-    val isPowerSaveMode: Boolean,
-    val isCharging: Boolean,
+data class ThermalSnapshot(
     val overheatLevel: Int,
     val thermalStatus: Int,
     val thermalHeadroom: Float,

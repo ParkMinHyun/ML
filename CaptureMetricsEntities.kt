@@ -100,8 +100,8 @@ data class NodeExecutionMetricsEntity(
     @Embedded(prefix = "memory_")
     val memorySnapshot: MemorySnapshotEntity,
 
-    @Embedded(prefix = "power_")
-    val powerThermalSnapshot: PowerThermalSnapshotEntity,
+    @Embedded(prefix = "thermal_")
+    val thermalSnapshot: ThermalSnapshotEntity,
 
     @Embedded(prefix = "storage_")
     val storageSnapshot: StorageSnapshotEntity,
@@ -202,8 +202,8 @@ data class SavingExecutionMetricsEntity(
     @Embedded(prefix = "memory_")
     val memorySnapshot: MemorySnapshotEntity,
 
-    @Embedded(prefix = "power_")
-    val powerThermalSnapshot: PowerThermalSnapshotEntity,
+    @Embedded(prefix = "thermal_")
+    val thermalSnapshot: ThermalSnapshotEntity,
 
     @Embedded(prefix = "storage_")
     val storageSnapshot: StorageSnapshotEntity,
@@ -232,13 +232,7 @@ data class MemorySnapshotEntity(
     val nativeHeapAllocatedPercent: Int,
 )
 
-data class PowerThermalSnapshotEntity(
-    @ColumnInfo(name = "is_power_save_mode")
-    val isPowerSaveMode: Boolean,
-
-    @ColumnInfo(name = "is_charging")
-    val isCharging: Boolean,
-
+data class ThermalSnapshotEntity(
     @ColumnInfo(name = "overheat_level")
     val overheatLevel: Int,
 
