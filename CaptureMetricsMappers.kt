@@ -16,9 +16,9 @@ fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
         ppSequenceId = ppSequenceId,
         dsMode = dsMode,
         dsExtraInfo = dsExtraInfo,
-        resultImageFormat = resultImageFormat,
         resultImageWidth = resultImageSize.width,
         resultImageHeight = resultImageSize.height,
+        resultImageFormat = resultImageFormat,
         resultImageFileName = resultImageFileName,
     )
 }
@@ -116,6 +116,8 @@ fun CpuProcessingSnapshot.toEntity(): CpuProcessingSnapshotEntity {
         cpuTimeMs = cpuTimeMs,
         wallTimeMs = wallTimeMs,
         cpuUtilizationRatio = cpuUtilizationRatio,
+        runqueueWaitMs = runqueueWaitMs,
+        nonvoluntaryCtxSwitches = nonvoluntaryCtxSwitches,
     )
 }
 
@@ -170,8 +172,8 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
         ppSequenceId = capture.ppSequenceId,
         dsMode = capture.dsMode,
         dsExtraInfo = capture.dsExtraInfo,
-        resultImageFormat = capture.resultImageFormat,
         resultImageSize = Size(capture.resultImageWidth, capture.resultImageHeight),
+        resultImageFormat = capture.resultImageFormat,
         resultImageFileName = capture.resultImageFileName,
         draftSequenceMetrics = draftSequenceMetrics?.toModel(
             nodeExecutionMetricsList = nodeExecutionMetrics
@@ -273,6 +275,8 @@ fun CpuProcessingSnapshotEntity.toModel(): CpuProcessingSnapshot {
         cpuTimeMs = cpuTimeMs,
         wallTimeMs = wallTimeMs,
         cpuUtilizationRatio = cpuUtilizationRatio,
+        runqueueWaitMs = runqueueWaitMs,
+        nonvoluntaryCtxSwitches = nonvoluntaryCtxSwitches,
     )
 }
 

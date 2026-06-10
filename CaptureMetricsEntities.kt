@@ -22,14 +22,14 @@ data class CaptureMetricsEntity(
     @ColumnInfo(name = "ds_extra_info")
     val dsExtraInfo: Int,
 
-    @ColumnInfo(name = "result_image_format")
-    val resultImageFormat: Int,
-
     @ColumnInfo(name = "result_image_width")
     val resultImageWidth: Int,
 
     @ColumnInfo(name = "result_image_height")
     val resultImageHeight: Int,
+
+    @ColumnInfo(name = "result_image_format")
+    val resultImageFormat: Int,
 
     @ColumnInfo(name = "result_image_file_name")
     val resultImageFileName: String,
@@ -271,4 +271,10 @@ data class CpuProcessingSnapshotEntity(
 
     @ColumnInfo(name = "utilization_ratio")
     val cpuUtilizationRatio: Float,
+
+    @ColumnInfo(name = "runqueue_wait_ms")
+    val runqueueWaitMs: Long,
+
+    @ColumnInfo(name = "nonvoluntary_ctx_switches")
+    val nonvoluntaryCtxSwitches: Int,
 )

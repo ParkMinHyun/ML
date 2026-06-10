@@ -234,6 +234,8 @@ class CaptureMetricsExcelExporter(
             Column("cpuTimeMs") { it.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
             Column("cpuWallTimeMs") { it.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
             Column("cpuUtilizationRatio") { it.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuUtilizationRatio },
+            Column("runqueueWaitMs") { it.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
+            Column("nonvoluntaryCtxSwitches") { it.node.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
             Column("durationMs") { it.node.postExecutionMetrics.durationMs },
         )
 
@@ -276,6 +278,8 @@ class CaptureMetricsExcelExporter(
             Column("cpuTimeMs") { it.saving.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
             Column("cpuWallTimeMs") { it.saving.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
             Column("cpuUtilizationRatio") { it.saving.postExecutionMetrics.cpuProcessingSnapshot?.cpuUtilizationRatio },
+            Column("runqueueWaitMs") { it.saving.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
+            Column("nonvoluntaryCtxSwitches") { it.saving.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
             Column("durationMs") { it.saving.postExecutionMetrics.durationMs },
         )
 

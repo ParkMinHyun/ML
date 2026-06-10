@@ -9,10 +9,10 @@ import androidx.room.Transaction
 abstract class CaptureMetricsDao {
 
     @Insert
-    protected abstract suspend fun insert(entity: CaptureMetricsEntity): Long
+    protected abstract suspend fun insertCaptureMetrics(entity: CaptureMetricsEntity): Long
 
     @Insert
-    protected abstract suspend fun insert(entity: DraftSequenceMetricsEntity)
+    protected abstract suspend fun insertDraftSequenceMetrics(entity: DraftSequenceMetricsEntity)
 
     @Insert
     protected abstract suspend fun insertNodeExecutionMetrics(entities: List<NodeExecutionMetricsEntity>)
@@ -21,14 +21,14 @@ abstract class CaptureMetricsDao {
     protected abstract suspend fun insertExecutionPredictions(entities: List<ExecutionPredictionEntity>)
 
     @Insert
-    protected abstract suspend fun insert(entity: SavingExecutionMetricsEntity)
+    protected abstract suspend fun insertSavingExecutionMetrics(entity: SavingExecutionMetricsEntity)
 
     @Transaction
     open suspend fun insertMetrics(metrics: CaptureMetrics): Int {
-        val captureMetricsId = insert(metrics.toCaptureEntity()).toInt()
+        val captureMetricsId = insertCaptureMetrics(metrics.toCaptureEntity()).toInt()
 
         metrics.draftSequenceMetrics?.let { draft ->
-            insert(draft.toEntity(captureMetricsId))
+            insertDraftSequenceMetrics(draft.toEntity(captureMetricsId))
 
             val nodeExecutionMetricsEntities = draft.nodeExecutionMetricsList
                 .toNodeExecutionMetricsEntities(captureMetricsId)
@@ -47,7 +47,7 @@ abstract class CaptureMetricsDao {
             }
 
             draft.savingExecutionMetrics?.let { saving ->
-                insert(saving.toEntity(captureMetricsId))
+                insertSavingExecutionMetrics(saving.toEntity(captureMetricsId))
             }
         }
 

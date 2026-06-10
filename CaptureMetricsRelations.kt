@@ -23,11 +23,11 @@ data class CaptureMetricsAggregate(
         parentColumn = "capture_metrics_id",
         entityColumn = "capture_metrics_id",
     )
-    val executionPredictions: List<ExecutionPredictionEntity>,
+    val savingExecutionMetrics: SavingExecutionMetricsEntity?,
 
     @Relation(
         parentColumn = "capture_metrics_id",
         entityColumn = "capture_metrics_id",
     )
-    val savingExecutionMetrics: SavingExecutionMetricsEntity?,
+    val executionPredictions: List<ExecutionPredictionEntity>,
 )

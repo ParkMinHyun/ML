@@ -6,8 +6,8 @@ data class CaptureMetrics @JvmOverloads constructor(
     val ppSequenceId: Int,
     val dsMode: Int,
     val dsExtraInfo: Int,
-    val resultImageFormat: Int,
     val resultImageSize: Size,
+    val resultImageFormat: Int,
     val resultImageFileName: String,
     var draftSequenceMetrics: DraftSequenceMetrics? = null,
 )
