@@ -37,7 +37,7 @@ abstract class CaptureMetricsDao {
             }
 
             val predictionEntities = buildList {
-                addAll(draft.executionPredictionList.toNodePredictionEntities(captureMetricsId))
+                addAll(draft.nodeExecutionPredictionList.toNodePredictionEntities(captureMetricsId))
                 draft.savingExecutionPrediction?.let {
                     add(it.toSavingPredictionEntity(captureMetricsId))
                 }

@@ -180,7 +180,7 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
                 .sortedBy { it.order }
                 .map { it.toModel() }
                 .toMutableList(),
-            executionPredictionList = executionPredictions
+            nodeExecutionPredictionList = executionPredictions
                 .filter { it.target == ExecutionPredictionEntity.PredictionTarget.NODE.name }
                 .sortedBy { it.order }
                 .map { it.toModel() }
@@ -195,13 +195,13 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
 
 fun DraftSequenceMetricsEntity.toModel(
     nodeExecutionMetricsList: MutableList<NodeExecutionMetrics>,
-    executionPredictionList: MutableList<ExecutionPrediction>,
+    nodeExecutionPredictionList: MutableList<ExecutionPrediction>,
     savingExecutionMetrics: SavingExecutionMetrics?,
     savingExecutionPrediction: ExecutionPrediction?,
 ): DraftSequenceMetrics {
     return DraftSequenceMetrics(
         nodeExecutionMetricsList = nodeExecutionMetricsList,
-        executionPredictionList = executionPredictionList,
+        nodeExecutionPredictionList = nodeExecutionPredictionList,
         isTimeout = isTimeout,
         savingExecutionMetrics = savingExecutionMetrics,
         savingExecutionPrediction = savingExecutionPrediction,

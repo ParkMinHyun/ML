@@ -1,23 +1,28 @@
 package com.samsung.android.camera.core2.ml
 
+import android.content.Context
 import android.os.SystemClock
 import android.util.Size
+import com.samsung.android.camera.core2.util.CLog
+import java.util.function.Consumer
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToLong
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 interface DraftSequenceExecutionPredictor {
     val name: String
 
     fun predict(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction
 
     fun update(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     )
@@ -41,7 +46,6 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     @Synchronized
     override fun predict(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val budgetMs = preExecutionMetrics.budgetMs
@@ -82,7 +86,6 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     @Synchronized
     override fun update(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
@@ -126,25 +129,108 @@ private class EwmaStats {
     }
 }
 
-class DraftSequenceExecutionAdmissionController @JvmOverloads constructor(
+/** Owns a [DraftSequenceExecutionPredictor] and routes predictions / completion updates to it. */
+class DraftSequenceExecutionPredictionManager @JvmOverloads constructor(
     private val predictor: DraftSequenceExecutionPredictor = EwmaDraftSequenceExecutionPredictor(),
 ) {
 
     fun predict(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        return predictor.predict(executionKey, inputImageSize, preExecutionMetrics)
+        return predictor.predict(executionKey, preExecutionMetrics)
     }
 
     fun updateAfterCompletion(
         executionKey: String,
-        inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
-        predictor.update(executionKey, inputImageSize, preExecutionMetrics, postExecutionMetrics)
+        predictor.update(executionKey, preExecutionMetrics, postExecutionMetrics)
+    }
+
+    /** Replays persisted capture history into the predictor. Returns the sample count fed. */
+    fun warmUpFromHistory(history: List<CaptureMetrics>): Int {
+        var updatedCount = 0
+
+        history.forEach { captureMetrics ->
+            val draftMetrics = captureMetrics.draftSequenceMetrics ?: return@forEach
+            if (draftMetrics.isTimeout == true) {
+                return@forEach
+            }
+
+            draftMetrics.nodeExecutionMetricsList.forEach { node ->
+                if (node.postExecutionMetrics.durationMs > 0L) {
+                    updateAfterCompletion(
+                        executionKey = node.nodeId,
+                        preExecutionMetrics = node.preExecutionMetrics,
+                        postExecutionMetrics = node.postExecutionMetrics,
+                    )
+                    updatedCount++
+                }
+            }
+
+            draftMetrics.savingExecutionMetrics?.let { saving ->
+                if (saving.postExecutionMetrics.durationMs > 0L) {
+                    updateAfterCompletion(
+                        executionKey = SAVING_EXECUTION_KEY,
+                        preExecutionMetrics = saving.preExecutionMetrics,
+                        postExecutionMetrics = saving.postExecutionMetrics,
+                    )
+                    updatedCount++
+                }
+            }
+        }
+
+        return updatedCount
+    }
+
+    companion object {
+        private const val TAG = "DraftSequenceExecutionPredictionManager"
+
+        /**
+         * Process-wide instance. The predictor's learned state lives here, so trackers created
+         * per capture keep accumulating across captures instead of cold-starting every time.
+         */
+        @JvmStatic
+        val instance: DraftSequenceExecutionPredictionManager = DraftSequenceExecutionPredictionManager()
+
+        private val warmUpScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        @Volatile
+        private var warmUpStarted: Boolean = false
+
+        /**
+         * Feeds [instance] with the capture history stored in the metrics database, restoring
+         * the learned state lost on process death. Call once at process start; subsequent calls
+         * are no-ops. Retries are allowed after a failure.
+         */
+        @JvmStatic
+        @JvmOverloads
+        @Synchronized
+        fun warmUp(context: Context, callback: Consumer<Int>? = null) {
+            if (warmUpStarted) {
+                return
+            }
+            warmUpStarted = true
+
+            val appContext = context.applicationContext
+            warmUpScope.launch {
+                try {
+                    val history = CaptureMetricsRepository
+                        .getInstance(appContext)
+                        .getAll()
+
+                    val updatedCount = instance.warmUpFromHistory(history)
+
+                    CLog.i(TAG, "[mhyun2.park] warmUp completed. updatedCount=$updatedCount")
+                    callback?.accept(updatedCount)
+                } catch (t: Throwable) {
+                    warmUpStarted = false
+                    CLog.e(TAG, "[mhyun2.park] warmUp failed", t)
+                }
+            }
+        }
     }
 }
 
@@ -157,14 +243,18 @@ private const val SAVING_EXECUTION_KEY = "saving"
  *   1. [predict] - reads device state, builds [PreExecutionMetrics], predicts, and records
  *      the node onto [DraftSequenceMetrics]. Returns a [DraftSequenceExecutionSession].
  *   2. caller inspects [DraftSequenceExecutionSession.shouldRun] and either runs the node or falls back.
- *   3. if the node ran, caller calls [DraftSequenceExecutionSession.recordCompletion] to fill
+ *   3. if the node ran, caller calls [DraftSequenceExecutionSession.complete] to fill
  *      [PostExecutionMetrics] and correct the model.
  *
  * The device-state snapshot used as prediction input is read inside [predict].
+ *
+ * This tracker itself is cheap and may be created per capture; the default
+ * [predictionManager] is [DraftSequenceExecutionPredictionManager.instance], so the learned
+ * model persists across captures.
  */
-class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
+class DraftSequenceExecutionTracker @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
-    private val admissionController: DraftSequenceExecutionAdmissionController = DraftSequenceExecutionAdmissionController(),
+    private val predictionManager: DraftSequenceExecutionPredictionManager = DraftSequenceExecutionPredictionManager.instance,
 ) {
 
     /**
@@ -174,7 +264,7 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
      * @param nodeParams node-specific pre-execution params (e.g. encoding format).
      * @param timeoutMs absolute deadline ([System.currentTimeMillis] base, i.e. epoch ms) for
      *   this node; the remaining budget is derived from it at device-state read time.
-     * @param inputImageSize input image dimensions (workload feature).
+     * @param inputImageSize input image dimensions (recorded on the node metrics).
      * @param draftMetrics draft metrics to append this node's record to.
      */
     @JvmOverloads
@@ -187,7 +277,7 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
     ): DraftSequenceExecutionSession {
         val preExecutionMetrics = readPreExecutionMetrics(timeoutMs)
         val executionKey = nodeId
-        val prediction = admissionController.predict(executionKey, inputImageSize, preExecutionMetrics)
+        val nodeExecutionPrediction = predictionManager.predict(executionKey, preExecutionMetrics)
 
         val nodeExecutionMetrics = NodeExecutionMetrics(
             nodeId = nodeId,
@@ -198,16 +288,15 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
         )
         synchronized(draftMetrics) {
             draftMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
-            draftMetrics.executionPredictionList += prediction
+            draftMetrics.nodeExecutionPredictionList += nodeExecutionPrediction
         }
 
         return DraftSequenceExecutionSession(
             executionKey = executionKey,
-            inputImageSize = inputImageSize,
             preExecutionMetrics = preExecutionMetrics,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
-            prediction = prediction,
-            admissionController = admissionController,
+            executionPrediction = nodeExecutionPrediction,
+            predictionManager = predictionManager,
         )
     }
 
@@ -232,7 +321,7 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
     ): DraftSequenceExecutionSession {
         val preExecutionMetrics = readPreExecutionMetrics(timeoutMs)
         val executionKey = SAVING_EXECUTION_KEY
-        val prediction = admissionController.predict(executionKey, resultImageSize, preExecutionMetrics)
+        val savingExecutionPrediction = predictionManager.predict(executionKey, preExecutionMetrics)
 
         val savingExecutionMetrics = SavingExecutionMetrics(
             isPendingRequest = isPendingRequest,
@@ -243,16 +332,15 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
         )
         synchronized(draftMetrics) {
             draftMetrics.savingExecutionMetrics = savingExecutionMetrics
-            draftMetrics.savingExecutionPrediction = prediction
+            draftMetrics.savingExecutionPrediction = savingExecutionPrediction
         }
 
         return DraftSequenceExecutionSession(
             executionKey = executionKey,
-            inputImageSize = resultImageSize,
             preExecutionMetrics = preExecutionMetrics,
             postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
-            prediction = prediction,
-            admissionController = admissionController,
+            executionPrediction = savingExecutionPrediction,
+            predictionManager = predictionManager,
         )
     }
 
@@ -268,7 +356,8 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
 }
 
 /**
- * Handle returned by [DraftSequenceExecutionPerformanceHelper.predict] / [predictSaving].
+ * Handle returned by [DraftSequenceExecutionTracker.predictNodeExecution] /
+ * [DraftSequenceExecutionTracker.predictSavingExecution].
  *
  * GC / CPU / wall-clock baselines are captured at construction time, i.e. right after
  * prediction, so the caller should run the work immediately after deciding [shouldRun].
@@ -276,15 +365,13 @@ class DraftSequenceExecutionPerformanceHelper @JvmOverloads constructor(
  */
 class DraftSequenceExecutionSession internal constructor(
     private val executionKey: String,
-    private val inputImageSize: Size,
     private val preExecutionMetrics: PreExecutionMetrics,
     private val postExecutionMetrics: PostExecutionMetrics,
-    val prediction: ExecutionPrediction,
-    private val admissionController: DraftSequenceExecutionAdmissionController,
+    val executionPrediction: ExecutionPrediction,
+    private val predictionManager: DraftSequenceExecutionPredictionManager,
 ) {
     /** True when the predicted upper bound fits within the budget. */
-    val shouldRun: Boolean =
-        prediction.predictedUpperBoundMs <= preExecutionMetrics.budgetMs
+    val shouldRun: Boolean = executionPrediction.predictedUpperBoundMs <= preExecutionMetrics.budgetMs
 
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()
@@ -299,9 +386,8 @@ class DraftSequenceExecutionSession internal constructor(
         postExecutionMetrics.gcSnapshot = gcTracker.delta()
         postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
 
-        admissionController.updateAfterCompletion(
+        predictionManager.updateAfterCompletion(
             executionKey = executionKey,
-            inputImageSize = inputImageSize,
             preExecutionMetrics = preExecutionMetrics,
             postExecutionMetrics = postExecutionMetrics,
         )

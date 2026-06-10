@@ -37,7 +37,7 @@ class CaptureMetricsExcelExporter(
                             captureIndex = capture.captureIndex,
                             order = order,
                             node = node,
-                            prediction = draftMetrics.executionPredictionList.getOrNull(order),
+                            prediction = draftMetrics.nodeExecutionPredictionList.getOrNull(order),
                         )
                     }
                 }
