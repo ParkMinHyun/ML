@@ -189,7 +189,7 @@ class DraftSequenceExecutionPredictionManager @JvmOverloads constructor(
         private const val TAG = "DraftSequenceExecutionPredictionManager"
 
         /**
-         * Process-wide instance. The predictor's learned state lives here, so trackers created
+         * Process-wide instance. The predictor's learned state lives here, so profilers created
          * per capture keep accumulating across captures instead of cold-starting every time.
          */
         @JvmStatic
@@ -248,11 +248,11 @@ private const val SAVING_EXECUTION_KEY = "saving"
  *
  * The device-state snapshot used as prediction input is read inside [predict].
  *
- * This tracker itself is cheap and may be created per capture; the default
+ * This profiler itself is cheap and may be created per capture; the default
  * [predictionManager] is [DraftSequenceExecutionPredictionManager.instance], so the learned
  * model persists across captures.
  */
-class DraftSequenceExecutionTracker @JvmOverloads constructor(
+class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
     private val predictionManager: DraftSequenceExecutionPredictionManager = DraftSequenceExecutionPredictionManager.instance,
 ) {
@@ -344,6 +344,40 @@ class DraftSequenceExecutionTracker @JvmOverloads constructor(
         )
     }
 
+    /**
+     * Predicts the cost of the fallback path — the mandatory encoding node plus saving — under
+     * the current device state. Unlike the other predict functions nothing is recorded onto the
+     * draft metrics and no session is returned: this is a read-only estimate the caller takes
+     * before running each draft node, e.g. to derive a watchdog timeout
+     * (remaining budget - fallback cost) so that when the watchdog fires, the in-flight node is
+     * abandoned and encoding + saving still fit.
+     *
+     * The combined upper bound is conservative: it assumes both steps hit their own upper bound.
+     * Confidence is the lower of the two.
+     *
+     * @param encodingNodeId node id of the encoding node (model key).
+     * @param timeoutMs absolute deadline ([System.currentTimeMillis] base, i.e. epoch ms).
+     */
+    fun predictFallbackExecution(
+        encodingNodeId: String,
+        timeoutMs: Long,
+    ): ExecutionPrediction {
+        val preExecutionMetrics = readPreExecutionMetrics(timeoutMs)
+        val encodingPrediction = predictionManager.predict(encodingNodeId, preExecutionMetrics)
+        val savingPrediction = predictionManager.predict(SAVING_EXECUTION_KEY, preExecutionMetrics)
+
+        return ExecutionPrediction(
+            predictedDurationMs = encodingPrediction.predictedDurationMs + savingPrediction.predictedDurationMs,
+            predictedUpperBoundMs = encodingPrediction.predictedUpperBoundMs + savingPrediction.predictedUpperBoundMs,
+            confidence = minOf(encodingPrediction.confidence, savingPrediction.confidence),
+            reason = buildString {
+                append("fallback=encoding+saving")
+                append(" encoding{").append(encodingPrediction.reason).append('}')
+                append(" saving{").append(savingPrediction.reason).append('}')
+            },
+        )
+    }
+
     private fun readPreExecutionMetrics(timeoutMs: Long): PreExecutionMetrics {
         val deviceState = deviceStateReader.read()
         return PreExecutionMetrics(
@@ -356,8 +390,8 @@ class DraftSequenceExecutionTracker @JvmOverloads constructor(
 }
 
 /**
- * Handle returned by [DraftSequenceExecutionTracker.predictNodeExecution] /
- * [DraftSequenceExecutionTracker.predictSavingExecution].
+ * Handle returned by [DraftSequenceExecutionProfiler.predictNodeExecution] /
+ * [DraftSequenceExecutionProfiler.predictSavingExecution].
  *
  * GC / CPU / wall-clock baselines are captured at construction time, i.e. right after
  * prediction, so the caller should run the work immediately after deciding [shouldRun].
