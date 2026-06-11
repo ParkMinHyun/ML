@@ -20,6 +20,7 @@ fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
         resultImageHeight = resultImageSize.height,
         resultImageFormat = resultImageFormat,
         resultImageFileName = resultImageFileName,
+        timeoutTimestampMs = timeoutTimestampMs,
     )
 }
 
@@ -64,7 +65,7 @@ fun NodeExecutionMetrics.toEntity(
     )
 }
 
-/** Node predictions: one row per node, keyed by [target] = NODE and the node's order. */
+/** Node predictions: keyed by [target] = NODE and the node's order. */
 fun List<ExecutionPrediction>.toNodePredictionEntities(
     captureMetricsId: Int,
 ): List<ExecutionPredictionEntity> {
@@ -72,20 +73,22 @@ fun List<ExecutionPrediction>.toNodePredictionEntities(
         prediction.toEntity(
             captureMetricsId = captureMetricsId,
             target = ExecutionPredictionEntity.PredictionTarget.NODE,
-            order = index,
+            order = prediction.executionOrder ?: index,
         )
     }
 }
 
-/** Saving prediction: a single row keyed by [target] = SAVING and [SAVING_ORDER]. */
-fun ExecutionPrediction.toSavingPredictionEntity(
+/** Saving predictions: one row per predictor, all keyed by [target] = SAVING and [SAVING_ORDER]. */
+fun List<ExecutionPrediction>.toSavingPredictionEntities(
     captureMetricsId: Int,
-): ExecutionPredictionEntity {
-    return toEntity(
-        captureMetricsId = captureMetricsId,
-        target = ExecutionPredictionEntity.PredictionTarget.SAVING,
-        order = ExecutionPredictionEntity.SAVING_ORDER,
-    )
+): List<ExecutionPredictionEntity> {
+    return map { prediction ->
+        prediction.toEntity(
+            captureMetricsId = captureMetricsId,
+            target = ExecutionPredictionEntity.PredictionTarget.SAVING,
+            order = ExecutionPredictionEntity.SAVING_ORDER,
+        )
+    }
 }
 
 fun ExecutionPrediction.toEntity(
@@ -97,6 +100,7 @@ fun ExecutionPrediction.toEntity(
         captureMetricsId = captureMetricsId,
         target = target.name,
         order = order,
+        predictorName = predictorName,
         predictedDurationMs = predictedDurationMs,
         predictedUpperBoundMs = predictedUpperBoundMs,
         confidence = confidence,
@@ -166,6 +170,13 @@ fun SavingExecutionMetrics.toEntity(
 }
 
 fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
+    val nodePredictions = executionPredictions
+        .filter { it.target == ExecutionPredictionEntity.PredictionTarget.NODE.name }
+        .sortedWith(compareBy<ExecutionPredictionEntity> { it.order }.thenBy { it.predictorName })
+    val savingPredictions = executionPredictions
+        .filter { it.target == ExecutionPredictionEntity.PredictionTarget.SAVING.name }
+        .sortedBy { it.predictorName }
+
     return CaptureMetrics(
         ppSequenceId = capture.ppSequenceId,
         dsMode = capture.dsMode,
@@ -173,20 +184,19 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
         resultImageSize = Size(capture.resultImageWidth, capture.resultImageHeight),
         resultImageFormat = capture.resultImageFormat,
         resultImageFileName = capture.resultImageFileName,
+        timeoutTimestampMs = capture.timeoutTimestampMs,
         draftSequenceMetrics = draftSequenceMetrics?.toModel(
             nodeExecutionMetricsList = nodeExecutionMetrics
                 .sortedBy { it.order }
                 .map { it.toModel() }
                 .toMutableList(),
-            nodeExecutionPredictionList = executionPredictions
-                .filter { it.target == ExecutionPredictionEntity.PredictionTarget.NODE.name }
-                .sortedBy { it.order }
+            nodeExecutionPredictionList = nodePredictions
                 .map { it.toModel() }
                 .toMutableList(),
             savingExecutionMetrics = savingExecutionMetrics?.toModel(),
-            savingExecutionPrediction = executionPredictions
-                .firstOrNull { it.target == ExecutionPredictionEntity.PredictionTarget.SAVING.name }
-                ?.toModel(),
+            savingExecutionPredictionList = savingPredictions
+                .map { it.toModel() }
+                .toMutableList(),
         ),
     )
 }
@@ -195,14 +205,14 @@ fun DraftSequenceMetricsEntity.toModel(
     nodeExecutionMetricsList: MutableList<NodeExecutionMetrics>,
     nodeExecutionPredictionList: MutableList<ExecutionPrediction>,
     savingExecutionMetrics: SavingExecutionMetrics?,
-    savingExecutionPrediction: ExecutionPrediction?,
+    savingExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
 ): DraftSequenceMetrics {
     return DraftSequenceMetrics(
         nodeExecutionMetricsList = nodeExecutionMetricsList,
         nodeExecutionPredictionList = nodeExecutionPredictionList,
-        isTimeout = isTimeout,
         savingExecutionMetrics = savingExecutionMetrics,
-        savingExecutionPrediction = savingExecutionPrediction,
+        savingExecutionPredictionList = savingExecutionPredictionList,
+        isTimeout = isTimeout,
     )
 }
 
@@ -241,6 +251,8 @@ fun ExecutionPredictionEntity.toModel(): ExecutionPrediction {
         predictedUpperBoundMs = predictedUpperBoundMs,
         confidence = confidence,
         reason = reason,
+        predictorName = predictorName,
+        executionOrder = order,
     )
 }
 

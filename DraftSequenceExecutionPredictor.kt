@@ -57,6 +57,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
                 predictedUpperBoundMs = 0L,
                 confidence = confidenceFromCount(0),
                 reason = "key=$executionKey count=0 budgetMs=$budgetMs shouldRun=${budgetMs >= 0L} (cold start)",
+                predictorName = name,
             )
         }
 
@@ -80,6 +81,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             predictedUpperBoundMs = predictedUpperBoundMs,
             confidence = confidenceFromCount(stats.count),
             reason = reason,
+            predictorName = name,
         )
     }
 
@@ -321,7 +323,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     ): DraftSequenceExecutionSession {
         val preExecutionMetrics = readPreExecutionMetrics(timeoutMs)
         val executionKey = SAVING_EXECUTION_KEY
-        val savingExecutionPrediction = predictionManager.predict(executionKey, preExecutionMetrics)
+        val savingPrediction = predictionManager.predict(executionKey, preExecutionMetrics)
 
         val savingExecutionMetrics = SavingExecutionMetrics(
             isPendingRequest = isPendingRequest,
@@ -332,14 +334,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
         synchronized(draftMetrics) {
             draftMetrics.savingExecutionMetrics = savingExecutionMetrics
-            draftMetrics.savingExecutionPrediction = savingExecutionPrediction
+            draftMetrics.savingExecutionPredictionList.clear()
+            draftMetrics.savingExecutionPredictionList += savingPrediction
         }
 
         return DraftSequenceExecutionSession(
             executionKey = executionKey,
             preExecutionMetrics = preExecutionMetrics,
             postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
-            executionPrediction = savingExecutionPrediction,
+            executionPrediction = savingPrediction,
             predictionManager = predictionManager,
         )
     }
@@ -375,6 +378,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 append(" encoding{").append(encodingPrediction.reason).append('}')
                 append(" saving{").append(savingPrediction.reason).append('}')
             },
+            predictorName = encodingPrediction.predictorName,
         )
     }
 

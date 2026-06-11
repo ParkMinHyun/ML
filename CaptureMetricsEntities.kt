@@ -33,6 +33,9 @@ data class CaptureMetricsEntity(
 
     @ColumnInfo(name = "result_image_file_name")
     val resultImageFileName: String,
+
+    @ColumnInfo(name = "timeout_timestamp_ms")
+    val timeoutTimestampMs: Long?,
 )
 
 @Entity(
@@ -146,6 +149,12 @@ data class ExecutionPredictionEntity(
     /** Node order within the draft sequence; [SAVING_ORDER] for the saving step. */
     @ColumnInfo(name = "order")
     val order: Int,
+
+    @ColumnInfo(
+        name = "predictor_name",
+        defaultValue = "'unknown'",
+    )
+    val predictorName: String = ExecutionPrediction.PREDICTOR_UNKNOWN,
 
     @ColumnInfo(name = "predicted_duration_ms")
     val predictedDurationMs: Long,

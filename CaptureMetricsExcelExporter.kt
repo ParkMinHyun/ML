@@ -32,26 +32,60 @@ class CaptureMetricsExcelExporter(
             val captures = metricsList.mapIndexed { index, metrics -> CaptureRow(index + 1, metrics) }
             val nodeRows = captures.flatMap { capture ->
                 capture.metrics.draftSequenceMetrics?.let { draftMetrics ->
-                    draftMetrics.nodeExecutionMetricsList.mapIndexed { order, node ->
-                        NodeRow(
-                            captureIndex = capture.captureIndex,
-                            order = order,
-                            node = node,
-                            prediction = draftMetrics.nodeExecutionPredictionList.getOrNull(order),
-                        )
+                    val predictionsByOrder = draftMetrics.nodeExecutionPredictionList
+                        .groupBy { it.executionOrder }
+                    draftMetrics.nodeExecutionMetricsList.flatMapIndexed { order, node ->
+                        val predictions = predictionsByOrder[order].orEmpty()
+                            .sortedBy { it.predictorName }
+                        if (predictions.isEmpty()) {
+                            listOf(
+                                NodeRow(
+                                    captureIndex = capture.captureIndex,
+                                    order = order,
+                                    node = node,
+                                    prediction = null,
+                                ),
+                            )
+                        } else {
+                            predictions.map { prediction ->
+                                NodeRow(
+                                    captureIndex = capture.captureIndex,
+                                    order = order,
+                                    node = node,
+                                    prediction = prediction,
+                                )
+                            }
+                        }
                     }
                 }
                     .orEmpty()
             }
 
-            val savingRows = captures.mapNotNull { capture ->
+            val savingRows = captures.flatMap { capture ->
                 capture.metrics.draftSequenceMetrics?.savingExecutionMetrics?.let { saving ->
-                    SavingRow(
-                        captureIndex = capture.captureIndex,
-                        saving = saving,
-                        prediction = capture.metrics.draftSequenceMetrics?.savingExecutionPrediction,
-                    )
+                    val predictions = capture.metrics.draftSequenceMetrics
+                        ?.savingPredictions()
+                        .orEmpty()
+                        .sortedBy { it.predictorName }
+                    if (predictions.isEmpty()) {
+                        listOf(
+                            SavingRow(
+                                captureIndex = capture.captureIndex,
+                                saving = saving,
+                                prediction = null,
+                            ),
+                        )
+                    } else {
+                        predictions.map { prediction ->
+                            SavingRow(
+                                captureIndex = capture.captureIndex,
+                                saving = saving,
+                                prediction = prediction,
+                            )
+                        }
+                    }
                 }
+                    .orEmpty()
             }
 
             writeSheet(workbook, styles, "Capture", captures, CAPTURE_COLUMNS)
@@ -144,13 +178,95 @@ class CaptureMetricsExcelExporter(
         val order: Int,
         val node: NodeExecutionMetrics,
         val prediction: ExecutionPrediction?,
-    )
+    ) {
+        private val actualDurationMs: Long?
+            get() = node.postExecutionMetrics.durationMs.takeIf { it > 0L }
+
+        fun predictionErrorMs(): Long? {
+            val durationMs = actualDurationMs ?: return null
+            val prediction = prediction ?: return null
+            return durationMs - prediction.predictedDurationMs
+        }
+
+        fun absolutePredictionErrorMs(): Long? {
+            return predictionErrorMs()?.let { kotlin.math.abs(it) }
+        }
+
+        fun upperBoundCovered(): Boolean? {
+            val durationMs = actualDurationMs ?: return null
+            val prediction = prediction ?: return null
+            return durationMs <= prediction.predictedUpperBoundMs
+        }
+
+        fun wouldRun(): Boolean? {
+            val prediction = prediction ?: return null
+            return prediction.predictedUpperBoundMs <= node.preExecutionMetrics.budgetMs
+        }
+
+        fun actualFitsBudget(): Boolean? {
+            val durationMs = actualDurationMs ?: return null
+            return durationMs <= node.preExecutionMetrics.budgetMs
+        }
+
+        fun falseAdmit(): Boolean? {
+            val wouldRun = wouldRun() ?: return null
+            val actualFitsBudget = actualFitsBudget() ?: return null
+            return wouldRun && !actualFitsBudget
+        }
+
+        fun falseReject(): Boolean? {
+            val wouldRun = wouldRun() ?: return null
+            val actualFitsBudget = actualFitsBudget() ?: return null
+            return !wouldRun && actualFitsBudget
+        }
+    }
 
     private class SavingRow(
         val captureIndex: Int,
         val saving: SavingExecutionMetrics,
         val prediction: ExecutionPrediction?,
-    )
+    ) {
+        private val actualDurationMs: Long?
+            get() = saving.postExecutionMetrics.durationMs.takeIf { it > 0L }
+
+        fun predictionErrorMs(): Long? {
+            val durationMs = actualDurationMs ?: return null
+            val prediction = prediction ?: return null
+            return durationMs - prediction.predictedDurationMs
+        }
+
+        fun absolutePredictionErrorMs(): Long? {
+            return predictionErrorMs()?.let { kotlin.math.abs(it) }
+        }
+
+        fun upperBoundCovered(): Boolean? {
+            val durationMs = actualDurationMs ?: return null
+            val prediction = prediction ?: return null
+            return durationMs <= prediction.predictedUpperBoundMs
+        }
+
+        fun wouldRun(): Boolean? {
+            val prediction = prediction ?: return null
+            return prediction.predictedUpperBoundMs <= saving.preExecutionMetrics.budgetMs
+        }
+
+        fun actualFitsBudget(): Boolean? {
+            val durationMs = actualDurationMs ?: return null
+            return durationMs <= saving.preExecutionMetrics.budgetMs
+        }
+
+        fun falseAdmit(): Boolean? {
+            val wouldRun = wouldRun() ?: return null
+            val actualFitsBudget = actualFitsBudget() ?: return null
+            return wouldRun && !actualFitsBudget
+        }
+
+        fun falseReject(): Boolean? {
+            val wouldRun = wouldRun() ?: return null
+            val actualFitsBudget = actualFitsBudget() ?: return null
+            return !wouldRun && actualFitsBudget
+        }
+    }
 
     /** Cell number formats keyed by column-title suffix. */
     private class Styles(workbook: Workbook) {
@@ -188,6 +304,7 @@ class CaptureMetricsExcelExporter(
             Column("resultImageWidth") { it.metrics.resultImageSize.width },
             Column("resultImageHeight") { it.metrics.resultImageSize.height },
             Column("resultImageFileName") { it.metrics.resultImageFileName },
+            Column("timeoutTimestampMs") { it.metrics.timeoutTimestampMs },
             Column("isTimeout") { it.metrics.draftSequenceMetrics?.isTimeout },
             Column("nodeCount") { it.metrics.draftSequenceMetrics?.nodeExecutionMetricsList?.size ?: 0 },
         )
@@ -221,9 +338,17 @@ class CaptureMetricsExcelExporter(
             Column("storageUsedPercent") { it.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
 
             // prediction
+            Column("predictorName") { it.prediction?.predictorName },
             Column("predictedDurationMs") { it.prediction?.predictedDurationMs },
             Column("predictedUpperBoundMs") { it.prediction?.predictedUpperBoundMs },
             Column("confidence") { it.prediction?.confidence },
+            Column("predictionErrorMs") { it.predictionErrorMs() },
+            Column("absolutePredictionErrorMs") { it.absolutePredictionErrorMs() },
+            Column("upperBoundCovered") { it.upperBoundCovered() },
+            Column("wouldRun") { it.wouldRun() },
+            Column("actualFitsBudget") { it.actualFitsBudget() },
+            Column("falseAdmit") { it.falseAdmit() },
+            Column("falseReject") { it.falseReject() },
             Column("reason") { it.prediction?.reason },
 
             // post-execution metrics
@@ -263,9 +388,17 @@ class CaptureMetricsExcelExporter(
             Column("storageUsedPercent") { it.saving.preExecutionMetrics.storageSnapshot.storageUsedPercent },
 
             // prediction
+            Column("predictorName") { it.prediction?.predictorName },
             Column("predictedDurationMs") { it.prediction?.predictedDurationMs },
             Column("predictedUpperBoundMs") { it.prediction?.predictedUpperBoundMs },
             Column("confidence") { it.prediction?.confidence },
+            Column("predictionErrorMs") { it.predictionErrorMs() },
+            Column("absolutePredictionErrorMs") { it.absolutePredictionErrorMs() },
+            Column("upperBoundCovered") { it.upperBoundCovered() },
+            Column("wouldRun") { it.wouldRun() },
+            Column("actualFitsBudget") { it.actualFitsBudget() },
+            Column("falseAdmit") { it.falseAdmit() },
+            Column("falseReject") { it.falseReject() },
             Column("reason") { it.prediction?.reason },
 
             // post-execution metrics
@@ -285,6 +418,10 @@ class CaptureMetricsExcelExporter(
                 is NodeParams.Encoding -> "encoding"
                 is NodeParams.DualBokeh -> "dualBokeh"
             }
+        }
+
+        private fun DraftSequenceMetrics.savingPredictions(): List<ExecutionPrediction> {
+            return savingExecutionPredictionList
         }
     }
 }
