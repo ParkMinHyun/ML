@@ -366,5 +366,9 @@ class CaptureMetricsExcelExporter(
                 is NodeParams.Encoding -> "encoding"
             }
         }
+
+        private fun DraftSequenceMetrics.savingPredictions(): List<ExecutionPrediction> {
+            return savingExecutionPredictionList
+        }
     }
 }
