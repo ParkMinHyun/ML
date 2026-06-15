@@ -9,14 +9,15 @@ data class CaptureMetrics @JvmOverloads constructor(
     val resultImageSize: Size,
     val resultImageFormat: Int,
     val resultImageFileName: String,
+    var timeoutTimestampMs: Long? = null,
     var draftSequenceMetrics: DraftSequenceMetrics? = null,
 )
 
-data class DraftSequenceMetrics(
+data class DraftSequenceMetrics @JvmOverloads constructor(
     val nodeExecutionMetricsList: MutableList<NodeExecutionMetrics> = mutableListOf(),
     val nodeExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
     var savingExecutionMetrics: SavingExecutionMetrics? = null,
-    var savingExecutionPrediction: ExecutionPrediction? = null,
+    val savingExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
     var isTimeout: Boolean? = false,
 )
 
@@ -34,12 +35,17 @@ data class SavingExecutionMetrics(
     val resultImageFormat: Int,
     val preExecutionMetrics: PreExecutionMetrics,
     val postExecutionMetrics: PostExecutionMetrics,
+    var startTimestampMs: Long = 0L,
 )
 
 sealed interface NodeParams {
     data object None : NodeParams
 
     data class DualBokeh(val outputImageSize: Size) : NodeParams
+
+    data object Filter : NodeParams
+
+    data object Watermark : NodeParams
 
     data class Encoding(val encodingFormat: Int) : NodeParams
 }
@@ -57,9 +63,15 @@ data class PostExecutionMetrics(
     var durationMs: Long = 0L,
 )
 
-data class ExecutionPrediction(
+data class ExecutionPrediction @JvmOverloads constructor(
     val predictedDurationMs: Long,
     val predictedUpperBoundMs: Long,
     val confidence: Float,
     val reason: String,
-)
+    val predictorName: String = PREDICTOR_UNKNOWN,
+    val executionOrder: Int? = null,
+) {
+    companion object {
+        const val PREDICTOR_UNKNOWN = "unknown"
+    }
+}
