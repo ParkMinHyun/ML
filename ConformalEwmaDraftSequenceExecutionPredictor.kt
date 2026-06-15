@@ -4,6 +4,7 @@ import android.util.Size
 import java.util.ArrayDeque
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.roundToLong
 import kotlin.math.sqrt
@@ -11,93 +12,107 @@ import kotlin.math.sqrt
 /**
  * EWMA + online conformal residual calibration predictor for draft-sequence admission.
  *
- * Design intent
- * -------------
- * - Keep EWMA as the point predictor because recent execution history was the most stable signal
- *   in the current Bokeh measurements.
- * - Use online positive residual quantiles as the upper-bound calibration layer. The margin is not
- *   a hand-tuned fixed ms value: it is read from recent under-prediction errors.
- * - Use workload identity as the stable Mondrian split, with a hierarchical fallback so a cold
- *   (key x size x format) cell borrows from (key x size), then key-only, then a global pool:
- *      Bokeh : result/input image size bucket (12MP / 24MP when present)
- *      Filter: image size bucket (12MP / 24MP / 50MP when present)
- *      Tail  : result image size bucket x image format (Encoding + Saving)
- * - Thermal / memory / runtime pressure do not create hard buckets. They only select how high a
- *   residual quantile to read from the same workload calibration window.
- * - For stage admission, use decision-level combined residuals:
- *      score = actual(stage + mandatoryTail) - predicted(stage + mandatoryTail)
- *   This calibrates the exact quantity used by the controller.
+ * Constant-free by construction
+ * -----------------------------
+ * Model and capture characteristics vary too widely across the fleet for hand-set, dimensioned
+ * (ms) or regime-specific (per-thermal-level) constants to transfer. This predictor therefore
+ * exposes exactly TWO device-invariant, dimensionless probabilities, and EVERYTHING else
+ * (quantiles, sample thresholds, window length, adaptation gain, warmup factor) is *derived* from
+ * them. There are no ms constants and no hand-picked quantiles.
  *
- * Pressure-aware quantile selection: cold-gated, not always-on
- * ------------------------------------------------------------
- * Raising the residual quantile under pressure only helps while the calibration window has not
- * yet seen pressure residuals. Once the sliding window has absorbed them, it already widens the
- * margin on its own, and an additional pressure surcharge becomes pure over-conservatism. On the
- * 8U memory-pressure logs this was measured directly through the admission counterfactual:
+ *   1. [targetBreachRate] - how often the issued upper bound may be exceeded (a timeout). Read off
+ *      the cost ratio: if a timeout is ~50x as costly as an over-skip, set ~0.02. This single knob
+ *      drives every quantile and sample-count threshold below.
+ *   2. [driftFalseAlarmRate] - the tolerated false-alarm rate of the change detector that governs
+ *      how fast the per-cell mean adapts. This single knob sets the detector threshold; the
+ *      adaptation gain itself is parameter-free (alpha = 1 / effective-sample-count).
  *
- *   pressure-aware always-on : over-skip 2.8% (5.8% inside the pressure region), Bokeh kept 85.0%
- *   pressure-aware cold-gated : over-skip 0.4% (1.2% in pressure region),       Bokeh kept 87.6%
+ * Derivations (so a reviewer can audit "why this value?"):
+ *   - calibrationWindowSize       = ceil(2 / targetBreachRate)   (~2 expected tail exceedances)
+ *   - minimumSamplesForCalibration= ceil(1 / targetBreachRate)   (>=1 expected exceedance to read
+ *                                                                  an empirical quantile at all)
+ *   - cold/warm parametric bridge = Student-t upper bound at (1 - targetBreachRate); the t-factor
+ *                                   widens automatically for small n, replacing a fixed std factor
+ *   - ACI step gamma              = targetBreachRate (clamped to the standard 0.005..0.05 band)
+ *   - drift detector threshold    = -ln(driftFalseAlarmRate)     (SPRT/CUSUM log-evidence budget)
  *
- * Both defended the identical set of savable timeouts, so the always-on surcharge cost quality
- * without buying safety. (Note this trade-off is invisible to a pure coverage metric: by UB-miss
- * rate, always-on looks *better* - 3.2% vs 5.7% Bokeh+Tail - because the higher bound is harder
- * to exceed. The miss reductions are mostly on captures with ample slack, where the decision is
- * unaffected, which is why savable-timeout defense is unchanged. Coverage-optimal and
- * admission-optimal disagree here; the admission counterfactual is the one that matches the
- * controller's actual job.) [enablePressureAwareQuantile] therefore gates the surcharge to the
- * cold window: when a cell has at least [coldGateSampleCount] residual samples, pressure no longer
- * forces the quantile up. The runtime-pressure tracker is retained for the cold phase and for
- * devices whose pre-execution signals (e.g. RAM) actually move under pressure.
+ * Point predictor: adaptive running mean (no fixed alpha, no thermal/surprise gains)
+ * ---------------------------------------------------------------------------------
+ * The center is a running mean whose gain is alpha = 1 / nEff, where nEff is an effective sample
+ * count. nEff grows while the series is stationary (gain shrinks -> noise is smoothed) and is reset
+ * by a two-sided CUSUM change detector when a *persistent* shift is detected (gain jumps -> the
+ * mean re-locks fast). "Insensitive to noise, fast on regime change" is therefore emergent, not a
+ * pair of tuned boost constants. A thermal escalation (severity rising since this cell last ran)
+ * only *lowers the detector's threshold*, so throttling onset is detected sooner - it is a prior on
+ * change probability, not a separate adaptation gain, and it never enters the bound. The detector
+ * is two-sided, so a downward shift (execution getting faster) resets the mean just as fast,
+ * pulling the center down - this is the negative-residual handling, done structurally.
  *
- * Notes on coverage wording
- * -------------------------
- * This class should be described as online residual calibration, not as an unconditional hard
- * guarantee. Standard conformal coverage assumes exchangeability; mobile thermal drift and burst
- * progression violate it. Sliding windows and cold-gated pressure-aware quantile selection make
- * the calibrator adaptive, but the guarantee should be evaluated empirically on device logs.
+ * Upper bound: target-coverage, self-selecting quantile (Adaptive Conformal Inference)
+ * -----------------------------------------------------------------------------------
+ * The margin is the empirical (positive) residual quantile, but the quantile is not chosen by
+ * hand: Adaptive Conformal Inference (Gibbs & Candes 2021) drives it online to hit
+ * [targetBreachRate]. A breach raises the quantile (widen); a non-breach - which includes every
+ * over-prediction / negative residual - relaxes it (reclaim savings). The residual window stays
+ * one-sided (positive residuals only), which is the correct, tight design for an upper bound; the
+ * negative side is handled by the center de-bias (the two-sided detector above) and by ACI
+ * relaxing the quantile, never by symmetrizing the margin window.
+ *
+ * Thermal is non-cellular. Severity selects an adaptation *speed* within a workload cell; it never
+ * splits a cell and never enters the bound. Workload identity is the only Mondrian split, with a
+ * hierarchical fallback (exact cell -> coarser key prefix -> global pool).
+ *
+ * This is online residual calibration, not an unconditional coverage guarantee: mobile thermal
+ * drift violates exchangeability, so the guarantee must be evaluated empirically on device logs.
  */
 class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
-    private val ewmaAlpha: Double = 0.20,
-    private val calibrationWindowSize: Int = 96,
-    private val minimumSamplesForCalibration: Int = 8,
-    private val minimumErrorMarginMs: Long = 60L,
-    /**
-     * Cold-phase warmup bridge. While a window holds at least [warmupMinSamples] but fewer than
-     * [minimumSamplesForCalibration] residuals, the margin uses a conservative parametric bound
-     * (mean + [warmupStdDevFactor] * std) instead of an untrustworthy small-sample quantile. This
-     * shortens the first-session interval where the margin is only the flat [minimumErrorMarginMs]
-     * floor, without injecting any foreign data: it is built from the device's own early residuals.
-     * Set [warmupMinSamples] >= [minimumSamplesForCalibration] to disable the parametric bridge.
-     */
-    private val warmupMinSamples: Int = 2,
-    private val warmupStdDevFactor: Double = 2.0,
-    private val normalQuantile: Double = 0.85,
-    private val lowQuantile: Double = 0.90,
-    private val highQuantile: Double = 0.95,
-    private val criticalQuantile: Double = 0.99,
-    private val enablePressureAwareQuantile: Boolean = true,
-    /**
-     * Once a cell's calibration window holds at least this many samples, pressure no longer
-     * raises the quantile (the window itself has absorbed the drift). Set to 0 to restore the
-     * always-on behavior; set very large to disable cold-gating.
-     */
-    private val coldGateSampleCount: Int = 24,
+    /** Knob #1: tolerated upper-bound breach (timeout) rate. Drives every quantile/threshold. */
+    private val targetBreachRate: Double = 0.02,
+    /** Knob #2: change-detector false-alarm rate. Drives center adaptation speed. */
+    private val driftFalseAlarmRate: Double = 0.01,
 ) : DraftSequenceExecutionPredictor {
 
     override val name: String = "draft_sequence_execution_conformal_ewma"
 
-    private val durationStatsByWorkload: MutableMap<String, OnlineEwmaStats> = mutableMapOf()
+    // --- Everything below is derived from the two knobs above (no independent constants). ---
+
+    /** ~2 expected tail exceedances kept in the calibration window. */
+    private val calibrationWindowSize: Int =
+        ceil(2.0 / targetBreachRate).toInt().coerceAtLeast(PARAMETRIC_MIN_SAMPLES)
+
+    /** Need >= 1 expected exceedance before an empirical quantile is meaningful. */
+    private val minimumSamplesForCalibration: Int =
+        ceil(1.0 / targetBreachRate).toInt().coerceAtLeast(PARAMETRIC_MIN_SAMPLES)
+
+    /** Coverage target the parametric bridge aims at while a cell is still cold. */
+    private val coverageTarget: Double = (1.0 - targetBreachRate).coerceIn(0.5, 0.999)
+
+    /** ACI step size, tied to the target (Gibbs & Candes use 0.005..0.05); not tuned separately. */
+    private val quantileAdaptationSpeed: Double = targetBreachRate.coerceIn(0.005, 0.05)
+
+    /** CUSUM/SPRT log-evidence threshold from the false-alarm rate. */
+    private val driftThreshold: Double = -ln(driftFalseAlarmRate.coerceIn(1e-6, 0.5))
+
+    private val durationStatsByWorkload: MutableMap<String, AdaptiveRunningMean> = mutableMapOf()
     private val positiveResidualsByWorkload: MutableMap<String, RollingQuantile> = mutableMapOf()
     private val combinedPositiveResidualsByDecision: MutableMap<String, RollingQuantile> = mutableMapOf()
 
     private val globalPositiveResiduals = RollingQuantile(calibrationWindowSize)
     private val globalCombinedPositiveResiduals = RollingQuantile(calibrationWindowSize)
 
-    private val runtimePressureTracker = RuntimePressureTracker(calibrationWindowSize)
-
-    private var lastOverheatLevel: Int? = null
-    private var lastThermalStatus: Int? = null
-    private var lastPressureLevel: PressureLevel = PressureLevel.NORMAL
+    // Warm-phase coverage controllers (Adaptive Conformal Inference). One per decision quantity:
+    // node/single duration vs. combined stage+tail admission. Breaches are sparse, so these are
+    // kept coarse (one each) for signal density rather than split per workload cell.
+    private val singleQuantileController = AdaptiveQuantileController(
+        targetBreachRate = targetBreachRate,
+        gamma = quantileAdaptationSpeed,
+        initialQuantile = coverageTarget,
+    )
+    private val combinedQuantileController = AdaptiveQuantileController(
+        targetBreachRate = targetBreachRate,
+        gamma = quantileAdaptationSpeed,
+        initialQuantile = coverageTarget,
+    )
 
     @Synchronized
     override fun predict(
@@ -126,10 +141,11 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         )
         updateSingleInternal(
             workloadKey = workloadKey.value,
-            predictedDurationMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedCenterMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedUpperBoundMs = predictionBeforeUpdate.predictedUpperBoundMs,
             observedDurationMs = postExecutionMetrics.durationMs,
+            severity = thermalSeverity(preExecutionMetrics),
         )
-        runtimePressureTracker.update(postExecutionMetrics)
     }
 
     @Synchronized
@@ -179,10 +195,11 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         )
         updateSingleInternal(
             workloadKey = workloadKey.value,
-            predictedDurationMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedCenterMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedUpperBoundMs = predictionBeforeUpdate.predictedUpperBoundMs,
             observedDurationMs = nodeExecutionMetrics.postExecutionMetrics.durationMs,
+            severity = thermalSeverity(nodeExecutionMetrics.preExecutionMetrics),
         )
-        runtimePressureTracker.update(nodeExecutionMetrics.postExecutionMetrics)
     }
 
     @Synchronized
@@ -228,10 +245,11 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         val workloadKey = WorkloadKey.saving(savingExecutionMetrics)
         updateSingleInternal(
             workloadKey = workloadKey.value,
-            predictedDurationMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedCenterMs = predictionBeforeUpdate.predictedDurationMs,
+            issuedUpperBoundMs = predictionBeforeUpdate.predictedUpperBoundMs,
             observedDurationMs = savingExecutionMetrics.postExecutionMetrics.durationMs,
+            severity = thermalSeverity(savingExecutionMetrics.preExecutionMetrics),
         )
-        runtimePressureTracker.update(savingExecutionMetrics.postExecutionMetrics)
     }
 
     /**
@@ -281,6 +299,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         tailResultImageSize: Size,
         tailResultImageFormat: Int,
         predictedCombinedDurationMs: Long,
+        predictedCombinedUpperBoundMs: Long,
         actualStageDurationMs: Long,
         actualEncodingDurationMs: Long,
         actualSavingDurationMs: Long,
@@ -304,6 +323,10 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             RollingQuantile(calibrationWindowSize)
         }.add(positiveResidualMs)
         globalCombinedPositiveResiduals.add(positiveResidualMs)
+        // Drive the combined coverage controller toward targetBreachRate. A "no breach" here (which
+        // includes every over-prediction / negative residual) relaxes the quantile - this is the
+        // formal mechanism by which negative residuals lower the bound.
+        combinedQuantileController.observe(breach = actualCombinedMs > predictedCombinedUpperBoundMs)
     }
 
     /**
@@ -341,12 +364,12 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        val pressureLevel = pressureLevel(preExecutionMetrics)
-        val quantile = quantileForPressure(pressureLevel, calibrationCount(workloadKey.value))
+        val quantile = singleQuantileController.quantile
         val stats = durationStatsByWorkload[workloadKey.value]
-        val predictedMs = stats?.ewmaMs ?: 0.0
+        val predictedMs = stats?.centerMs ?: 0.0
         val marginMs = calibratedSingleMargin(workloadKey.value, quantile)
-        val upperBoundMs = if (stats == null || stats.count == 0) {
+        val upperBoundMs = if (stats == null || stats.count == 0 || marginMs == null) {
+            // No center yet, or too few residuals to form any margin -> never skip (always admit).
             0L
         } else {
             (predictedMs + marginMs).roundToLong()
@@ -360,13 +383,11 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             append(" workload=").append(workloadKey.value)
             append(" samples=").append(stats?.count ?: 0)
             append(" q=").append(quantile)
-            append(" pressure=").append(pressureLevel.label)
-            append(" marginMs=").append(marginMs.roundToLong())
+            append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
             append(" shouldRun=").append(upperBoundMs <= budgetMs)
         }
-        rememberThermal(preExecutionMetrics)
         return ExecutionPrediction(
             predictedDurationMs = predictedDurationMs,
             predictedUpperBoundMs = upperBoundMs,
@@ -385,17 +406,16 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         tailWorkloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        val pressureLevel = pressureLevel(preExecutionMetrics)
         val decisionKey = DecisionKey.combined(stageWorkloadKey, tailWorkloadKey)
-        val quantile = quantileForPressure(pressureLevel, combinedCalibrationCount(decisionKey.value))
+        val quantile = combinedQuantileController.quantile
         val stageStats = durationStatsByWorkload[stageWorkloadKey.value]
         val tailStats = durationStatsByWorkload[tailWorkloadKey.value]
-        val stagePredMs = stageStats?.ewmaMs ?: 0.0
-        val tailPredMs = tailStats?.ewmaMs ?: 0.0
+        val stagePredMs = stageStats?.centerMs ?: 0.0
+        val tailPredMs = tailStats?.centerMs ?: 0.0
         val predictedCombinedMs = stagePredMs + tailPredMs
         val hasAnySample = (stageStats?.count ?: 0) > 0 || (tailStats?.count ?: 0) > 0
         val marginMs = calibratedCombinedMargin(decisionKey.value, quantile)
-        val upperBoundMs = if (!hasAnySample) {
+        val upperBoundMs = if (!hasAnySample || marginMs == null) {
             0L
         } else {
             (predictedCombinedMs + marginMs).roundToLong()
@@ -409,13 +429,11 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             append(" stageSamples=").append(stageStats?.count ?: 0)
             append(" tailSamples=").append(tailStats?.count ?: 0)
             append(" q=").append(quantile)
-            append(" pressure=").append(pressureLevel.label)
-            append(" marginMs=").append(marginMs.roundToLong())
+            append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
             append(" shouldRun=").append(upperBoundMs <= budgetMs)
         }
-        rememberThermal(preExecutionMetrics)
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
             predictedUpperBoundMs = upperBoundMs,
@@ -430,48 +448,54 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     private fun updateSingleInternal(
         workloadKey: String,
-        predictedDurationMs: Long,
+        issuedCenterMs: Long,
+        issuedUpperBoundMs: Long,
         observedDurationMs: Long,
+        severity: Double,
     ) {
         val observedMs = observedDurationMs.coerceAtLeast(0L)
         if (observedMs <= 0L) {
             return
         }
-        durationStatsByWorkload.getOrPut(workloadKey) { OnlineEwmaStats() }
-            .update(observedMs.toDouble(), ewmaAlpha)
-        val positiveResidualMs = (observedMs - predictedDurationMs).coerceAtLeast(0L)
+        // Center: adaptive running mean with CUSUM-driven forgetting + thermal-escalation prior.
+        durationStatsByWorkload.getOrPut(workloadKey) {
+            AdaptiveRunningMean(maxEffectiveSamples = calibrationWindowSize, driftThreshold = driftThreshold)
+        }.update(observedMs.toDouble(), severity)
+        // Upper-margin window stays ONE-SIDED. Residual is measured against the issued center so the
+        // calibration matches exactly what predict() handed out.
+        val positiveResidualMs = (observedMs - issuedCenterMs).coerceAtLeast(0L)
         positiveResidualsByWorkload.getOrPut(workloadKey) {
             RollingQuantile(calibrationWindowSize)
         }.add(positiveResidualMs)
         globalPositiveResiduals.add(positiveResidualMs)
+        // Drive the single-path coverage controller. No breach (incl. every over-prediction) relaxes
+        // the quantile; a breach raises it. Empirical breach rate -> targetBreachRate.
+        singleQuantileController.observe(breach = observedMs > issuedUpperBoundMs)
     }
 
     /**
      * Best margin a single window can supply for this quantile: the empirical quantile once the
-     * window is warm (>= minimumSamplesForCalibration), otherwise a conservative parametric bound
-     * during the cold warmup band (>= warmupMinSamples), otherwise null (too few samples to say
-     * anything - the caller falls back to a coarser pool or the floor).
+     * window is warm (>= minimumSamplesForCalibration), otherwise a conservative Student-t bound
+     * during the cold band (>= PARAMETRIC_MIN_SAMPLES), otherwise null (too few samples to say
+     * anything - the caller falls back to a coarser pool, the global pool, or "always admit").
      */
     private fun windowMargin(window: RollingQuantile, quantile: Double): Double? {
         return when {
             window.count >= minimumSamplesForCalibration -> window.quantile(quantile)
-            window.count >= warmupMinSamples -> window.parametricUpperBound(warmupStdDevFactor)
+            window.count >= PARAMETRIC_MIN_SAMPLES -> window.studentTUpperBound(coverageTarget)
             else -> null
         }
     }
 
-    private fun calibratedSingleMargin(workloadKey: String, quantile: Double): Double {
+    private fun calibratedSingleMargin(workloadKey: String, quantile: Double): Double? {
         // Hierarchical fallback: exact cell -> coarser key prefix -> global pool. Each tier first
-        // tries the empirical quantile, then the parametric warmup bound while still cold.
-        // On a single-cell dataset every prefix resolves to the same window, so the prefix tier is a
-        // no-op there (verified); it only engages once multiple size/format cells coexist.
+        // tries the empirical quantile, then the Student-t warmup bound while still cold. Returns
+        // null only when no tier has even PARAMETRIC_MIN_SAMPLES residuals.
         val candidates = mutableListOf<Double>()
         val exact = positiveResidualsByWorkload[workloadKey]?.let { windowMargin(it, quantile) }
         if (exact != null) {
             candidates.add(exact)
         } else {
-            // Coarser tier: any window whose key shares this key's executionKey prefix
-            // (e.g. "bokeh|size=24MP" falls back to the pooled "bokeh|" residuals).
             val prefix = workloadKey.substringBefore('|')
             val coarser = positiveResidualsByWorkload.entries
                 .filter { it.key.substringBefore('|') == prefix }
@@ -482,14 +506,10 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             }
         }
         windowMargin(globalPositiveResiduals, quantile)?.let { candidates.add(it) }
-        candidates.add(minimumErrorMarginMs.toDouble())
-        return candidates.max()
+        return candidates.maxOrNull()
     }
 
-    private fun calibratedCombinedMargin(decisionKey: String, quantile: Double): Double {
-        // Same hierarchical idea for the decision-level window: exact decision cell -> decisions
-        // sharing the stage+tail execution-key prefix -> global combined pool, each with the same
-        // quantile-then-parametric-warmup logic.
+    private fun calibratedCombinedMargin(decisionKey: String, quantile: Double): Double? {
         val candidates = mutableListOf<Double>()
         val exact = combinedPositiveResidualsByDecision[decisionKey]?.let { windowMargin(it, quantile) }
         if (exact != null) {
@@ -505,8 +525,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             }
         }
         windowMargin(globalCombinedPositiveResiduals, quantile)?.let { candidates.add(it) }
-        candidates.add(minimumErrorMarginMs.toDouble())
-        return candidates.max()
+        return candidates.maxOrNull()
     }
 
     private fun calibrationCount(workloadKey: String): Int {
@@ -524,89 +543,31 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     }
 
     private fun confidenceFromCount(sampleCount: Int, calibrationCount: Int): Float {
-        val sampleConfidence = sampleCount.toFloat() / (sampleCount + WARMUP_COUNT).toFloat()
-        val calibrationConfidence = calibrationCount.toFloat() /
-            (calibrationCount + WARMUP_COUNT).toFloat()
+        // Warm scale = minimumSamplesForCalibration (itself derived from targetBreachRate), so
+        // confidence reaches ~0.5 exactly when a cell has enough samples to read an empirical
+        // quantile. Reporting only; never enters the admission decision.
+        val warm = minimumSamplesForCalibration.toFloat()
+        val sampleConfidence = sampleCount.toFloat() / (sampleCount + warm)
+        val calibrationConfidence = calibrationCount.toFloat() / (calibrationCount + warm)
         return (sampleConfidence * calibrationConfidence)
             .coerceIn(MIN_CONFIDENCE, MAX_CONFIDENCE)
     }
 
-    private fun quantileForPressure(
-        pressureLevel: PressureLevel,
-        calibrationCount: Int
-    ): Double {
-
-        if (!enablePressureAwareQuantile) {
-            return highQuantile
-        }
-
-        return if (calibrationCount >= coldGateSampleCount) {
-            highQuantile
-        } else {
-            when (pressureLevel) {
-                PressureLevel.NORMAL -> normalQuantile
-                PressureLevel.LOW -> lowQuantile
-                PressureLevel.HIGH -> highQuantile
-                PressureLevel.CRITICAL -> highQuantile
-            }
-        }.coerceIn(0.5, 0.999)
-    }
-
-    private fun pressureLevel(preExecutionMetrics: PreExecutionMetrics): PressureLevel {
-        val thermal = preExecutionMetrics.thermalSnapshot
-        val overheatLevel = thermal.overheatLevel
-        val thermalStatus = thermal.thermalStatus
-        // overheatLevel leads thermalStatus during an upward thermal transient (measured: oh moves
-        // before ts in ~29 captures vs ts-only in ~17). It is therefore used only as an escalation
-        // early-warning, not as a primary axis. On device logs thermalStatus alone reproduced the
-        // identical UB-miss/over-skip (the two correlate r=0.93), so the level boundaries are driven
-        // by thermalStatus; overheatLevel can only push the level one notch higher when it has run
-        // ahead of thermalStatus, never lower.
-        val overheatEscalates = lastThermalStatus?.let { prevStatus ->
-            lastOverheatLevel?.let { prevOverheat -> overheatLevel > prevOverheat } == true &&
-                thermalStatus <= prevStatus
-        } ?: false
-        val runtimePressure = runtimePressureTracker.currentLevel()
-
-        // Primary axis: thermalStatus. Validated jumps: ts2 is the dominant 4x residual jump; ts3-4
-        // stay elevated (share HIGH) without re-jumping. runtimePressure and an overheat escalation
-        // can each raise the level by one step so an upward transient is not under-protected before
-        // thermalStatus catches up.
-        return when {
-            thermalStatus >= 4 || runtimePressure == PressureLevel.CRITICAL ->
-                PressureLevel.CRITICAL
-            thermalStatus >= 2 || runtimePressure == PressureLevel.HIGH || (overheatEscalates && thermalStatus >= 1) ->
-                PressureLevel.HIGH
-            thermalStatus >= 1 || runtimePressure == PressureLevel.LOW || overheatEscalates ->
-                PressureLevel.LOW
-            else -> PressureLevel.NORMAL
-        }
-    }
-
-    private fun rememberThermal(preExecutionMetrics: PreExecutionMetrics) {
-        val thermal = preExecutionMetrics.thermalSnapshot
-        lastOverheatLevel = thermal.overheatLevel
-        lastThermalStatus = thermal.thermalStatus
-    }
-
     /**
-     * Pressure levels ordered by the size of the positive residual they predict, driven primarily
-     * by thermalStatus - a standard OS integer signal that is stable across device tiers, so one
-     * threshold set covers the whole fleet with zero per-model configuration. On device logs (Bokeh
-     * node, EWMA(0.20) residuals) the strongest single jump is at thermalStatus 2 (p90 residual
-     * 30ms -> 113ms, ~4x); thermalStatus 3-4 stay elevated (~100ms) without re-jumping, so they
-     * share the HIGH level. overheatLevel is used only as an escalation early-warning (it can lead
-     * thermalStatus during an upward transient) - thermalStatus alone reproduced identical
-     * UB-miss/over-skip (the two correlate r=0.93). A continuous thermalHeadroom split (~0.97) was
-     * also evaluated and dropped: it is tier-dependent and the online residual window already
-     * absorbs that signal per tier. Levels are sorted so the implied quantile margin increases
-     * monotonically.
+     * A single monotone thermal-severity scalar in [0,1], used only as the change detector's
+     * escalation prior - it selects an adaptation *speed* within a cell, never splits a cell, never
+     * enters the bound. Both signals are normalized by their platform spec range and fused by
+     * worst-of (max), so there are no fusion weights: thermalStatus dominates in steady state
+     * (validated strongest single predictor) while overheatLevel can lead it during an upward
+     * transient (early warning).
      */
-    private enum class PressureLevel(val label: String) {
-        NORMAL("normal"),
-        LOW("low"),
-        HIGH("high"),
-        CRITICAL("critical"),
+    private fun thermalSeverity(preExecutionMetrics: PreExecutionMetrics): Double {
+        val thermal = preExecutionMetrics.thermalSnapshot
+        val statusTerm = thermal.thermalStatus.coerceIn(0, THERMAL_STATUS_MAX).toDouble() /
+            THERMAL_STATUS_MAX
+        val overheatTerm = thermal.overheatLevel.coerceIn(0, OVERHEAT_LEVEL_MAX).toDouble() /
+            OVERHEAT_LEVEL_MAX
+        return max(statusTerm, overheatTerm).coerceIn(0.0, 1.0)
     }
 
     private data class WorkloadKey(val value: String) {
@@ -677,24 +638,115 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
     }
 
-    private class OnlineEwmaStats {
+    /**
+     * Point estimator: parameter-free adaptive running mean.
+     *
+     * The gain is alpha = 1 / nEff where nEff is an effective sample count. While the series is
+     * stationary, nEff grows toward [maxEffectiveSamples] so the gain shrinks and noise is averaged
+     * out. A two-sided CUSUM on standardized innovations ([DriftDetector]) resets nEff to 1 on a
+     * persistent shift, so the gain jumps and the mean re-locks fast. There are NO tuned constants:
+     * no base alpha, no min/max alpha, no thermal/surprise boost. "Slow on noise, fast on regime
+     * change" is emergent.
+     *
+     * Negative-residual / down-shift handling is structural: the detector is two-sided, so when
+     * execution gets faster the mean is pulled down just as fast as it is pushed up. The upper
+     * margin window is left untouched (one-sided).
+     */
+    private class AdaptiveRunningMean(
+        private val maxEffectiveSamples: Int,
+        driftThreshold: Double,
+    ) {
         var count: Int = 0
             private set
-        var ewmaMs: Double = 0.0
-            private set
-        private var varianceEwma: Double = 0.0
 
-        fun update(observedMs: Double, alpha: Double) {
+        /** What predict() should issue. */
+        var centerMs: Double = 0.0
+            private set
+
+        private var varEwma: Double = 0.0
+        private var effectiveSamples: Int = 0
+        private var lastSeverity: Double = 0.0
+        private val detector = DriftDetector(driftThreshold)
+
+        fun update(observedMs: Double, severity: Double) {
             if (count == 0) {
-                ewmaMs = observedMs
-            } else {
-                val error = abs(observedMs - ewmaMs)
-                varianceEwma = 0.9 * varianceEwma + 0.1 * error
-                val normalized = (varianceEwma / (ewmaMs + 1e-6)).coerceIn(0.0, 2.0)
-                val adaptiveAlpha = (alpha * (1.0 + normalized)).coerceIn(0.05, 0.5)
-                ewmaMs = adaptiveAlpha * observedMs + (1.0 - adaptiveAlpha) * ewmaMs
+                centerMs = observedMs
+                effectiveSamples = 1
+                lastSeverity = severity
+                count = 1
+                return
             }
+
+            val innovation = observedMs - centerMs
+
+            // Consult the detector only once the spread estimate is itself trustworthy; thermal
+            // escalation since this cell last ran lowers the threshold (earlier reaction).
+            var drift = false
+            if (count >= SCALE_WARMUP) {
+                val scale = sqrt(varEwma).coerceAtLeast(1e-6)
+                val z = innovation / scale
+                val severityBoost = (severity - lastSeverity).coerceIn(0.0, 1.0)
+                drift = detector.observe(z, severityBoost)
+            }
+            if (drift) {
+                effectiveSamples = 1
+            }
+            effectiveSamples = (effectiveSamples + 1).coerceAtMost(maxEffectiveSamples)
+
+            val alpha = 1.0 / effectiveSamples
+            centerMs += alpha * innovation
+            // EWMA variance recursion using the same gain (innovation taken pre-update).
+            varEwma = (1.0 - alpha) * (varEwma + alpha * innovation * innovation)
+
+            lastSeverity = severity
             count++
+        }
+    }
+
+    /**
+     * Two-sided CUSUM (Page's test) change detector on standardized innovations. The decision
+     * threshold is the only parameter and is derived from the false-alarm rate
+     * (threshold = -ln(falseAlarmRate), the SPRT log-evidence budget). The allowance k = 0.5 is the
+     * canonical CUSUM design value for detecting a 1-sigma shift (k = delta/2) - a standard design
+     * choice, not a per-device tuning parameter. A thermal-escalation boost in [0,1] lowers the
+     * effective threshold so an upward thermal transient is detected sooner.
+     */
+    private class DriftDetector(private val threshold: Double) {
+        private var cumulativeUp: Double = 0.0
+        private var cumulativeDown: Double = 0.0
+
+        fun observe(z: Double, severityBoost: Double): Boolean {
+            cumulativeUp = (cumulativeUp + z - CUSUM_ALLOWANCE).coerceAtLeast(0.0)
+            cumulativeDown = (cumulativeDown - z - CUSUM_ALLOWANCE).coerceAtLeast(0.0)
+            val effectiveThreshold = threshold * (1.0 - severityBoost.coerceIn(0.0, 1.0))
+            val fired = cumulativeUp > effectiveThreshold || cumulativeDown > effectiveThreshold
+            if (fired) {
+                cumulativeUp = 0.0
+                cumulativeDown = 0.0
+            }
+            return fired
+        }
+    }
+
+    /**
+     * Target-coverage quantile controller (Adaptive Conformal Inference, Gibbs & Candes 2021).
+     * Replaces hand-picked p85/p90/p95/p99. Pick a target breach rate; the effective quantile
+     * self-selects to hit it on the live stream:
+     *     q <- clamp( q + gamma * (breach_t - targetBreachRate) )
+     * breach_t = 1 if the issued upper bound was exceeded, else 0. A breach raises q (widen); a
+     * non-breach - which includes every over-prediction / negative residual - relaxes q.
+     */
+    private class AdaptiveQuantileController(
+        private val targetBreachRate: Double,
+        private val gamma: Double,
+        initialQuantile: Double,
+    ) {
+        var quantile: Double = initialQuantile.coerceIn(Q_MIN, Q_MAX)
+            private set
+
+        fun observe(breach: Boolean) {
+            val err = if (breach) 1.0 else 0.0
+            quantile = (quantile + gamma * (err - targetBreachRate)).coerceIn(Q_MIN, Q_MAX)
         }
     }
 
@@ -726,58 +778,22 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
 
         /**
-         * Conservative parametric upper bound = mean + k * sample standard deviation, for the cold
-         * phase where there are too few residuals for a trustworthy empirical quantile but the mean
-         * and spread are already stable (n >= 2). Used as a warmup bridge before the empirical
-         * quantile takes over at minimumSamplesForCalibration. A normal tail factor (k ~ 2) is
-         * deliberately conservative here: it over-covers slightly on the right-skewed residuals,
-         * which is the safe direction while the window is still filling.
+         * Conservative Student-t upper bound = mean + t_{n-1}(p) * sample std, for the cold phase
+         * where there are too few residuals for a trustworthy empirical quantile but the mean and
+         * spread are already stable. The t-factor widens automatically for small n (vs a fixed
+         * normal factor), which is the correct, derived, safe direction while the window fills. The
+         * coverage level p is itself derived from the target breach rate, so this bound carries no
+         * hand-set constant.
          */
-        fun parametricUpperBound(k: Double): Double {
-            if (values.size < 2) {
+        fun studentTUpperBound(p: Double): Double {
+            val n = values.size
+            if (n < PARAMETRIC_MIN_SAMPLES) {
                 return 0.0
             }
             val mean = values.average()
-            val variance = values.sumOf { (it - mean) * (it - mean) } / values.size.toDouble()
-            return mean + k * sqrt(variance)
-        }
-
-        fun percentileRank(value: Double): Double {
-            if (values.isEmpty()) {
-                return 0.0
-            }
-            val leCount = values.count { it <= value }
-            return leCount.toDouble() / values.size.toDouble()
-        }
-    }
-
-    /**
-     * Tracks recent runtime CPU pressure from a single signal: the run-queue wait of the previous
-     * shot, expressed as a percentile rank within a rolling window. nonvoluntaryCtxSwitches was
-     * evaluated and dropped - it correlates r=0.82 with run-queue wait and carries nearly identical
-     * information (removing it changed tail-admission UB-miss by 0.08%p), so it is redundant. This
-     * is a post-hoc proxy: the value is from the previous capture, used only to nudge the quantile
-     * up while the calibration window is still cold.
-     */
-    private class RuntimePressureTracker(windowSize: Int) {
-        private val runQueueWaitMs = RollingQuantile(windowSize)
-        private var lastRunQueueWaitMs: Double? = null
-
-        fun update(postExecutionMetrics: PostExecutionMetrics) {
-            val cpu = postExecutionMetrics.cpuProcessingSnapshot ?: return
-            val runQueue = cpu.runqueueWaitMs.coerceAtLeast(0L).toDouble()
-            lastRunQueueWaitMs = runQueue
-            runQueueWaitMs.add(runQueue)
-        }
-
-        fun currentLevel(): PressureLevel {
-            val runQueue = lastRunQueueWaitMs ?: return PressureLevel.NORMAL
-            val runQueueRank = runQueueWaitMs.percentileRank(runQueue)
-            return when {
-                runQueueRank >= CRITICAL_PERCENTILE -> PressureLevel.CRITICAL
-                runQueueRank >= HIGH_PERCENTILE -> PressureLevel.HIGH
-                else -> PressureLevel.NORMAL
-            }
+            val variance = values.sumOf { (it - mean) * (it - mean) } / (n - 1).toDouble()
+            val standardDeviation = sqrt(variance)
+            return mean + studentTQuantile(p, n - 1) * standardDeviation
         }
     }
 
@@ -787,17 +803,99 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         private const val NODE_ID_FILTER = "NODE_SEC_FILTER"
         private const val NODE_ID_ENCODING = "NODE_SEC_V2_IMAGE_CODEC"
         private const val UNKNOWN_FORMAT = -1
-        private const val WARMUP_COUNT = 12
+
+        // Platform spec ranges (NOT tuned): Android PowerManager thermal status spans 0..6
+        // (NONE..SHUTDOWN); Samsung overheatLevel spans 0..6. Used only to normalize the two
+        // thermal signals to [0,1] before taking their worst-case for the escalation delta.
+        private const val THERMAL_STATUS_MAX = 6
+        private const val OVERHEAT_LEVEL_MAX = 6
+
+        // Structural numeric-method floors (NOT tuned):
+        //  - need a few points before standardizing innovations for the change detector.
+        private const val SCALE_WARMUP = 4
+        //  - the Cornish-Fisher t-quantile is trustworthy for df >= 5, i.e. n >= 6.
+        private const val PARAMETRIC_MIN_SAMPLES = 6
+        //  - canonical CUSUM allowance k = delta/2 for detecting a 1-sigma shift.
+        private const val CUSUM_ALLOWANCE = 0.5
+        //  - treat the t-distribution as normal once df is large.
+        private const val LARGE_DF = 200
+
+        // Quantile clamps + confidence reporting bounds (numeric guards; never tuned per device).
+        private const val Q_MIN = 0.50
+        private const val Q_MAX = 0.999
         private const val MIN_CONFIDENCE = 0.05f
         private const val MAX_CONFIDENCE = 0.95f
-        private const val HIGH_PERCENTILE = 0.85
-        private const val CRITICAL_PERCENTILE = 0.95
 
         private fun sizeBucket(size: Size): String {
             val pixels = size.width.toLong().coerceAtLeast(0L) * size.height.toLong().coerceAtLeast(0L)
             val megaPixels = pixels.toDouble() / 1_000_000.0
             val nearest = listOf(12, 24, 50, 200).minByOrNull { abs(megaPixels - it) } ?: 12
             return "${nearest}MP"
+        }
+
+        /**
+         * Inverse standard-normal CDF (Acklam's rational approximation; abs error < 1.15e-9). The
+         * coefficients are fixed properties of the approximation - a numerical method, not tuning.
+         */
+        private fun inverseNormalCdf(p: Double): Double {
+            val pp = p.coerceIn(1e-12, 1.0 - 1e-12)
+            val a = doubleArrayOf(
+                -3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+                1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00,
+            )
+            val b = doubleArrayOf(
+                -5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+                6.680131188771972e+01, -1.328068155288572e+01,
+            )
+            val c = doubleArrayOf(
+                -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+                -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00,
+            )
+            val d = doubleArrayOf(
+                7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+                3.754408661907416e+00,
+            )
+            val pLow = 0.02425
+            val pHigh = 1.0 - pLow
+            return when {
+                pp < pLow -> {
+                    val q = sqrt(-2.0 * ln(pp))
+                    (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+                        ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+                }
+                pp <= pHigh -> {
+                    val q = pp - 0.5
+                    val r = q * q
+                    (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+                        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+                }
+                else -> {
+                    val q = sqrt(-2.0 * ln(1.0 - pp))
+                    -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+                        ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+                }
+            }
+        }
+
+        /**
+         * Student-t quantile via the Cornish-Fisher expansion around the normal quantile. Accurate
+         * for df >= 5 (the band where it is used); collapses to the normal quantile for large df.
+         * Standard expansion - no tuned coefficients.
+         */
+        private fun studentTQuantile(p: Double, df: Int): Double {
+            val z = inverseNormalCdf(p)
+            if (df >= LARGE_DF || df <= 0) {
+                return z
+            }
+            val nu = df.toDouble()
+            val z2 = z * z
+            val z3 = z2 * z
+            val z5 = z3 * z2
+            val z7 = z5 * z2
+            val g1 = (z3 + z) / 4.0
+            val g2 = (5.0 * z5 + 16.0 * z3 + 3.0 * z) / 96.0
+            val g3 = (3.0 * z7 + 19.0 * z5 + 17.0 * z3 - 15.0 * z) / 384.0
+            return z + g1 / nu + g2 / (nu * nu) + g3 / (nu * nu * nu)
         }
     }
 }
