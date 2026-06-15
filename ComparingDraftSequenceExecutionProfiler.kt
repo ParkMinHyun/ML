@@ -15,9 +15,8 @@ import android.util.Size
  */
 class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
-    private val referencePredictor: DraftSequenceExecutionPredictor = EwmaDraftSequenceExecutionPredictor(),
-    private val contextualPredictor: ContextualEwmaDraftSequenceExecutionPredictor =
-        ContextualEwmaDraftSequenceExecutionPredictor(),
+    private val referencePredictor: DraftSequenceExecutionPredictor = sReferencePredictor,
+    private val contextualPredictor: ContextualEwmaDraftSequenceExecutionPredictor = sContextualPredictor,
     private val decisionPredictorName: String = referencePredictor.name,
 ) {
 
@@ -219,7 +218,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
     private fun readPreExecutionMetrics(timeoutMs: Long): PreExecutionMetrics {
         val deviceState = deviceStateReader.read()
         return PreExecutionMetrics(
-            budgetMs = timeoutMs - System.currentTimeMillis(),
+            budgetMs = timeoutMs - SystemClock.uptimeMillis(),
             memorySnapshot = deviceState.memorySnapshot,
             thermalSnapshot = deviceState.thermalSnapshot,
             storageSnapshot = deviceState.storageSnapshot,
@@ -246,8 +245,10 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
-    private companion object {
+    companion object {
         private const val SAVING_EXECUTION_KEY = "saving"
+        private val sReferencePredictor = EwmaDraftSequenceExecutionPredictor()
+        private val sContextualPredictor = ContextualEwmaDraftSequenceExecutionPredictor()
     }
 }
 

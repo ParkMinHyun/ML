@@ -34,7 +34,7 @@ class ContextualEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val useRecentRuntimeContext: Boolean = true,
 ) : DraftSequenceExecutionPredictor {
 
-    override val name: String = "draft_sequence_execution_contextual_ewma_conformal"
+    override val name: String = "contextual_ewma_conformal"
 
     private val globalDurationStats = OnlineEwmaStats()
     private val durationStatsByKey: MutableMap<String, OnlineEwmaStats> = mutableMapOf()
@@ -643,7 +643,7 @@ private fun Size.bucket(): String {
 
 private fun NodeParams.signature(): String {
     return when (this) {
-        NodeParams.None -> "none"
+        NodeParams.None, NodeParams.Watermark, NodeParams.Filter -> "none"
         is NodeParams.DualBokeh -> "dualBokeh:${outputImageSize.bucket()}"
         is NodeParams.Encoding -> "encoding:$encodingFormat"
     }

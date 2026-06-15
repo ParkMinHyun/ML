@@ -1,0 +1,108 @@
+package com.samsung.android.camera.core2.node;
+
+import androidx.annotation.NonNull;
+
+public enum NodeId {
+    NODE_DUMMY(-1),
+
+    /*
+     *  Classification of Version  (library is located in binary)
+     *  NODE_[vendor]_[version]_[name]([name]_[major]_[minor]
+     */
+    NODE_SEC_V4_BEAUTY(10_04_00),
+    NODE_ARC_V1_MFHDR(60_01_00),
+    NODE_ARC_V2_MFHDR(60_02_00),
+    NODE_ARC_V4_MFHDR(60_04_00),
+    NODE_SEC_V2_IMAGE_CODEC(100_02_00),
+    NODE_ARC_V1_LLHDR(110_01_00),
+    NODE_ARC_V4_LLHDR(110_04_00),
+    NODE_PANORAMA(129_01_00),
+    NODE_SEC_V1_SINGLE_BOKEH(150_01_00),
+    NODE_SEC_V2_SINGLE_BOKEH(150_02_00),
+    NODE_MPI_V1_HIFILLS(170_01_00),
+    NODE_SEC_V1_EVENT_DETECTION(180_01_00),
+    NODE_SEC_V2_EVENT_DETECTION(180_02_00),
+    NODE_SEC_V1_SALIENCY_FOOD(190_01_00),
+    NODE_SEC_V1_DUAL_BOKEH(230_01_00),
+    NODE_SEC_V1_1_DUAL_BOKEH(230_01_01),
+    NODE_SEC_V2_DUAL_BOKEH(230_02_00),
+    NODE_SEC_V1_LOCAL_TM(240_01_00),
+    NODE_SEC_V1_1_LOCAL_TM(240_01_01),
+    NODE_SRCB_V2_SMART_SCAN(250_02_00),
+    NODE_SEC_V1_UW_DISTORTION(260_01_00),
+    NODE_ARC_V3_SUPER_NIGHT(270_03_00),
+    NODE_MPI_V2_SUPER_NIGHT(271_02_00),
+    NODE_ARC_V2_SUPER_RESOLUTION(290_02_00),
+    NODE_ARC_V2_1_SUPER_RESOLUTION(290_02_01),
+    NODE_ARC_V1_HIGH_RES(300_01_00),
+    NODE_ARC_V1_FUSION_HIGH_RES(310_01_00),
+    NODE_ARC_V1_SIE(360_01_00),
+    NODE_ARC_V1_SSHDR(370_01_00),
+    NODE_ARC_V1_FACE_RESTORATION(380_01_00),
+    NODE_ARC_V1_UW_SUPER_RESOLUTION(390_01_00),
+    NODE_ARC_V1_SUPER_RESOLUTION_RAW(400_01_00),
+    NODE_ARC_V2_SUPER_RESOLUTION_RAW(400_02_00),
+    NODE_SEC_V1_UDC(410_01_00),
+    NODE_SEC_V2_UDC(410_02_00),
+    NODE_ARC_V1_HYBRID_HDR(420_01_00),
+    NODE_SEC_V1_AI_HIGH_RES(430_01_00),
+    NODE_SEC_V2_AI_HIGH_RES(430_02_00),
+    NODE_SEC_V2_1_AI_HIGH_RES(430_02_01),
+    NODE_SEC_V3_AI_HIGH_RES(430_03_00),
+    NODE_ARC_V1_AEB_HDR(440_01_00),
+    NODE_MPI_V1_PRO_RGB_CONVERSION(460_01_00),
+    NODE_ARC_V1_MACRO_RAW_SR(470_01_00),
+    NODE_ARC_V1_AI_CLEAR_ZOOM(490_01_00),
+    NODE_ARC_V2_AI_CLEAR_ZOOM(490_02_00),
+    NODE_SEC_V1_TETRA_SR(510_01_00),
+    NODE_SEC_V1_STEREO_PHOTO(520_01_00),
+    NODE_SEC_V1_AI_ISP(530_01_00),
+    NODE_ARC_V1_DE_FLICKER(550_01_00),
+    NODE_SEC_V1_HEXADECA_SR(560_01_00),
+    NODE_SEC_V1_DE_FLICKER_HDR(570_01_00),
+    NODE_SEC_V1_COMPRESSED_RAW_DECODER(580_01_00),
+
+    /*
+     *  Classification of simple  (library is located in app)
+     *  NODE_[vendor]_[name] or NODE_[name]
+     */
+    NODE_SAIV_QRCODE(110),
+    NODE_ARC_PALM(120),
+    NODE_WATERMARK(150),
+    NODE_SEF(170),
+    NODE_DNG(180),
+    NODE_SAVE_YUV_FOR_GAIN_MAP(190),
+    NODE_IMAGE_RESIZE(200),
+    NODE_SAVE_YUV_FOR_DUAL_CAMERA(210),
+    NODE_EXIF(240),
+    NODE_AGIF(250),
+    NODE_XMP(270),
+    NODE_CONVERTER(280),
+    NODE_SRIB_SCENE_DETECTION(290),
+    NODE_SEC_FILTER(310),
+    NODE_POLARR_COMPOSITION_GUIDE_NODE(320),
+    NODE_NON_DESTRUCTION(340),
+    NODE_WIDE_DISTORTION(350),
+    NODE_SELFIE_CORRECTION(360),
+    NODE_DYNAMIC_FUNCTION(370);
+
+    private final int id;
+
+    NodeId(int id) {
+        this.id = id;
+    }
+
+    public int getId() {
+        return id;
+    }
+
+    @NonNull
+    public static NodeId fromId(int id) {
+        for (NodeId nodeId : values()) {
+            if (nodeId.getId() == id) {
+                return nodeId;
+            }
+        }
+        return NODE_DUMMY;
+    }
+}

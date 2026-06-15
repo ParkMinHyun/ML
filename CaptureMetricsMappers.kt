@@ -315,7 +315,7 @@ fun StorageSnapshotEntity.toModel(): StorageSnapshot {
 
 fun NodeParams.toJson(): String {
     return when (this) {
-        NodeParams.None -> JSONObject()
+        NodeParams.None, NodeParams.Watermark, NodeParams.Filter -> JSONObject()
             .put(NODE_PARAMS_KEY_TYPE, NODE_PARAMS_TYPE_NONE)
             .toString()
         is NodeParams.DualBokeh -> JSONObject()

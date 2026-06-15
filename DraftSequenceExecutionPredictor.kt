@@ -39,7 +39,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val minimumErrorMarginMs: Long = 80L,
 ) : DraftSequenceExecutionPredictor {
 
-    override val name: String = "draft_sequence_execution_ewma"
+    override val name: String = "ewma"
 
     private val statsByKey: MutableMap<String, EwmaStats> = mutableMapOf()
 

@@ -35,12 +35,17 @@ data class SavingExecutionMetrics(
     val resultImageFormat: Int,
     val preExecutionMetrics: PreExecutionMetrics,
     val postExecutionMetrics: PostExecutionMetrics,
+    var startTimestampMs: Long = 0L,
 )
 
 sealed interface NodeParams {
     data object None : NodeParams
 
     data class DualBokeh(val outputImageSize: Size) : NodeParams
+
+    data object Filter : NodeParams
+
+    data object Watermark : NodeParams
 
     data class Encoding(val encodingFormat: Int) : NodeParams
 }
