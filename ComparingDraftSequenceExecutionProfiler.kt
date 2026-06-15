@@ -4,7 +4,7 @@ import android.os.SystemClock
 import android.util.Size
 
 /**
- * Runs a reference predictor and the contextual EWMA predictor side by side for comparison.
+ * Runs a reference predictor and the conformal EWMA predictor side by side for comparison.
  *
  * Callers use this profiler instead of [DraftSequenceExecutionProfiler]. It records one
  * [NodeExecutionMetrics] / [SavingExecutionMetrics] row for the real work, and records one
@@ -16,7 +16,7 @@ import android.util.Size
 class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
     private val referencePredictor: DraftSequenceExecutionPredictor = sReferencePredictor,
-    private val contextualPredictor: ContextualEwmaDraftSequenceExecutionPredictor = sContextualPredictor,
+    private val conformalPredictor: ConformalEwmaDraftSequenceExecutionPredictor = sConformalPredictor,
     private val decisionPredictorName: String = referencePredictor.name,
 ) {
 
@@ -48,7 +48,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
             referencePredictor
                 .predict(nodeId, preExecutionMetrics)
                 .forComparison(referencePredictor.name, order),
-            contextualPredictor
+            conformalPredictor
                 .predictNodeExecution(
                     captureMetrics = captureMetrics,
                     nodeId = nodeId,
@@ -56,7 +56,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                     inputImageSize = inputImageSize,
                     preExecutionMetrics = preExecutionMetrics,
                 )
-                .forComparison(contextualPredictor.name, order),
+                .forComparison(conformalPredictor.name, order),
         )
 
         synchronized(draftMetrics) {
@@ -77,7 +77,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                     )
                 },
                 {
-                    contextualPredictor.updateNodeExecution(
+                    conformalPredictor.updateNodeExecution(
                         captureMetrics = captureMetrics,
                         nodeExecutionMetrics = nodeExecutionMetrics,
                     )
@@ -111,13 +111,13 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                     predictorName = referencePredictor.name,
                     executionOrder = ExecutionPredictionEntity.SAVING_ORDER,
                 ),
-            contextualPredictor
+            conformalPredictor
                 .predictSavingExecution(
                     captureMetrics = captureMetrics,
                     savingExecutionMetrics = savingExecutionMetrics,
                 )
                 .forComparison(
-                    predictorName = contextualPredictor.name,
+                    predictorName = conformalPredictor.name,
                     executionOrder = ExecutionPredictionEntity.SAVING_ORDER,
                 ),
         )
@@ -142,7 +142,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                     )
                 },
                 {
-                    contextualPredictor.updateSavingExecution(
+                    conformalPredictor.updateSavingExecution(
                         captureMetrics = captureMetrics,
                         savingExecutionMetrics = savingExecutionMetrics,
                     )
@@ -161,12 +161,12 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
             encodingPrediction = referencePredictor.predict(encodingNodeId, preExecutionMetrics),
             savingPrediction = referencePredictor.predict(SAVING_EXECUTION_KEY, preExecutionMetrics),
         )
-        val contextualPrediction = combineFallbackPrediction(
-            predictorName = contextualPredictor.name,
-            encodingPrediction = contextualPredictor.predict(encodingNodeId, preExecutionMetrics),
-            savingPrediction = contextualPredictor.predict(SAVING_EXECUTION_KEY, preExecutionMetrics),
+        val conformalPrediction = combineFallbackPrediction(
+            predictorName = conformalPredictor.name,
+            encodingPrediction = conformalPredictor.predict(encodingNodeId, preExecutionMetrics),
+            savingPrediction = conformalPredictor.predict(SAVING_EXECUTION_KEY, preExecutionMetrics),
         )
-        val predictions = listOf(referencePrediction, contextualPrediction)
+        val predictions = listOf(referencePrediction, conformalPrediction)
 
         return ComparedExecutionPrediction(
             predictions = predictions,
@@ -194,7 +194,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                         preExecutionMetrics = node.preExecutionMetrics,
                         postExecutionMetrics = node.postExecutionMetrics,
                     )
-                    contextualPredictor.updateNodeExecution(captureMetrics, node)
+                    conformalPredictor.updateNodeExecution(captureMetrics, node)
                     updatedCount++
                 }
             }
@@ -206,7 +206,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
                         preExecutionMetrics = saving.preExecutionMetrics,
                         postExecutionMetrics = saving.postExecutionMetrics,
                     )
-                    contextualPredictor.updateSavingExecution(captureMetrics, saving)
+                    conformalPredictor.updateSavingExecution(captureMetrics, saving)
                     updatedCount++
                 }
             }
@@ -248,7 +248,7 @@ class ComparingDraftSequenceExecutionProfiler @JvmOverloads constructor(
     companion object {
         private const val SAVING_EXECUTION_KEY = "saving"
         private val sReferencePredictor = EwmaDraftSequenceExecutionPredictor()
-        private val sContextualPredictor = ContextualEwmaDraftSequenceExecutionPredictor()
+        private val sConformalPredictor = ConformalEwmaDraftSequenceExecutionPredictor()
     }
 }
 
