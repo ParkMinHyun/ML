@@ -216,13 +216,13 @@ abstract class DraftSequenceExecutionPredictor {
  * Coarse workload family a node / saving / tail maps to. This is the grouping level the predictors
  * fall back to when an exact [WorkloadKey] cell does not yet have enough samples.
  */
-enum class WorkloadCategory(val tag: String) {
-    BOKEH("bokeh"),
-    FILTER("filter"),
-    ENCODING("encoding"),
-    TAIL("tail"),
-    SAVING("saving"),
-    NODE("node");
+enum class WorkloadCategory {
+    BOKEH,
+    FILTER,
+    ENCODING,
+    TAIL,
+    SAVING,
+    NODE;
 
     /**
      * Whether this family is gated on the combined (stage + Encoding + Saving) admission bound rather
@@ -265,27 +265,52 @@ enum class SizeBucket(val megaPixels: Int) {
 }
 
 /**
- * Stable workload bucket - the Mondrian split shared by every predictor:
+ * Stable workload bucket shared by every predictor:
  *   Bokeh : DualBokeh output [SizeBucket]
  *   Filter: input [SizeBucket]
  *   Encoding/Tail/Saving: [SizeBucket] x image format (Saving also splits on the pending flag)
  *
- * Identity is the typed fields (it is a data class), so it can be used directly as a map key without
- * any string format to keep in sync; [toString] renders a compact form for logs only.
+ * Identity is the typed fields of each subtype, so it can be used directly as a map key without any
+ * string format to keep in sync.
  */
-data class WorkloadKey internal constructor(
-    val category: WorkloadCategory,
-    val sizeBucket: SizeBucket? = null,
-    val imageFormat: Int? = null,
-    val isPendingRequest: Boolean? = null,
-    val nodeName: String? = null,
-) {
-    override fun toString(): String = buildString {
-        append(category.tag)
-        sizeBucket?.let { append("|").append(it.megaPixels).append("MP") }
-        imageFormat?.let { append("|fmt=").append(it) }
-        isPendingRequest?.let { append("|pending=").append(it) }
-        nodeName?.let { append("|").append(it) }
+sealed interface WorkloadKey {
+    val category: WorkloadCategory
+
+    data class Bokeh(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.BOKEH
+    }
+
+    data class Filter(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.FILTER
+    }
+
+    data class Encoding(
+        val sizeBucket: SizeBucket,
+        val imageFormat: Int,
+    ) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.ENCODING
+    }
+
+    data class Tail(
+        val sizeBucket: SizeBucket,
+        val imageFormat: Int,
+    ) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.TAIL
+    }
+
+    data class Saving(
+        val sizeBucket: SizeBucket,
+        val imageFormat: Int,
+        val isPendingRequest: Boolean,
+    ) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.SAVING
+    }
+
+    data class Node(
+        val nodeId: NodeId,
+        val sizeBucket: SizeBucket,
+    ) : WorkloadKey {
+        override val category: WorkloadCategory = WorkloadCategory.NODE
     }
 
     companion object {
@@ -297,22 +322,13 @@ data class WorkloadKey internal constructor(
             inputImageSize: Size,
         ): WorkloadKey {
             return when (WorkloadCategory.ofNode(nodeId)) {
-                WorkloadCategory.BOKEH ->
-                    WorkloadKey(WorkloadCategory.BOKEH, sizeBucket = SizeBucket.of(bokehOutputSize(nodeParams)))
-                WorkloadCategory.FILTER ->
-                    WorkloadKey(WorkloadCategory.FILTER, sizeBucket = SizeBucket.of(inputImageSize))
-                WorkloadCategory.ENCODING ->
-                    WorkloadKey(
-                        WorkloadCategory.ENCODING,
-                        sizeBucket = SizeBucket.of(inputImageSize),
-                        imageFormat = encodingFormat(nodeParams),
-                    )
-                else ->
-                    WorkloadKey(
-                        WorkloadCategory.NODE,
-                        sizeBucket = SizeBucket.of(inputImageSize),
-                        nodeName = nodeId.name,
-                    )
+                WorkloadCategory.BOKEH -> Bokeh(SizeBucket.of(bokehOutputSize(nodeParams)))
+                WorkloadCategory.FILTER -> Filter(SizeBucket.of(inputImageSize))
+                WorkloadCategory.ENCODING -> Encoding(
+                    sizeBucket = SizeBucket.of(inputImageSize),
+                    imageFormat = encodingFormat(nodeParams),
+                )
+                else -> Node(nodeId = nodeId, sizeBucket = SizeBucket.of(inputImageSize))
             }
         }
 
@@ -320,8 +336,7 @@ data class WorkloadKey internal constructor(
             resultImageSize: Size,
             resultImageFormat: Int,
         ): WorkloadKey {
-            return WorkloadKey(
-                WorkloadCategory.TAIL,
+            return Tail(
                 sizeBucket = SizeBucket.of(resultImageSize),
                 imageFormat = resultImageFormat,
             )
@@ -332,8 +347,7 @@ data class WorkloadKey internal constructor(
             resultImageSize: Size,
             resultImageFormat: Int,
         ): WorkloadKey {
-            return WorkloadKey(
-                WorkloadCategory.SAVING,
+            return Saving(
                 sizeBucket = SizeBucket.of(resultImageSize),
                 imageFormat = resultImageFormat,
                 isPendingRequest = isPendingRequest,
@@ -367,8 +381,6 @@ data class DecisionKey internal constructor(
     val stageKey: WorkloadKey,
     val tailKey: WorkloadKey,
 ) {
-    override fun toString(): String = "$stageKey|$tailKey"
-
     companion object {
         fun combined(stageKey: WorkloadKey, tailKey: WorkloadKey): DecisionKey {
             return DecisionKey(stageKey, tailKey)
@@ -471,25 +483,35 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * @param nodeParams node-specific pre-execution params (e.g. encoding format, bokeh output size).
      * @param timeoutMs absolute deadline for this node; the remaining budget is derived at read time.
      * @param inputImageSize input image dimensions.
+     * @param resultImageSize final capture result image dimensions for the mandatory tail key.
+     * @param resultImageFormat final capture result image format for the mandatory tail key.
      * @param draftMetrics draft metrics to append this node's record to.
      */
     @JvmOverloads
     fun profileNodeExecution(
-        captureMetrics: CaptureMetrics,
         nodeId: NodeId,
         nodeParams: NodeParams = NodeParams.None,
         timeoutMs: Long,
         inputImageSize: Size,
-        draftMetrics: DraftSequenceMetrics = captureMetrics.ensureDraftSequenceMetrics(),
+        resultImageSize: Size,
+        resultImageFormat: Int,
+        draftMetrics: DraftSequenceMetrics,
     ): DraftSequenceExecutionSession {
-        val preExecutionMetrics = readPreExecutionMetrics(timeoutMs)
+        val deviceState = deviceStateReader.read()
+        val preExecutionMetrics = PreExecutionMetrics(
+            budgetMs = timeoutMs - SystemClock.uptimeMillis(),
+            memorySnapshot = deviceState.memorySnapshot,
+            thermalSnapshot = deviceState.thermalSnapshot,
+            storageSnapshot = deviceState.storageSnapshot,
+        )
+
         val prediction = if (WorkloadCategory.ofNode(nodeId).isAdmissionStage) {
             predictor.predictCombinedAdmission(
                 stageNodeId = nodeId,
                 stageNodeParams = nodeParams,
                 stageInputImageSize = inputImageSize,
-                tailResultImageSize = captureMetrics.resultImageSize,
-                tailResultImageFormat = captureMetrics.resultImageFormat,
+                tailResultImageSize = resultImageSize,
+                tailResultImageFormat = resultImageFormat,
                 preExecutionMetrics = preExecutionMetrics,
             )
         } else {
@@ -514,16 +536,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             executionPrediction = prediction,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
             onComplete = { predictor.updateNodeExecution(nodeExecutionMetrics) },
-        )
-    }
-
-    private fun readPreExecutionMetrics(timeoutMs: Long): PreExecutionMetrics {
-        val deviceState = deviceStateReader.read()
-        return PreExecutionMetrics(
-            budgetMs = timeoutMs - SystemClock.uptimeMillis(),
-            memorySnapshot = deviceState.memorySnapshot,
-            thermalSnapshot = deviceState.thermalSnapshot,
-            storageSnapshot = deviceState.storageSnapshot,
         )
     }
 }
@@ -562,11 +574,5 @@ class DraftSequenceExecutionSession internal constructor(
         postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
 
         onComplete()
-    }
-}
-
-private fun CaptureMetrics.ensureDraftSequenceMetrics(): DraftSequenceMetrics {
-    return draftSequenceMetrics ?: DraftSequenceMetrics().also {
-        draftSequenceMetrics = it
     }
 }

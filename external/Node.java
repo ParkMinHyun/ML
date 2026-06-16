@@ -1258,11 +1258,13 @@ public abstract class Node implements PictureFormatProcessableInterface {
         // reports shouldRun == true and merely feeds its observed cost back into the model.
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
         final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(
-                captureMetrics,
                 mNodeId,
                 nodeParams,
-                captureMetrics.getTimeoutTimestampMs(),
-                picture.getImageInfo().getSize());
+                Objects.requireNonNull(captureMetrics.getTimeoutTimestampMs(), "timeoutMs"),
+                picture.getImageInfo().getSize(),
+                captureMetrics.getResultImageSize(),
+                captureMetrics.getResultImageFormat(),
+                draftSequenceMetrics);
         if (!session.getShouldRun()) {
             return picture;
         }
