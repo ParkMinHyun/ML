@@ -18,7 +18,7 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
     val nodeExecutionMetricsList: MutableList<NodeExecutionMetrics> = mutableListOf(),
     val nodeExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
     var savingExecutionMetrics: SavingExecutionMetrics? = null,
-    val savingExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
+    var savingExecutionPrediction: ExecutionPrediction? = null,
     var isTimeout: Boolean? = false,
 )
 
@@ -68,12 +68,4 @@ data class ExecutionPrediction @JvmOverloads constructor(
     val admit: Boolean = false,
     val predictedDurationMs: Long,
     val predictedUpperBoundMs: Long,
-    val confidence: Float,
-    val reason: String,
-    val predictorName: String = PREDICTOR_UNKNOWN,
-    val executionOrder: Int? = null,
-) {
-    companion object {
-        const val PREDICTOR_UNKNOWN = "unknown"
-    }
-}
+)

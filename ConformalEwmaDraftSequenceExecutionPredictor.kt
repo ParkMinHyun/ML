@@ -111,26 +111,9 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         val predictedDurationMs = predictedMs.roundToLong()
         val budgetMs = preExecutionMetrics.budgetMs
         val admit = upperBoundMs <= budgetMs
-        val reason = buildString {
-            append("model=").append(name)
-            append(" type=single")
-            append(" workload=").append(workloadKey)
-            append(" samples=").append(stats?.count ?: 0)
-            append(" q=").append(quantile)
-            append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
-            append(" budgetMs=").append(budgetMs)
-            append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(admit)
-        }
         return ExecutionPrediction(
             predictedDurationMs = predictedDurationMs,
             predictedUpperBoundMs = upperBoundMs,
-            confidence = confidenceFromCount(
-                sampleCount = stats?.count ?: 0,
-                calibrationCount = calibrationCount(workloadKey),
-            ),
-            reason = reason,
-            predictorName = name,
             admit = admit,
         )
     }
@@ -186,27 +169,9 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val budgetMs = preExecutionMetrics.budgetMs
         val admit = upperBoundMs <= budgetMs
-        val reason = buildString {
-            append("model=").append(name)
-            append(" type=combined")
-            append(" decision=").append(decisionKey)
-            append(" stageSamples=").append(stageStats?.count ?: 0)
-            append(" tailSamples=").append(tailStats?.count ?: 0)
-            append(" q=").append(quantile)
-            append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
-            append(" budgetMs=").append(budgetMs)
-            append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(admit)
-        }
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
             predictedUpperBoundMs = upperBoundMs,
-            confidence = confidenceFromCount(
-                sampleCount = (stageStats?.count ?: 0) + (tailStats?.count ?: 0),
-                calibrationCount = combinedCalibrationCount(decisionKey),
-            ),
-            reason = reason,
-            predictorName = name,
             admit = admit,
         )
     }
@@ -285,30 +250,6 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         windowMargin(globalCombinedPositiveResiduals, quantile)?.let { candidates.add(it) }
         return candidates.maxOrNull()
-    }
-
-    private fun calibrationCount(workloadKey: WorkloadKey): Int {
-        return max(
-            positiveResidualsByWorkload[workloadKey]?.count ?: 0,
-            globalPositiveResiduals.count,
-        )
-    }
-
-    private fun combinedCalibrationCount(decisionKey: DecisionKey): Int {
-        return max(
-            combinedPositiveResidualsByDecision[decisionKey]?.count ?: 0,
-            globalCombinedPositiveResiduals.count,
-        )
-    }
-
-    private fun confidenceFromCount(sampleCount: Int, calibrationCount: Int): Float {
-        // Warm scale = minimumSamplesForCalibration (itself derived from targetBreachRate). Reporting
-        // only; never enters the admission decision.
-        val warm = minimumSamplesForCalibration.toFloat()
-        val sampleConfidence = sampleCount.toFloat() / (sampleCount + warm)
-        val calibrationConfidence = calibrationCount.toFloat() / (calibrationCount + warm)
-        return (sampleConfidence * calibrationConfidence)
-            .coerceIn(MIN_CONFIDENCE, MAX_CONFIDENCE)
     }
 
     /**
@@ -483,11 +424,9 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         //  - treat the t-distribution as normal once df is large.
         private const val LARGE_DF = 200
 
-        // Quantile clamps + confidence reporting bounds (numeric guards; never tuned per device).
+        // Quantile clamps.
         private const val Q_MIN = 0.50
         private const val Q_MAX = 0.999
-        private const val MIN_CONFIDENCE = 0.05f
-        private const val MAX_CONFIDENCE = 0.95f
 
         /**
          * Inverse standard-normal CDF (Acklam's rational approximation; abs error < 1.15e-9). The

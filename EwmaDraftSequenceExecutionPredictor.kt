@@ -41,28 +41,10 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val budgetMs = preExecutionMetrics.budgetMs
         val admit = upperBoundMs <= budgetMs
-        val reason = buildString {
-            append("model=").append(name)
-            append(" type=single")
-            append(" workload=").append(workloadKey)
-            append(" samples=").append(stats?.count ?: 0)
-            append(" residualSamples=").append(residualCount(workloadKey))
-            append(" q=").append(residualQuantile)
-            append(" marginMs=").append(marginMs.roundToLong())
-            append(" budgetMs=").append(budgetMs)
-            append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(admit)
-        }
 
         return ExecutionPrediction(
             predictedDurationMs = predictedDurationMs,
             predictedUpperBoundMs = upperBoundMs,
-            confidence = confidenceFromCount(
-                sampleCount = stats?.count ?: 0,
-                residualCount = residualCount(workloadKey),
-            ),
-            reason = reason,
-            predictorName = name,
             admit = admit,
         )
     }
@@ -109,29 +91,10 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val budgetMs = preExecutionMetrics.budgetMs
         val admit = upperBoundMs <= budgetMs
-        val reason = buildString {
-            append("model=").append(name)
-            append(" type=combined")
-            append(" decision=").append(decisionKey)
-            append(" stageSamples=").append(stageStats?.count ?: 0)
-            append(" tailSamples=").append(tailStats?.count ?: 0)
-            append(" residualSamples=").append(combinedResidualCount(decisionKey))
-            append(" q=").append(residualQuantile)
-            append(" marginMs=").append(marginMs.roundToLong())
-            append(" budgetMs=").append(budgetMs)
-            append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(admit)
-        }
 
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
             predictedUpperBoundMs = upperBoundMs,
-            confidence = confidenceFromCount(
-                sampleCount = (stageStats?.count ?: 0) + (tailStats?.count ?: 0),
-                residualCount = combinedResidualCount(decisionKey),
-            ),
-            reason = reason,
-            predictorName = name,
             admit = admit,
         )
     }
@@ -164,20 +127,6 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         return combinedPositiveResidualsByDecision[decisionKey]
             ?.quantile(residualQuantile)
             ?: 0.0
-    }
-
-    private fun residualCount(workloadKey: WorkloadKey): Int {
-        return positiveResidualsByWorkload[workloadKey]?.count ?: 0
-    }
-
-    private fun combinedResidualCount(decisionKey: DecisionKey): Int {
-        return combinedPositiveResidualsByDecision[decisionKey]?.count ?: 0
-    }
-
-    private fun confidenceFromCount(sampleCount: Int, residualCount: Int): Float {
-        val sampleConfidence = sampleCount.toFloat() / (sampleCount + WARMUP_COUNT).toFloat()
-        val residualConfidence = residualCount.toFloat() / (residualCount + WARMUP_COUNT).toFloat()
-        return (sampleConfidence * residualConfidence).coerceIn(MIN_CONFIDENCE, MAX_CONFIDENCE)
     }
 
     private class EwmaStats {
@@ -224,9 +173,4 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
     }
 
-    private companion object {
-        private const val WARMUP_COUNT = 12
-        private const val MIN_CONFIDENCE = 0.05f
-        private const val MAX_CONFIDENCE = 0.90f
-    }
 }

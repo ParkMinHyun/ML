@@ -32,14 +32,13 @@ class CaptureMetricsExcelExporter(
 
             val rawCaptures = metricsList.mapIndexed { index, metrics ->
                 val draftMetrics = metrics.draftSequenceMetrics
-                val nodePredictionsByOrder = draftMetrics?.nodeExecutionPredictionList?.groupBy { it.executionOrder }
 
                 val nodeRows = draftMetrics?.nodeExecutionMetricsList.orEmpty().mapIndexed { order, node ->
-                    NodeRow(node, nodePredictionsByOrder?.get(order).orEmpty())
+                    NodeRow(node, draftMetrics?.nodeExecutionPredictionList?.getOrNull(order))
                 }
 
                 val savingRow = draftMetrics?.savingExecutionMetrics?.let { savingMetrics ->
-                    SavingRow(savingMetrics, draftMetrics.savingExecutionPredictionList)
+                    SavingRow(savingMetrics, draftMetrics.savingExecutionPrediction)
                 }
 
                 CaptureRow(
@@ -121,21 +120,12 @@ class CaptureMetricsExcelExporter(
 
         nodeRowsByNodeId.toSortedMap().forEach { (nodeId, rows) ->
             val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeId")
-            val predictorNames = rows
-                .flatMap { it.third.predictions.map { pred -> pred.predictorName } }
-                .distinct()
-                .sorted()
-            val nodeColumns = buildNodeColumns(predictorNames)
+            val nodeColumns = buildNodeColumns()
             writeSheet(workbook, styles, sheetName, rows, nodeColumns)
         }
 
         if (captures.any { it.row.savingRow != null }) {
-            val savingPredictorNames = captures
-                .mapNotNull { it.row.savingRow }
-                .flatMap { it.predictions.map { pred -> pred.predictorName } }
-                .distinct()
-                .sorted()
-            val savingColumns = buildSavingColumns(savingPredictorNames)
+            val savingColumns = buildSavingColumns()
             val flattenedSavingRows = captures.mapNotNull { enrichedCapture ->
                 enrichedCapture.row.savingRow?.let { Pair(enrichedCapture.row.captureIndex, it) }
             }
@@ -219,36 +209,28 @@ class CaptureMetricsExcelExporter(
 
     private class NodeRow(
         val node: NodeExecutionMetrics,
-        val predictions: List<ExecutionPrediction>,
+        val prediction: ExecutionPrediction?,
     ) {
         private val actualDurationMs: Long?
             get() = node.postExecutionMetrics.durationMs.takeIf { it > 0L }
 
-        fun predictionFor(predictorName: String): ExecutionPrediction? {
-            return predictions.find { it.predictorName == predictorName }
-        }
-
-        fun predictionErrorMs(predictorName: String): Long? {
+        fun predictionErrorMs(): Long? {
             val durationMs = actualDurationMs ?: return null
-            val prediction = predictionFor(predictorName) ?: return null
+            val prediction = prediction ?: return null
             return durationMs - prediction.predictedDurationMs
         }
     }
 
     private class SavingRow(
         val saving: SavingExecutionMetrics,
-        val predictions: List<ExecutionPrediction>,
+        val prediction: ExecutionPrediction?,
     ) {
         private val actualDurationMs: Long?
             get() = saving.postExecutionMetrics.durationMs.takeIf { it > 0L }
 
-        fun predictionFor(predictorName: String): ExecutionPrediction? {
-            return predictions.find { it.predictorName == predictorName }
-        }
-
-        fun predictionErrorMs(predictorName: String): Long? {
+        fun predictionErrorMs(): Long? {
             val durationMs = actualDurationMs ?: return null
-            val prediction = predictionFor(predictorName) ?: return null
+            val prediction = prediction ?: return null
             return durationMs - prediction.predictedDurationMs
         }
     }
@@ -302,7 +284,7 @@ class CaptureMetricsExcelExporter(
             Column("timeoutCount") { it.timeoutCount?.let { idx -> "#$idx" } }
         )
 
-        private fun buildNodeColumns(predictorNames: List<String>): List<Column<Triple<Int, String, NodeRow>>> {
+        private fun buildNodeColumns(): List<Column<Triple<Int, String, NodeRow>>> {
             val columns = mutableListOf<Column<Triple<Int, String, NodeRow>>>(
                 Column("captureIndex") { it.first },
                 Column("nodeId") { it.second },
@@ -331,7 +313,7 @@ class CaptureMetricsExcelExporter(
             return columns
         }
 
-        private fun buildSavingColumns(predictorNames: List<String>): List<Column<Pair<Int, SavingRow>>> {
+        private fun buildSavingColumns(): List<Column<Pair<Int, SavingRow>>> {
             val columns = mutableListOf<Column<Pair<Int, SavingRow>>>(
                 Column("captureIndex") { it.first },
                 Column("isPendingRequest") { it.second.saving.isPendingRequest },
@@ -367,8 +349,5 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        private fun DraftSequenceMetrics.savingPredictions(): List<ExecutionPrediction> {
-            return savingExecutionPredictionList
-        }
     }
 }

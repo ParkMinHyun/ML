@@ -150,29 +150,17 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "order")
     val order: Int,
 
-    @ColumnInfo(
-        name = "predictor_name",
-        defaultValue = "'unknown'",
-    )
-    val predictorName: String = ExecutionPrediction.PREDICTOR_UNKNOWN,
-
     @ColumnInfo(name = "predicted_duration_ms")
     val predictedDurationMs: Long,
 
     @ColumnInfo(name = "predicted_upper_bound_ms")
     val predictedUpperBoundMs: Long,
 
-    @ColumnInfo(name = "confidence")
-    val confidence: Float,
-
     @ColumnInfo(
         name = "admit",
         defaultValue = "0",
     )
     val admit: Boolean = false,
-
-    @ColumnInfo(name = "reason")
-    val reason: String,
 ) {
     enum class PredictionTarget { NODE, SAVING }
 
