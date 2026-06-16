@@ -1254,7 +1254,7 @@ public abstract class Node implements PictureFormatProcessableInterface {
             final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
             final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.predictNodeExecution(
                     captureMetrics,
-                    mNodeId.name(),
+                    mNodeId,
                     nodeParams,
                     captureMetrics.getTimeoutTimestampMs(),
                     picture.getImageInfo().getSize());

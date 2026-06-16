@@ -1,6 +1,7 @@
 package com.samsung.android.camera.core2.ml
 
 import android.util.Size
+import com.samsung.android.camera.core2.node.NodeId
 import org.json.JSONObject
 
 private const val NODE_PARAMS_KEY_TYPE = "type"
@@ -51,7 +52,7 @@ fun NodeExecutionMetrics.toEntity(
     return NodeExecutionMetricsEntity(
         captureMetricsId = captureMetricsId,
         order = order,
-        nodeId = nodeId,
+        nodeId = nodeId.name,
         nodeParams = nodeParams.toJson(),
         budgetMs = preExecution.budgetMs,
         inputImageWidth = inputImageSize.width,
@@ -104,7 +105,7 @@ fun ExecutionPrediction.toEntity(
         predictedDurationMs = predictedDurationMs,
         predictedUpperBoundMs = predictedUpperBoundMs,
         confidence = confidence,
-        addmit = addmit,
+        admit = admit,
         reason = reason,
     )
 }
@@ -238,7 +239,7 @@ fun SavingExecutionMetricsEntity.toModel(): SavingExecutionMetrics {
 
 fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
     return NodeExecutionMetrics(
-        nodeId = nodeId,
+        nodeId = nodeId.toNodeId(),
         nodeParams = nodeParams.toNodeParams(),
         inputImageSize = Size(inputImageWidth, inputImageHeight),
         preExecutionMetrics = toPreExecutionMetrics(),
@@ -254,7 +255,7 @@ fun ExecutionPredictionEntity.toModel(): ExecutionPrediction {
         reason = reason,
         predictorName = predictorName,
         executionOrder = order,
-        addmit = addmit,
+        admit = admit,
     )
 }
 
@@ -349,4 +350,9 @@ fun String.toNodeParams(): NodeParams {
         )
         else -> NodeParams.None
     }
+}
+
+/** Maps a persisted node-id name back to its [NodeId]; unknown names fall back to [NodeId.NODE_DUMMY]. */
+fun String.toNodeId(): NodeId {
+    return runCatching { NodeId.valueOf(this) }.getOrDefault(NodeId.NODE_DUMMY)
 }

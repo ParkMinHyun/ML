@@ -21,14 +21,13 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     override val name: String = "draft_sequence_execution_ewma"
 
-    private val durationStatsByWorkload: MutableMap<String, EwmaStats> = mutableMapOf()
-    private val positiveResidualsByWorkload: MutableMap<String, RollingQuantile> = mutableMapOf()
-    private val combinedPositiveResidualsByDecision: MutableMap<String, RollingQuantile> = mutableMapOf()
+    private val durationStatsByWorkload: MutableMap<WorkloadKey, EwmaStats> = mutableMapOf()
+    private val positiveResidualsByWorkload: MutableMap<WorkloadKey, RollingQuantile> = mutableMapOf()
+    private val combinedPositiveResidualsByDecision: MutableMap<DecisionKey, RollingQuantile> = mutableMapOf()
 
     @Synchronized
     override fun predictForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val stats = durationStatsByWorkload[workloadKey]
@@ -41,19 +40,18 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             (predictedMs + marginMs).roundToLong()
         }
         val budgetMs = preExecutionMetrics.budgetMs
-        val addmit = upperBoundMs <= budgetMs
+        val admit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=single")
-            append(" key=").append(executionKey)
-            append(" workload=").append(workloadKey)
+            append(" workload=").append(workloadKey.value)
             append(" samples=").append(stats?.count ?: 0)
             append(" residualSamples=").append(residualCount(workloadKey))
             append(" q=").append(residualQuantile)
             append(" marginMs=").append(marginMs.roundToLong())
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(addmit)
+            append(" shouldRun=").append(admit)
         }
 
         return ExecutionPrediction(
@@ -65,14 +63,13 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
-            addmit = addmit,
+            admit = admit,
         )
     }
 
     @Synchronized
     override fun updateForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
@@ -81,7 +78,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             return
         }
 
-        val issued = predictForKey(executionKey, workloadKey, preExecutionMetrics)
+        val issued = predictForKey(workloadKey, preExecutionMetrics)
         durationStatsByWorkload.getOrPut(workloadKey) { EwmaStats() }
             .update(observedMs.toDouble(), ewmaAlpha)
 
@@ -93,10 +90,9 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     @Synchronized
     override fun predictForDecision(
-        stageExecutionKey: String,
-        stageWorkloadKey: String,
-        tailWorkloadKey: String,
-        decisionKey: String,
+        stageWorkloadKey: WorkloadKey,
+        tailWorkloadKey: WorkloadKey,
+        decisionKey: DecisionKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val stageStats = durationStatsByWorkload[stageWorkloadKey]
@@ -112,12 +108,11 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             (predictedCombinedMs + marginMs).roundToLong()
         }
         val budgetMs = preExecutionMetrics.budgetMs
-        val addmit = upperBoundMs <= budgetMs
+        val admit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=combined")
-            append(" stage=").append(stageExecutionKey)
-            append(" decision=").append(decisionKey)
+            append(" decision=").append(decisionKey.value)
             append(" stageSamples=").append(stageStats?.count ?: 0)
             append(" tailSamples=").append(tailStats?.count ?: 0)
             append(" residualSamples=").append(combinedResidualCount(decisionKey))
@@ -125,7 +120,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             append(" marginMs=").append(marginMs.roundToLong())
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(addmit)
+            append(" shouldRun=").append(admit)
         }
 
         return ExecutionPrediction(
@@ -137,13 +132,13 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
-            addmit = addmit,
+            admit = admit,
         )
     }
 
     @Synchronized
     override fun updateForDecision(
-        decisionKey: String,
+        decisionKey: DecisionKey,
         predictedCombinedDurationMs: Long,
         predictedCombinedUpperBoundMs: Long,
         actualStageDurationMs: Long,
@@ -159,23 +154,23 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }.add(positiveResidualMs)
     }
 
-    private fun residualMargin(workloadKey: String): Double {
+    private fun residualMargin(workloadKey: WorkloadKey): Double {
         return positiveResidualsByWorkload[workloadKey]
             ?.quantile(residualQuantile)
             ?: 0.0
     }
 
-    private fun combinedResidualMargin(decisionKey: String): Double {
+    private fun combinedResidualMargin(decisionKey: DecisionKey): Double {
         return combinedPositiveResidualsByDecision[decisionKey]
             ?.quantile(residualQuantile)
             ?: 0.0
     }
 
-    private fun residualCount(workloadKey: String): Int {
+    private fun residualCount(workloadKey: WorkloadKey): Int {
         return positiveResidualsByWorkload[workloadKey]?.count ?: 0
     }
 
-    private fun combinedResidualCount(decisionKey: String): Int {
+    private fun combinedResidualCount(decisionKey: DecisionKey): Int {
         return combinedPositiveResidualsByDecision[decisionKey]?.count ?: 0
     }
 

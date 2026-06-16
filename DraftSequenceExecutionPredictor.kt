@@ -3,6 +3,7 @@ package com.samsung.android.camera.core2.ml
 import android.content.Context
 import android.os.SystemClock
 import android.util.Size
+import com.samsung.android.camera.core2.node.NodeId
 import com.samsung.android.camera.core2.util.CLog
 import java.util.function.Consumer
 import kotlin.math.abs
@@ -16,12 +17,12 @@ import kotlinx.coroutines.launch
  *
  * This class owns the functionality that is common to *all* predictors and independent of how any
  * one of them models execution cost:
- *   - the workload taxonomy (how a node / saving / tail maps to a stable bucket key),
+ *   - the workload taxonomy (how a node / saving / tail maps to a stable [WorkloadKey]),
  *   - the public entry points the profiler calls (single node, saving, combined admission), and
  *   - history replay ([warmUpFromHistory]).
  *
  * A concrete predictor implements only the four model-specific hooks below; it never sees raw
- * nodeIds, image sizes, or formats - it receives the already-bucketed string key and the
+ * nodeIds, image sizes, or formats - it receives the already-bucketed [WorkloadKey] and the
  * pre/post-execution metrics. To add a new predictor, subclass this and implement the hooks; all
  * routing, keying, and replay are inherited unchanged.
  */
@@ -33,31 +34,28 @@ abstract class DraftSequenceExecutionPredictor {
 
     /** Predicts a single bucketed workload's execution cost. */
     protected abstract fun predictForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction
 
     /** Corrects the model for a single bucketed workload from its observed outcome. */
     protected abstract fun updateForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     )
 
     /** Predicts a decision-level (stage + mandatory tail) cost for admission. */
     protected abstract fun predictForDecision(
-        stageExecutionKey: String,
-        stageWorkloadKey: String,
-        tailWorkloadKey: String,
-        decisionKey: String,
+        stageWorkloadKey: WorkloadKey,
+        tailWorkloadKey: WorkloadKey,
+        decisionKey: DecisionKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction
 
     /** Corrects the decision-level model from the combined observed outcome. */
     protected abstract fun updateForDecision(
-        decisionKey: String,
+        decisionKey: DecisionKey,
         predictedCombinedDurationMs: Long,
         predictedCombinedUpperBoundMs: Long,
         actualStageDurationMs: Long,
@@ -71,7 +69,7 @@ abstract class DraftSequenceExecutionPredictor {
         executionKey: String,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        return predictForKey(executionKey, WorkloadKey.keyOnly(executionKey).value, preExecutionMetrics)
+        return predictForKey(WorkloadKey.generic(executionKey), preExecutionMetrics)
     }
 
     fun update(
@@ -79,32 +77,30 @@ abstract class DraftSequenceExecutionPredictor {
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
-        updateForKey(executionKey, WorkloadKey.keyOnly(executionKey).value, preExecutionMetrics, postExecutionMetrics)
+        updateForKey(WorkloadKey.generic(executionKey), preExecutionMetrics, postExecutionMetrics)
     }
 
     // ---- Node ----
 
     fun predictNodeExecution(
-        nodeId: String,
+        nodeId: NodeId,
         nodeParams: NodeParams,
         inputImageSize: Size,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         return predictForKey(
-            executionKey = nodeId,
-            workloadKey = WorkloadKey.node(nodeId, nodeParams, inputImageSize).value,
+            workloadKey = WorkloadKey.node(nodeId, nodeParams, inputImageSize),
             preExecutionMetrics = preExecutionMetrics,
         )
     }
 
     fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics) {
         updateForKey(
-            executionKey = nodeExecutionMetrics.nodeId,
             workloadKey = WorkloadKey.node(
                 nodeExecutionMetrics.nodeId,
                 nodeExecutionMetrics.nodeParams,
                 nodeExecutionMetrics.inputImageSize,
-            ).value,
+            ),
             preExecutionMetrics = nodeExecutionMetrics.preExecutionMetrics,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
         )
@@ -119,16 +115,14 @@ abstract class DraftSequenceExecutionPredictor {
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         return predictForKey(
-            executionKey = SAVING_EXECUTION_KEY,
-            workloadKey = WorkloadKey.saving(isPendingRequest, resultImageSize, resultImageFormat).value,
+            workloadKey = WorkloadKey.saving(isPendingRequest, resultImageSize, resultImageFormat),
             preExecutionMetrics = preExecutionMetrics,
         )
     }
 
     fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
         updateForKey(
-            executionKey = SAVING_EXECUTION_KEY,
-            workloadKey = WorkloadKey.saving(savingExecutionMetrics).value,
+            workloadKey = WorkloadKey.saving(savingExecutionMetrics),
             preExecutionMetrics = savingExecutionMetrics.preExecutionMetrics,
             postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
         )
@@ -142,7 +136,7 @@ abstract class DraftSequenceExecutionPredictor {
      * The tail means Encoding + Saving; update it later via [updateCombinedAdmission].
      */
     fun predictCombinedAdmission(
-        stageNodeId: String,
+        stageNodeId: NodeId,
         stageNodeParams: NodeParams,
         stageInputImageSize: Size,
         tailResultImageSize: Size,
@@ -152,16 +146,15 @@ abstract class DraftSequenceExecutionPredictor {
         val stageKey = WorkloadKey.node(stageNodeId, stageNodeParams, stageInputImageSize)
         val tailKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat)
         return predictForDecision(
-            stageExecutionKey = stageNodeId,
-            stageWorkloadKey = stageKey.value,
-            tailWorkloadKey = tailKey.value,
-            decisionKey = DecisionKey.combined(stageKey, tailKey).value,
+            stageWorkloadKey = stageKey,
+            tailWorkloadKey = tailKey,
+            decisionKey = DecisionKey.combined(stageKey, tailKey),
             preExecutionMetrics = preExecutionMetrics,
         )
     }
 
     fun updateCombinedAdmission(
-        stageNodeId: String,
+        stageNodeId: NodeId,
         stageNodeParams: NodeParams,
         stageInputImageSize: Size,
         tailResultImageSize: Size,
@@ -175,7 +168,7 @@ abstract class DraftSequenceExecutionPredictor {
         val stageKey = WorkloadKey.node(stageNodeId, stageNodeParams, stageInputImageSize)
         val tailKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat)
         updateForDecision(
-            decisionKey = DecisionKey.combined(stageKey, tailKey).value,
+            decisionKey = DecisionKey.combined(stageKey, tailKey),
             predictedCombinedDurationMs = predictedCombinedDurationMs,
             predictedCombinedUpperBoundMs = predictedCombinedUpperBoundMs,
             actualStageDurationMs = actualStageDurationMs,
@@ -212,92 +205,138 @@ abstract class DraftSequenceExecutionPredictor {
         }
         return updatedCount
     }
+}
 
-    /**
-     * Stable workload bucket key. This is the Mondrian split shared by every predictor:
-     *   Bokeh : output/input image size bucket
-     *   Filter: input image size bucket
-     *   Encoding/Tail/Saving: size bucket x image format
-     */
-    private data class WorkloadKey(val value: String) {
-        companion object {
-            fun keyOnly(executionKey: String): WorkloadKey {
-                return WorkloadKey("keyOnly=$executionKey")
-            }
+/**
+ * Coarse workload family a node / saving / tail maps to. This is the grouping level the predictors
+ * fall back to when an exact [WorkloadKey] cell does not yet have enough samples.
+ */
+enum class WorkloadCategory(val tag: String) {
+    BOKEH("bokeh"),
+    FILTER("filter"),
+    ENCODING("encoding"),
+    TAIL("tail"),
+    SAVING("saving"),
+    NODE("node"),
+    GENERIC("generic"),
+}
 
-            fun node(
-                nodeId: String,
-                nodeParams: NodeParams,
-                inputImageSize: Size,
-            ): WorkloadKey {
-                return when (nodeId) {
-                    NODE_ID_BOKEH -> WorkloadKey("bokeh|size=${bokehSize(nodeParams, inputImageSize)}")
-                    NODE_ID_FILTER -> WorkloadKey("filter|size=${sizeBucket(inputImageSize)}")
-                    NODE_ID_ENCODING -> WorkloadKey("encoding|size=${sizeBucket(inputImageSize)}|format=${encodingFormat(nodeParams)}")
-                    else -> WorkloadKey("node=$nodeId|size=${sizeBucket(inputImageSize)}")
-                }
-            }
+/**
+ * Stable workload bucket. This is the Mondrian split shared by every predictor:
+ *   Bokeh : DualBokeh output image size bucket
+ *   Filter: input image size bucket
+ *   Encoding/Tail/Saving: size bucket x image format
+ *
+ * [category] is the coarse family used for hierarchical fallback; [value] is the exact model-cell
+ * identity (and its human-readable form). Equality/hashing are by [value], so it can be used
+ * directly as a map key.
+ */
+class WorkloadKey private constructor(
+    val category: WorkloadCategory,
+    val value: String,
+) {
+    override fun equals(other: Any?): Boolean = other is WorkloadKey && other.value == value
 
-            fun tail(
-                resultImageSize: Size,
-                resultImageFormat: Int,
-            ): WorkloadKey {
-                return WorkloadKey("tail|size=${sizeBucket(resultImageSize)}|format=$resultImageFormat")
-            }
+    override fun hashCode(): Int = value.hashCode()
 
-            fun saving(
-                isPendingRequest: Boolean,
-                resultImageSize: Size,
-                resultImageFormat: Int,
-            ): WorkloadKey {
-                return WorkloadKey(
-                    "saving|pending=$isPendingRequest|size=${sizeBucket(resultImageSize)}|format=$resultImageFormat",
-                )
-            }
+    override fun toString(): String = value
 
-            fun saving(savingExecutionMetrics: SavingExecutionMetrics): WorkloadKey {
-                return saving(
-                    isPendingRequest = savingExecutionMetrics.isPendingRequest,
-                    resultImageSize = savingExecutionMetrics.resultImageSize,
-                    resultImageFormat = savingExecutionMetrics.resultImageFormat,
-                )
-            }
-
-            private fun bokehSize(nodeParams: NodeParams, inputImageSize: Size): String {
-                return when (nodeParams) {
-                    is NodeParams.DualBokeh -> sizeBucket(nodeParams.outputImageSize)
-                    else -> sizeBucket(inputImageSize)
-                }
-            }
-
-            private fun encodingFormat(nodeParams: NodeParams): Int {
-                return when (nodeParams) {
-                    is NodeParams.Encoding -> nodeParams.encodingFormat
-                    else -> UNKNOWN_FORMAT
-                }
-            }
-        }
-    }
-
-    private data class DecisionKey(val value: String) {
-        companion object {
-            fun combined(stageKey: WorkloadKey, tailKey: WorkloadKey): DecisionKey {
-                return DecisionKey("${stageKey.value}|${tailKey.value}")
-            }
-        }
-    }
-
-    private companion object {
-        private const val NODE_ID_BOKEH = "NODE_SEC_V2_DUAL_BOKEH"
-        private const val NODE_ID_FILTER = "NODE_SEC_FILTER"
-        private const val NODE_ID_ENCODING = "NODE_SEC_V2_IMAGE_CODEC"
+    companion object {
         private const val UNKNOWN_FORMAT = -1
+
+        fun generic(executionKey: String): WorkloadKey {
+            return of(WorkloadCategory.GENERIC, "key=$executionKey")
+        }
+
+        fun node(
+            nodeId: NodeId,
+            nodeParams: NodeParams,
+            inputImageSize: Size,
+        ): WorkloadKey {
+            return when (nodeId) {
+                NodeId.NODE_SEC_V1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V2_DUAL_BOKEH ->
+                    of(WorkloadCategory.BOKEH, "size=${bokehSize(nodeParams)}")
+                NodeId.NODE_SEC_FILTER ->
+                    of(WorkloadCategory.FILTER, "size=${sizeBucket(inputImageSize)}")
+                NodeId.NODE_SEC_V2_IMAGE_CODEC ->
+                    of(
+                        WorkloadCategory.ENCODING,
+                        "size=${sizeBucket(inputImageSize)}|format=${encodingFormat(nodeParams)}",
+                    )
+                else ->
+                    of(WorkloadCategory.NODE, "node=${nodeId.name}|size=${sizeBucket(inputImageSize)}")
+            }
+        }
+
+        fun tail(
+            resultImageSize: Size,
+            resultImageFormat: Int,
+        ): WorkloadKey {
+            return of(WorkloadCategory.TAIL, "size=${sizeBucket(resultImageSize)}|format=$resultImageFormat")
+        }
+
+        fun saving(
+            isPendingRequest: Boolean,
+            resultImageSize: Size,
+            resultImageFormat: Int,
+        ): WorkloadKey {
+            return of(
+                WorkloadCategory.SAVING,
+                "pending=$isPendingRequest|size=${sizeBucket(resultImageSize)}|format=$resultImageFormat",
+            )
+        }
+
+        fun saving(savingExecutionMetrics: SavingExecutionMetrics): WorkloadKey {
+            return saving(
+                isPendingRequest = savingExecutionMetrics.isPendingRequest,
+                resultImageSize = savingExecutionMetrics.resultImageSize,
+                resultImageFormat = savingExecutionMetrics.resultImageFormat,
+            )
+        }
+
+        private fun of(category: WorkloadCategory, descriptor: String): WorkloadKey {
+            val value = if (descriptor.isEmpty()) category.tag else "${category.tag}|$descriptor"
+            return WorkloadKey(category, value)
+        }
+
+        /** Bokeh cost tracks the bokeh OUTPUT size, carried by [NodeParams.DualBokeh]. */
+        private fun bokehSize(nodeParams: NodeParams): String {
+            val outputImageSize = (nodeParams as? NodeParams.DualBokeh)?.outputImageSize ?: Size(0, 0)
+            return sizeBucket(outputImageSize)
+        }
+
+        private fun encodingFormat(nodeParams: NodeParams): Int {
+            return (nodeParams as? NodeParams.Encoding)?.encodingFormat ?: UNKNOWN_FORMAT
+        }
 
         private fun sizeBucket(size: Size): String {
             val pixels = size.width.toLong().coerceAtLeast(0L) * size.height.toLong().coerceAtLeast(0L)
             val megaPixels = pixels.toDouble() / 1_000_000.0
             val nearest = listOf(12, 24, 50, 200).minByOrNull { abs(megaPixels - it) } ?: 12
             return "${nearest}MP"
+        }
+    }
+}
+
+/**
+ * Decision-level key for a stage + mandatory tail admission. Retains the stage [WorkloadKey] so the
+ * predictors can fall back to the stage [WorkloadCategory]; equality/hashing are by [value].
+ */
+class DecisionKey private constructor(
+    val stageKey: WorkloadKey,
+    val value: String,
+) {
+    override fun equals(other: Any?): Boolean = other is DecisionKey && other.value == value
+
+    override fun hashCode(): Int = value.hashCode()
+
+    override fun toString(): String = value
+
+    companion object {
+        fun combined(stageKey: WorkloadKey, tailKey: WorkloadKey): DecisionKey {
+            return DecisionKey(stageKey, "${stageKey.value}|${tailKey.value}")
         }
     }
 }
@@ -388,7 +427,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     /**
      * Step 1 (node): predict a node's execution cost from pre-execution state and record it.
      *
-     * @param nodeId stable node identifier (model bucket key).
+     * @param nodeId node identifier (model bucket key).
      * @param nodeParams node-specific pre-execution params (e.g. encoding format, bokeh output size).
      * @param timeoutMs absolute deadline for this node; the remaining budget is derived at read time.
      * @param inputImageSize input image dimensions.
@@ -397,7 +436,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     @JvmOverloads
     fun predictNodeExecution(
         captureMetrics: CaptureMetrics,
-        nodeId: String,
+        nodeId: NodeId,
         nodeParams: NodeParams = NodeParams.None,
         timeoutMs: Long,
         inputImageSize: Size,
@@ -492,7 +531,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 append(" saving{").append(savingPrediction.reason).append('}')
             },
             predictorName = encodingPrediction.predictorName,
-            addmit = encodingPrediction.predictedUpperBoundMs + savingPrediction.predictedUpperBoundMs <=
+            admit = encodingPrediction.predictedUpperBoundMs + savingPrediction.predictedUpperBoundMs <=
                 preExecutionMetrics.budgetMs,
         )
     }
@@ -523,7 +562,7 @@ class DraftSequenceExecutionSession internal constructor(
     private val onComplete: () -> Unit,
 ) {
     /** True when the predicted upper bound fits within the budget. */
-    val shouldRun: Boolean = executionPrediction.addmit
+    val shouldRun: Boolean = executionPrediction.admit
 
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()

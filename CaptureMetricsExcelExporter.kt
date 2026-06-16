@@ -114,7 +114,7 @@ class CaptureMetricsExcelExporter(
         val nodeRowsByNodeId = captures
             .flatMap { enrichedCapture ->
                 enrichedCapture.row.nodeRows.map { nodeRow ->
-                    Triple(enrichedCapture.row.captureIndex, nodeRow.node.nodeId, nodeRow)
+                    Triple(enrichedCapture.row.captureIndex, nodeRow.node.nodeId.name, nodeRow)
                 }
             }
             .groupBy { it.second } // group by nodeId

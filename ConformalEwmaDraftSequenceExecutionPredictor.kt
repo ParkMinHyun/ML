@@ -72,9 +72,9 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     /** CUSUM/SPRT log-evidence threshold from the false-alarm rate. */
     private val driftThreshold: Double = -ln(driftFalseAlarmRate.coerceIn(1e-6, 0.5))
 
-    private val durationStatsByWorkload: MutableMap<String, AdaptiveRunningMean> = mutableMapOf()
-    private val positiveResidualsByWorkload: MutableMap<String, RollingQuantile> = mutableMapOf()
-    private val combinedPositiveResidualsByDecision: MutableMap<String, RollingQuantile> = mutableMapOf()
+    private val durationStatsByWorkload: MutableMap<WorkloadKey, AdaptiveRunningMean> = mutableMapOf()
+    private val positiveResidualsByWorkload: MutableMap<WorkloadKey, RollingQuantile> = mutableMapOf()
+    private val combinedPositiveResidualsByDecision: MutableMap<DecisionKey, RollingQuantile> = mutableMapOf()
 
     private val globalPositiveResiduals = RollingQuantile(calibrationWindowSize)
     private val globalCombinedPositiveResiduals = RollingQuantile(calibrationWindowSize)
@@ -95,8 +95,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     @Synchronized
     override fun predictForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val quantile = singleQuantileController.quantile
@@ -111,18 +110,17 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val predictedDurationMs = predictedMs.roundToLong()
         val budgetMs = preExecutionMetrics.budgetMs
-        val addmit = upperBoundMs <= budgetMs
+        val admit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=single")
-            append(" key=").append(executionKey)
-            append(" workload=").append(workloadKey)
+            append(" workload=").append(workloadKey.value)
             append(" samples=").append(stats?.count ?: 0)
             append(" q=").append(quantile)
             append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(addmit)
+            append(" shouldRun=").append(admit)
         }
         return ExecutionPrediction(
             predictedDurationMs = predictedDurationMs,
@@ -133,14 +131,13 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
-            addmit = addmit,
+            admit = admit,
         )
     }
 
     @Synchronized
     override fun updateForKey(
-        executionKey: String,
-        workloadKey: String,
+        workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
@@ -149,7 +146,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             return
         }
         // Issued prediction reflects pre-update state, matching exactly what predict() handed out.
-        val issued = predictForKey(executionKey, workloadKey, preExecutionMetrics)
+        val issued = predictForKey(workloadKey, preExecutionMetrics)
 
         // Center: adaptive running mean with CUSUM-driven forgetting + thermal-escalation prior.
         durationStatsByWorkload.getOrPut(workloadKey) {
@@ -169,10 +166,9 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     @Synchronized
     override fun predictForDecision(
-        stageExecutionKey: String,
-        stageWorkloadKey: String,
-        tailWorkloadKey: String,
-        decisionKey: String,
+        stageWorkloadKey: WorkloadKey,
+        tailWorkloadKey: WorkloadKey,
+        decisionKey: DecisionKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val quantile = combinedQuantileController.quantile
@@ -189,19 +185,18 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             (predictedCombinedMs + marginMs).roundToLong()
         }
         val budgetMs = preExecutionMetrics.budgetMs
-        val addmit = upperBoundMs <= budgetMs
+        val admit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=combined")
-            append(" stage=").append(stageExecutionKey)
-            append(" decision=").append(decisionKey)
+            append(" decision=").append(decisionKey.value)
             append(" stageSamples=").append(stageStats?.count ?: 0)
             append(" tailSamples=").append(tailStats?.count ?: 0)
             append(" q=").append(quantile)
             append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(addmit)
+            append(" shouldRun=").append(admit)
         }
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
@@ -212,13 +207,13 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
-            addmit = addmit,
+            admit = admit,
         )
     }
 
     @Synchronized
     override fun updateForDecision(
-        decisionKey: String,
+        decisionKey: DecisionKey,
         predictedCombinedDurationMs: Long,
         predictedCombinedUpperBoundMs: Long,
         actualStageDurationMs: Long,
@@ -252,18 +247,17 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
     }
 
-    private fun calibratedSingleMargin(workloadKey: String, quantile: Double): Double? {
-        // Hierarchical fallback: exact cell -> coarser key prefix -> global pool. Each tier first
-        // tries the empirical quantile, then the Student-t warmup bound while still cold. Returns
-        // null only when no tier has even PARAMETRIC_MIN_SAMPLES residuals.
+    private fun calibratedSingleMargin(workloadKey: WorkloadKey, quantile: Double): Double? {
+        // Hierarchical fallback: exact cell -> coarser workload category -> global pool. Each tier
+        // first tries the empirical quantile, then the Student-t warmup bound while still cold.
+        // Returns null only when no tier has even PARAMETRIC_MIN_SAMPLES residuals.
         val candidates = mutableListOf<Double>()
         val exact = positiveResidualsByWorkload[workloadKey]?.let { windowMargin(it, quantile) }
         if (exact != null) {
             candidates.add(exact)
         } else {
-            val prefix = workloadKey.substringBefore('|')
             val coarser = positiveResidualsByWorkload.entries
-                .filter { it.key.substringBefore('|') == prefix }
+                .filter { it.key.category == workloadKey.category }
                 .mapNotNull { windowMargin(it.value, quantile) }
                 .maxOrNull()
             if (coarser != null) {
@@ -274,15 +268,15 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         return candidates.maxOrNull()
     }
 
-    private fun calibratedCombinedMargin(decisionKey: String, quantile: Double): Double? {
+    private fun calibratedCombinedMargin(decisionKey: DecisionKey, quantile: Double): Double? {
         val candidates = mutableListOf<Double>()
         val exact = combinedPositiveResidualsByDecision[decisionKey]?.let { windowMargin(it, quantile) }
         if (exact != null) {
             candidates.add(exact)
         } else {
-            val stagePrefix = decisionKey.substringBefore('|')
+            val stageCategory = decisionKey.stageKey.category
             val coarser = combinedPositiveResidualsByDecision.entries
-                .filter { it.key.substringBefore('|') == stagePrefix }
+                .filter { it.key.stageKey.category == stageCategory }
                 .mapNotNull { windowMargin(it.value, quantile) }
                 .maxOrNull()
             if (coarser != null) {
@@ -293,14 +287,14 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         return candidates.maxOrNull()
     }
 
-    private fun calibrationCount(workloadKey: String): Int {
+    private fun calibrationCount(workloadKey: WorkloadKey): Int {
         return max(
             positiveResidualsByWorkload[workloadKey]?.count ?: 0,
             globalPositiveResiduals.count,
         )
     }
 
-    private fun combinedCalibrationCount(decisionKey: String): Int {
+    private fun combinedCalibrationCount(decisionKey: DecisionKey): Int {
         return max(
             combinedPositiveResidualsByDecision[decisionKey]?.count ?: 0,
             globalCombinedPositiveResiduals.count,
