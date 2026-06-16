@@ -111,6 +111,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val predictedDurationMs = predictedMs.roundToLong()
         val budgetMs = preExecutionMetrics.budgetMs
+        val addmit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=single")
@@ -121,7 +122,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(upperBoundMs <= budgetMs)
+            append(" shouldRun=").append(addmit)
         }
         return ExecutionPrediction(
             predictedDurationMs = predictedDurationMs,
@@ -132,6 +133,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
+            addmit = addmit,
         )
     }
 
@@ -187,6 +189,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             (predictedCombinedMs + marginMs).roundToLong()
         }
         val budgetMs = preExecutionMetrics.budgetMs
+        val addmit = upperBoundMs <= budgetMs
         val reason = buildString {
             append("model=").append(name)
             append(" type=combined")
@@ -198,7 +201,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
             append(" budgetMs=").append(budgetMs)
             append(" slackMs=").append(budgetMs - upperBoundMs)
-            append(" shouldRun=").append(upperBoundMs <= budgetMs)
+            append(" shouldRun=").append(addmit)
         }
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
@@ -209,6 +212,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             ),
             reason = reason,
             predictorName = name,
+            addmit = addmit,
         )
     }
 

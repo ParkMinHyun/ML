@@ -64,6 +64,7 @@ data class PostExecutionMetrics(
 )
 
 data class ExecutionPrediction @JvmOverloads constructor(
+    val addmit: Boolean = false,
     val predictedDurationMs: Long,
     val predictedUpperBoundMs: Long,
     val confidence: Float,

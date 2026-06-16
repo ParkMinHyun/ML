@@ -104,6 +104,7 @@ fun ExecutionPrediction.toEntity(
         predictedDurationMs = predictedDurationMs,
         predictedUpperBoundMs = predictedUpperBoundMs,
         confidence = confidence,
+        addmit = addmit,
         reason = reason,
     )
 }
@@ -253,6 +254,7 @@ fun ExecutionPredictionEntity.toModel(): ExecutionPrediction {
         reason = reason,
         predictorName = predictorName,
         executionOrder = order,
+        addmit = addmit,
     )
 }
 

@@ -165,6 +165,12 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "confidence")
     val confidence: Float,
 
+    @ColumnInfo(
+        name = "addmit",
+        defaultValue = "0",
+    )
+    val addmit: Boolean = false,
+
     @ColumnInfo(name = "reason")
     val reason: String,
 ) {

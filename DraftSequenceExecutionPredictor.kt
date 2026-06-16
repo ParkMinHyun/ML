@@ -310,7 +310,7 @@ private const val SAVING_EXECUTION_KEY = "saving"
  * across captures, plus the one-shot warm-up from the metrics database.
  */
 class DraftSequenceExecutionPredictionManager @JvmOverloads constructor(
-    val predictor: DraftSequenceExecutionPredictor = ConformalEwmaDraftSequenceExecutionPredictor(),
+    val predictor: DraftSequenceExecutionPredictor = EwmaDraftSequenceExecutionPredictor(),
 ) {
 
     /** Replays persisted capture history into the predictor. Returns the sample count fed. */
@@ -492,6 +492,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 append(" saving{").append(savingPrediction.reason).append('}')
             },
             predictorName = encodingPrediction.predictorName,
+            addmit = encodingPrediction.predictedUpperBoundMs + savingPrediction.predictedUpperBoundMs <=
+                preExecutionMetrics.budgetMs,
         )
     }
 
@@ -521,7 +523,7 @@ class DraftSequenceExecutionSession internal constructor(
     private val onComplete: () -> Unit,
 ) {
     /** True when the predicted upper bound fits within the budget. */
-    val shouldRun: Boolean = executionPrediction.predictedUpperBoundMs <= budgetMs
+    val shouldRun: Boolean = executionPrediction.addmit
 
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()
