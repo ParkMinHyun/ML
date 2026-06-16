@@ -114,7 +114,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         val reason = buildString {
             append("model=").append(name)
             append(" type=single")
-            append(" workload=").append(workloadKey.value)
+            append(" workload=").append(workloadKey)
             append(" samples=").append(stats?.count ?: 0)
             append(" q=").append(quantile)
             append(" marginMs=").append(marginMs?.roundToLong() ?: 0L)
@@ -189,7 +189,7 @@ class ConformalEwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         val reason = buildString {
             append("model=").append(name)
             append(" type=combined")
-            append(" decision=").append(decisionKey.value)
+            append(" decision=").append(decisionKey)
             append(" stageSamples=").append(stageStats?.count ?: 0)
             append(" tailSamples=").append(tailStats?.count ?: 0)
             append(" q=").append(quantile)

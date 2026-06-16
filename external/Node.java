@@ -1250,22 +1250,27 @@ public abstract class Node implements PictureFormatProcessableInterface {
                 .map(CaptureMetrics::getDraftSequenceMetrics)
                 .orElse(null);
         final NodeParams nodeParams = getNodeParams(bundle);
-        if (null != draftSequenceMetrics && null != deviceStateReader && nodeParams != NodeParams.None.INSTANCE) {
-            final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
-            final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.predictNodeExecution(
-                    captureMetrics,
-                    mNodeId,
-                    nodeParams,
-                    captureMetrics.getTimeoutTimestampMs(),
-                    picture.getImageInfo().getSize());
-
-            final ImageBuffer resultBuffer = executor.apply(picture, bundle);
-            if (null != resultBuffer) {
-                session.complete();
-            }
-            return resultBuffer;
+        if (null == draftSequenceMetrics || null == deviceStateReader || nodeParams == NodeParams.None.INSTANCE) {
+            return executor.apply(picture, bundle);
         }
-        return executor.apply(picture, bundle);
+
+        // DualBokeh is gated on its combined (bokeh + encoding + saving) admission; every other node
+        // reports shouldRun == true and merely feeds its observed cost back into the model.
+        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
+        final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(
+                captureMetrics,
+                mNodeId,
+                nodeParams,
+                captureMetrics.getTimeoutTimestampMs(),
+                picture.getImageInfo().getSize());
+        if (!session.getShouldRun()) {
+            return picture;
+        }
+        final ImageBuffer resultBuffer = executor.apply(picture, bundle);
+        if (null != resultBuffer) {
+            session.complete();
+        }
+        return resultBuffer;
     }
 
     @NonNull
