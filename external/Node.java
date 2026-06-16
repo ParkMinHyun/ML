@@ -12,8 +12,8 @@ import com.samsung.android.camera.core2.exception.InvalidOperationException;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.CaptureMetadataKey;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.RequiredCaptureMetadataProvider;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
-import com.samsung.android.camera.core2.ml.ComparedDraftSequenceExecutionSession;
-import com.samsung.android.camera.core2.ml.ComparingDraftSequenceExecutionProfiler;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionSession;
 import com.samsung.android.camera.core2.ml.DeviceStateReader;
 import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
 import com.samsung.android.camera.core2.ml.NodeParams;
@@ -1251,8 +1251,8 @@ public abstract class Node implements PictureFormatProcessableInterface {
                 .orElse(null);
         final NodeParams nodeParams = getNodeParams(bundle);
         if (null != draftSequenceMetrics && null != deviceStateReader && nodeParams != NodeParams.None.INSTANCE) {
-            final ComparingDraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new ComparingDraftSequenceExecutionProfiler(deviceStateReader);
-            final ComparedDraftSequenceExecutionSession session = draftSequenceExecutionProfiler.predictNodeExecution(
+            final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
+            final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.predictNodeExecution(
                     captureMetrics,
                     mNodeId.name(),
                     nodeParams,
