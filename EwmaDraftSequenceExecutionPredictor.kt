@@ -1,5 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
+import com.samsung.android.camera.core2.util.CLog
 import java.util.ArrayDeque
 import kotlin.math.ceil
 import kotlin.math.roundToLong
@@ -19,7 +20,7 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val residualQuantile: Double = 0.95,
 ) : DraftSequenceExecutionPredictor() {
 
-    override val name: String = "draft_sequence_execution_ewma"
+    private val TAG = "EwmaDraftSequenceExecutionPredictor"
 
     private val durationStatsByWorkload: MutableMap<WorkloadKey, EwmaStats> = mutableMapOf()
     private val positiveResidualsByWorkload: MutableMap<WorkloadKey, RollingQuantile> = mutableMapOf()
@@ -31,8 +32,10 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val stats = durationStatsByWorkload[workloadKey]
+
         val predictedMs = stats?.ewmaMs ?: 0.0
         val predictedDurationMs = predictedMs.roundToLong()
+
         val marginMs = residualMargin(workloadKey)
         val upperBoundMs = if (stats == null || stats.count == 0) {
             0L
@@ -61,28 +64,29 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
 
         val issued = predictForKey(workloadKey, preExecutionMetrics)
-        durationStatsByWorkload.getOrPut(workloadKey) { EwmaStats() }
-            .update(observedMs.toDouble(), ewmaAlpha)
+        durationStatsByWorkload.getOrPut(workloadKey) { EwmaStats() }.update(observedMs.toDouble(), ewmaAlpha)
 
-        val positiveResidualMs = (observedMs - issued.predictedDurationMs).coerceAtLeast(0L)
-        positiveResidualsByWorkload.getOrPut(workloadKey) {
-            RollingQuantile(residualWindowSize)
-        }.add(positiveResidualMs)
+        if (issued.predictedDurationMs > 0) {
+            val positiveResidualMs = (observedMs - issued.predictedDurationMs).coerceAtLeast(0L)
+            positiveResidualsByWorkload.getOrPut(workloadKey) { RollingQuantile(residualWindowSize) }.add(positiveResidualMs)
+        }
     }
 
     @Synchronized
     override fun predictForDecision(
-        stageWorkloadKey: WorkloadKey,
+        stageWorkloadKeys: List<WorkloadKey>,
         tailWorkloadKey: WorkloadKey,
         decisionKey: DecisionKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        val stageStats = durationStatsByWorkload[stageWorkloadKey]
+        val stageStatsList = stageWorkloadKeys.map { durationStatsByWorkload[it] }
         val tailStats = durationStatsByWorkload[tailWorkloadKey]
-        val stagePredMs = stageStats?.ewmaMs ?: 0.0
+
+        val stagePredMs = stageStatsList.sumOf { it?.ewmaMs ?: 0.0 }
         val tailPredMs = tailStats?.ewmaMs ?: 0.0
         val predictedCombinedMs = stagePredMs + tailPredMs
-        val hasAnySample = (stageStats?.count ?: 0) > 0 || (tailStats?.count ?: 0) > 0
+
+        val hasAnySample = stageStatsList.any { (it?.count ?: 0) > 0 } || (tailStats?.count ?: 0) > 0
         val marginMs = combinedResidualMargin(decisionKey)
         val upperBoundMs = if (!hasAnySample) {
             0L
@@ -91,6 +95,12 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         }
         val budgetMs = preExecutionMetrics.budgetMs
         val admit = upperBoundMs <= budgetMs
+
+        CLog.e(
+            TAG,
+            "[mhyun2.park] predictForDecision - stageStatsList: $stageStatsList, " +
+                    "tailStats: $tailStats, upperBoundMs: $upperBoundMs"
+        )
 
         return ExecutionPrediction(
             predictedDurationMs = predictedCombinedMs.roundToLong(),
@@ -104,13 +114,13 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
         decisionKey: DecisionKey,
         predictedCombinedDurationMs: Long,
         predictedCombinedUpperBoundMs: Long,
-        actualStageDurationMs: Long,
+        actualAdmissionStagesDurationMs: Long,
         actualEncodingDurationMs: Long,
         actualSavingDurationMs: Long,
     ) {
-        val actualCombinedMs = actualStageDurationMs.coerceAtLeast(0L) +
-            actualEncodingDurationMs.coerceAtLeast(0L) +
-            actualSavingDurationMs.coerceAtLeast(0L)
+        val actualCombinedMs = actualAdmissionStagesDurationMs.coerceAtLeast(0L) +
+                actualEncodingDurationMs.coerceAtLeast(0L) +
+                actualSavingDurationMs.coerceAtLeast(0L)
         val positiveResidualMs = (actualCombinedMs - predictedCombinedDurationMs).coerceAtLeast(0L)
         combinedPositiveResidualsByDecision.getOrPut(decisionKey) {
             RollingQuantile(residualWindowSize)
@@ -172,5 +182,4 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             return sortedValues[index]
         }
     }
-
 }

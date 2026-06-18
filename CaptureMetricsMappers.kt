@@ -4,14 +4,6 @@ import android.util.Size
 import com.samsung.android.camera.core2.node.NodeId
 import org.json.JSONObject
 
-private const val NODE_PARAMS_KEY_TYPE = "type"
-private const val NODE_PARAMS_KEY_ENCODING_FORMAT = "encodingFormat"
-private const val NODE_PARAMS_KEY_OUTPUT_IMAGE_WIDTH = "outputImageWidth"
-private const val NODE_PARAMS_KEY_OUTPUT_IMAGE_HEIGHT = "outputImageHeight"
-private const val NODE_PARAMS_TYPE_NONE = "none"
-private const val NODE_PARAMS_TYPE_ENCODING = "encoding"
-private const val NODE_PARAMS_TYPE_DUAL_BOKEH = "dualBokeh"
-
 fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
     return CaptureMetricsEntity(
         ppSequenceId = ppSequenceId,
@@ -53,10 +45,11 @@ fun NodeExecutionMetrics.toEntity(
         captureMetricsId = captureMetricsId,
         order = order,
         nodeId = nodeId.name,
-        nodeParams = nodeParams.toJson(),
         budgetMs = preExecution.budgetMs,
         inputImageWidth = inputImageSize.width,
         inputImageHeight = inputImageSize.height,
+        outputImageWidth = outputImageSize.width,
+        outputImageHeight = outputImageSize.height,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
         thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
         storageSnapshot = preExecution.storageSnapshot.toEntity(),
@@ -233,8 +226,8 @@ fun SavingExecutionMetricsEntity.toModel(): SavingExecutionMetrics {
 fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
     return NodeExecutionMetrics(
         nodeId = nodeId.toNodeId(),
-        nodeParams = nodeParams.toNodeParams(),
         inputImageSize = Size(inputImageWidth, inputImageHeight),
+        outputImageSize = Size(outputImageWidth, outputImageHeight),
         preExecutionMetrics = toPreExecutionMetrics(),
         postExecutionMetrics = toPostExecutionMetrics(),
     )
@@ -303,42 +296,6 @@ fun StorageSnapshotEntity.toModel(): StorageSnapshot {
     return StorageSnapshot(
         storageUsedPercent = storageUsedPercent,
     )
-}
-
-fun NodeParams.toJson(): String {
-    return when (this) {
-        NodeParams.None, NodeParams.Watermark, NodeParams.Filter -> JSONObject()
-            .put(NODE_PARAMS_KEY_TYPE, NODE_PARAMS_TYPE_NONE)
-            .toString()
-        is NodeParams.DualBokeh -> JSONObject()
-            .put(NODE_PARAMS_KEY_TYPE, NODE_PARAMS_TYPE_DUAL_BOKEH)
-            .put(NODE_PARAMS_KEY_OUTPUT_IMAGE_WIDTH, outputImageSize.width)
-            .put(NODE_PARAMS_KEY_OUTPUT_IMAGE_HEIGHT, outputImageSize.height)
-            .toString()
-        is NodeParams.Encoding -> JSONObject()
-            .put(NODE_PARAMS_KEY_TYPE, NODE_PARAMS_TYPE_ENCODING)
-            .put(NODE_PARAMS_KEY_ENCODING_FORMAT, encodingFormat)
-            .toString()
-    }
-}
-
-fun String.toNodeParams(): NodeParams {
-    if (isBlank()) {
-        return NodeParams.None
-    }
-    val json = JSONObject(this)
-    return when (json.optString(NODE_PARAMS_KEY_TYPE, NODE_PARAMS_TYPE_NONE)) {
-        NODE_PARAMS_TYPE_DUAL_BOKEH -> NodeParams.DualBokeh(
-            outputImageSize = Size(
-                json.optInt(NODE_PARAMS_KEY_OUTPUT_IMAGE_WIDTH, 0),
-                json.optInt(NODE_PARAMS_KEY_OUTPUT_IMAGE_HEIGHT, 0),
-            ),
-        )
-        NODE_PARAMS_TYPE_ENCODING -> NodeParams.Encoding(
-            encodingFormat = json.optInt(NODE_PARAMS_KEY_ENCODING_FORMAT, 0),
-        )
-        else -> NodeParams.None
-    }
 }
 
 /** Maps a persisted node-id name back to its [NodeId]; unknown names fall back to [NodeId.NODE_DUMMY]. */

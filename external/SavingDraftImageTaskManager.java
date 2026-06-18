@@ -10,7 +10,6 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
-import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictionManager;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
 import com.samsung.android.camera.core2.ml.PostExecutionMetrics;
@@ -191,18 +190,22 @@ public class SavingDraftImageTaskManager {
                         savingExecutionMetrics.getResultImageFormat(),
                         savingExecutionMetrics.getPreExecutionMetrics(),
                         new PostExecutionMetrics(null, null, SystemClock.uptimeMillis() - savingExecutionMetrics.getStartTimestampMs()),
-                        0L);
+                        savingExecutionMetrics.getStartTimestampMs());
                 draftSequenceMetrics.setSavingExecutionMetrics(completedSavingExecutionMetrics);
                 // Saving needs no prediction; feed its observed cost into the shared model, then close
                 // the loop by learning the combined (bokeh + encoding + saving) admission residual now
                 // that every stage of this draft sequence has finished.
-                final DraftSequenceExecutionPredictor predictor =
-                        DraftSequenceExecutionPredictionManager.getInstance().getPredictor();
+                final DraftSequenceExecutionPredictor predictor = DraftSequenceExecutionPredictor.getInstance();
                 predictor.updateSavingExecution(completedSavingExecutionMetrics);
                 predictor.updateCombinedAdmission(captureMetrics);
-                draftSequenceMetrics.setTimeout(Optional.ofNullable(captureMetrics.getTimeoutTimestampMs())
-                        .map(timeoutTimestampMs -> timeoutTimestampMs < SystemClock.uptimeMillis())
-                        .orElse(false));
+
+                if (isLastTimeout) {
+                    draftSequenceMetrics.setTimeout(true);
+                } else {
+                    draftSequenceMetrics.setTimeout(Optional.ofNullable(captureMetrics.getTimeoutTimestampMs())
+                            .map(timeoutTimestampMs -> timeoutTimestampMs < SystemClock.uptimeMillis())
+                            .orElse(false));
+                }
 
                 if (Boolean.TRUE.equals(draftSequenceMetrics.isTimeout())) {
                     if (!isLastTimeout) {

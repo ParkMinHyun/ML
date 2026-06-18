@@ -88,9 +88,6 @@ data class NodeExecutionMetricsEntity(
     @ColumnInfo(name = "node_id")
     val nodeId: String,
 
-    @ColumnInfo(name = "node_params")
-    val nodeParams: String,
-
     @ColumnInfo(name = "budget_ms")
     val budgetMs: Long,
 
@@ -99,6 +96,12 @@ data class NodeExecutionMetricsEntity(
 
     @ColumnInfo(name = "input_image_height")
     val inputImageHeight: Int,
+
+    @ColumnInfo(name = "output_image_width")
+    val outputImageWidth: Int,
+
+    @ColumnInfo(name = "output_image_height")
+    val outputImageHeight: Int,
 
     @Embedded(prefix = "memory_")
     val memorySnapshot: MemorySnapshotEntity,

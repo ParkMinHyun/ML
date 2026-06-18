@@ -11,12 +11,12 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.CaptureMetadataKey;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.RequiredCaptureMetadataProvider;
+import com.samsung.android.camera.core2.ml.AdmissionStageSpec;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
+import com.samsung.android.camera.core2.ml.DeviceStateReader;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionSession;
-import com.samsung.android.camera.core2.ml.DeviceStateReader;
 import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
-import com.samsung.android.camera.core2.ml.NodeParams;
 import com.samsung.android.camera.core2.node.NodeFeature.NodeFeatureVersion;
 import com.samsung.android.camera.core2.util.CLog;
 import com.samsung.android.camera.core2.util.ConditionChecker;
@@ -42,7 +42,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
@@ -1249,35 +1253,67 @@ public abstract class Node implements PictureFormatProcessableInterface {
         final DraftSequenceMetrics draftSequenceMetrics = Optional.ofNullable(captureMetrics)
                 .map(CaptureMetrics::getDraftSequenceMetrics)
                 .orElse(null);
-        final NodeParams nodeParams = getNodeParams(bundle);
-        if (null == draftSequenceMetrics || null == deviceStateReader || nodeParams == NodeParams.None.INSTANCE) {
+        if (null == draftSequenceMetrics || null == deviceStateReader || !isPredictable()) {
             return executor.apply(picture, bundle);
         }
 
         // DualBokeh is gated on its combined (bokeh + encoding + saving) admission; every other node
         // reports shouldRun == true and merely feeds its observed cost back into the model.
+        final long timeoutTimestampMs = Objects.requireNonNull(captureMetrics.getTimeoutTimestampMs(), "timeoutMs");
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
+        final List<AdmissionStageSpec> admissionStageSpecs;
+        if (mNodeId == NodeId.NODE_SEC_V2_DUAL_BOKEH) {
+            admissionStageSpecs = List.of(new AdmissionStageSpec(NodeId.NODE_SEC_FILTER, picture.getImageInfo().getSize(), captureMetrics.getResultImageSize()));
+        } else {
+            admissionStageSpecs = Collections.emptyList();
+        }
+
         final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(
                 mNodeId,
-                nodeParams,
-                Objects.requireNonNull(captureMetrics.getTimeoutTimestampMs(), "timeoutMs"),
+                timeoutTimestampMs,
                 picture.getImageInfo().getSize(),
                 captureMetrics.getResultImageSize(),
                 captureMetrics.getResultImageFormat(),
-                draftSequenceMetrics);
-        if (!session.getShouldRun()) {
-            return picture;
+                draftSequenceMetrics,
+                admissionStageSpecs);
+
+        final ExecutorService executorService = Executors.newSingleThreadExecutor();
+        final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
+
+        final ImageBuffer resultBuffer;
+        try {
+            if (session.getDelayMs() > 0) {
+                CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
+                resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
+            } else {
+                resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
+            }
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            CLog.w(getNodeTag(), "processPicture timed out.");
+            return null;
+        } catch (Exception e) {
+            future.cancel(true);
+            session.abort();
+            CLog.e(getNodeTag(), "processPicture error", e);
+            return null;
+        } finally {
+            executorService.shutdown();
         }
-        final ImageBuffer resultBuffer = executor.apply(picture, bundle);
+
         if (null != resultBuffer) {
             session.complete();
         }
-        return resultBuffer;
+
+        if (session.isWatchdogTimedOut()) {
+            return null;
+        } else {
+            return resultBuffer;
+        }
     }
 
-    @NonNull
-    protected NodeParams getNodeParams(@NonNull ExtraBundle extraBundle) {
-        return NodeParams.None.INSTANCE;
+    protected boolean isPredictable() {
+        return false;
     }
 
     /**

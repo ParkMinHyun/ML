@@ -24,8 +24,8 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
 
 data class NodeExecutionMetrics(
     val nodeId: NodeId,
-    val nodeParams: NodeParams = NodeParams.None,
     val inputImageSize: Size,
+    val outputImageSize: Size,
     val preExecutionMetrics: PreExecutionMetrics,
     val postExecutionMetrics: PostExecutionMetrics,
 )
@@ -38,18 +38,6 @@ data class SavingExecutionMetrics(
     val postExecutionMetrics: PostExecutionMetrics,
     var startTimestampMs: Long = 0L,
 )
-
-sealed interface NodeParams {
-    data object None : NodeParams
-
-    data class DualBokeh(val outputImageSize: Size) : NodeParams
-
-    data object Filter : NodeParams
-
-    data object Watermark : NodeParams
-
-    data class Encoding(val encodingFormat: Int) : NodeParams
-}
 
 data class PreExecutionMetrics(
     val budgetMs: Long,

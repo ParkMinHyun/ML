@@ -49,19 +49,13 @@ class CaptureMetricsExcelExporter(
                 )
             }
 
-            val normalCaptures = rawCaptures.filter { it.captureIndex <= 1060 }
-            val memoryPressureCaptures = rawCaptures.filter { it.captureIndex > 1060 }
-
-            val enrichedNormalCaptures = processCaptures(normalCaptures)
-            val enrichedMemoryPressureCaptures = processCaptures(memoryPressureCaptures)
+            val enrichedNormalCaptures = processCaptures(rawCaptures)
 
             // Write main sheets
-            writeSheet(workbook, styles, "Normal", enrichedNormalCaptures, buildCaptureColumns())
-            writeSheet(workbook, styles, "Memory Pressure", enrichedMemoryPressureCaptures, buildCaptureColumns())
+            writeSheet(workbook, styles, "Capture", enrichedNormalCaptures, buildCaptureColumns())
 
             // Write sub-sheets for each category
-            generateSubSheets(workbook, styles, enrichedNormalCaptures, "Normal - ")
-            generateSubSheets(workbook, styles, enrichedMemoryPressureCaptures, "Memory - ")
+            generateSubSheets(workbook, styles, enrichedNormalCaptures, "")
 
             FileOutputStream(outputFile).use { workbook.write(it) }
         }
@@ -156,12 +150,10 @@ class CaptureMetricsExcelExporter(
                 setCellValue(cell, value)
             }
 
-            if (sheetName == "Normal" || sheetName == "Memory Pressure") {
-                if (item is EnrichedCaptureRow && item.row.metrics.draftSequenceMetrics?.isTimeout == true && rowIndex < items.lastIndex) {
-                    val nextItem = items.getOrNull(rowIndex + 1) as? EnrichedCaptureRow
-                    if (nextItem != null && item.groupId != nextItem.groupId) {
-                        sheet.createRow(sheet.lastRowNum + 1)
-                    }
+            if (item is EnrichedCaptureRow && item.row.metrics.draftSequenceMetrics?.isTimeout == true && rowIndex < items.lastIndex) {
+                val nextItem = items.getOrNull(rowIndex + 1) as? EnrichedCaptureRow
+                if (nextItem != null && item.groupId != nextItem.groupId) {
+                    sheet.createRow(sheet.lastRowNum + 1)
                 }
             }
         }
@@ -215,8 +207,8 @@ class CaptureMetricsExcelExporter(
             get() = node.postExecutionMetrics.durationMs.takeIf { it > 0L }
 
         fun predictionErrorMs(): Long? {
-            val durationMs = actualDurationMs ?: return null
             val prediction = prediction ?: return null
+            val durationMs = actualDurationMs ?: return null
             return durationMs - prediction.predictedDurationMs
         }
     }
@@ -288,10 +280,8 @@ class CaptureMetricsExcelExporter(
             val columns = mutableListOf<Column<Triple<Int, String, NodeRow>>>(
                 Column("captureIndex") { it.first },
                 Column("nodeId") { it.second },
-                Column("nodeParamsType") { it.third.node.nodeParams.typeName() },
-                Column("encodingFormat") { (it.third.node.nodeParams as? NodeParams.Encoding)?.encodingFormat },
-                Column("outputImageWidth") { (it.third.node.nodeParams as? NodeParams.DualBokeh)?.outputImageSize?.width },
-                Column("outputImageHeight") { (it.third.node.nodeParams as? NodeParams.DualBokeh)?.outputImageSize?.height },
+                Column("outputImageWidth") { it.third.node.outputImageSize.width },
+                Column("outputImageHeight") { it.third.node.outputImageSize.height },
                 Column("inputImageWidth") { it.third.node.inputImageSize.width },
                 Column("inputImageHeight") { it.third.node.inputImageSize.height },
                 Column("budgetMs") { it.third.node.preExecutionMetrics.budgetMs },
@@ -306,8 +296,11 @@ class CaptureMetricsExcelExporter(
                 Column("cpuTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
                 Column("wallTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
                 Column("runQueueWaitMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
-                Column("nonvoluntaryCtxSwitches") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
+                Column("admit") { it.third.prediction?.admit },
+                Column("predictedDurationMs") { it.third.prediction?.predictedDurationMs },
+                Column("predictedUpperBoundMs") { it.third.prediction?.predictedUpperBoundMs },
                 Column("durationMs") { it.third.node.postExecutionMetrics.durationMs },
+                Column("predictionErrorMs") { it.third.predictionErrorMs() },
             )
             // ... (rest of the function is the same)
             return columns
@@ -332,22 +325,11 @@ class CaptureMetricsExcelExporter(
                 Column("cpuTimeMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
                 Column("wallTimeMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
                 Column("runQueueWaitMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
-                Column("nonvoluntaryCtxSwitches") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
                 Column("durationMs") { it.second.saving.postExecutionMetrics.durationMs },
+                Column("predictionErrorMs") { it.second.predictionErrorMs() },
             )
             // ... (rest of the function is the same)
             return columns
         }
-
-        private fun NodeParams.typeName(): String {
-            return when (this) {
-                NodeParams.None -> "none"
-                is NodeParams.DualBokeh -> "dualBokeh"
-                is NodeParams.Watermark -> "watermark"
-                is NodeParams.Filter -> "filter"
-                is NodeParams.Encoding -> "encoding"
-            }
-        }
-
     }
 }
