@@ -9,6 +9,7 @@ import java.util.function.Consumer
 import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -87,7 +88,11 @@ abstract class DraftSequenceExecutionPredictor {
 
     fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
         updateWorkload(
-            workloadKey = WorkloadKey.saving(savingExecutionMetrics),
+            workloadKey = WorkloadKey.saving(
+                savingExecutionMetrics.resultImageSize,
+                savingExecutionMetrics.resultImageFormat,
+                savingExecutionMetrics.isPendingRequest,
+            ),
             postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
         )
     }
@@ -171,39 +176,6 @@ abstract class DraftSequenceExecutionPredictor {
     }
 }
 
-/**
- * Coarse workload family a node / saving maps to. This is the grouping level the predictors fall
- * back to when an exact [WorkloadKey] cell does not yet have enough samples.
- */
-enum class WorkloadCategory {
-    BOKEH,
-    FILTER,
-    ENCODING,
-    SAVING,
-    NODE;
-
-    /**
-     * Whether this family is gated on an admission bound rather than run unconditionally. The
-     * profiler predicts admission only for these; Encoding and Saving are mandatory and only learned.
-     */
-    val isAdmissionStage: Boolean
-        get() = this == BOKEH || this == FILTER
-
-    companion object {
-        /** Single source of truth for which [WorkloadCategory] a node id belongs to. */
-        fun ofNode(nodeId: NodeId): WorkloadCategory {
-            return when (nodeId) {
-                NodeId.NODE_SEC_V1_DUAL_BOKEH,
-                NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
-                NodeId.NODE_SEC_V2_DUAL_BOKEH -> BOKEH
-                NodeId.NODE_SEC_FILTER -> FILTER
-                NodeId.NODE_SEC_V2_IMAGE_CODEC -> ENCODING
-                else -> NODE
-            }
-        }
-    }
-}
-
 /** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */
 enum class SizeBucket(val megaPixels: Int) {
     MP12(12),
@@ -231,42 +203,39 @@ enum class SizeBucket(val megaPixels: Int) {
  * string format to keep in sync.
  */
 sealed interface WorkloadKey {
-    val category: WorkloadCategory
 
-    data class Bokeh(val sizeBucket: SizeBucket) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.BOKEH
-    }
+    data class Bokeh(val sizeBucket: SizeBucket) : WorkloadKey
 
-    data class Filter(val sizeBucket: SizeBucket) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.FILTER
-    }
+    data class Filter(val sizeBucket: SizeBucket) : WorkloadKey
 
-    data class Node(val nodeId: NodeId, val sizeBucket: SizeBucket) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.NODE
-    }
+    data class Encoding(val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
 
-    data class Encoding(val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.ENCODING
-    }
-
-    data class Saving(val sizeBucket: SizeBucket, val imageFormat: Int, val isPendingRequest: Boolean) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.SAVING
-    }
+    data class Saving(val sizeBucket: SizeBucket, val imageFormat: Int, val isPendingRequest: Boolean) : WorkloadKey
 
     companion object {
+        /** Bokeh and Filter are gated on an admission bound; Encoding and Saving are mandatory. */
+        fun isAdmissionStageNode(nodeId: NodeId): Boolean {
+            return when (nodeId) {
+                NodeId.NODE_SEC_V1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V2_DUAL_BOKEH,
+                NodeId.NODE_SEC_FILTER -> true
+                else -> false
+            }
+        }
+
         fun node(
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
             imageFormat: Int,
         ): WorkloadKey {
-            return when (WorkloadCategory.ofNode(nodeId)) {
-                WorkloadCategory.BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
-                WorkloadCategory.FILTER -> Filter(SizeBucket.of(inputImageSize))
-                WorkloadCategory.ENCODING -> Encoding(
-                    sizeBucket = SizeBucket.of(inputImageSize),
-                    imageFormat = imageFormat,
-                )
+            return when (nodeId) {
+                NodeId.NODE_SEC_V1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
+                NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
+                NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
+                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(inputImageSize), imageFormat)
                 else -> throw IllegalArgumentException("not supported node type($nodeId)")
             }
         }
@@ -277,14 +246,6 @@ sealed interface WorkloadKey {
 
         fun saving(resultImageSize: Size, imageFormat: Int, isPendingRequest: Boolean): WorkloadKey {
             return Saving(SizeBucket.of(resultImageSize), imageFormat, isPendingRequest)
-        }
-
-        fun saving(savingExecutionMetrics: SavingExecutionMetrics): WorkloadKey {
-            return Saving(
-                isPendingRequest = savingExecutionMetrics.isPendingRequest,
-                sizeBucket = SizeBucket.of(savingExecutionMetrics.resultImageSize),
-                imageFormat = savingExecutionMetrics.resultImageFormat
-            )
         }
     }
 }
@@ -299,44 +260,26 @@ sealed interface WorkloadKey {
  *   3. if the work ran, caller calls [DraftSequenceExecutionSession.complete] exactly once to fill
  *      [PostExecutionMetrics] and correct the model.
  *
- * Create one per draft sequence and call [setDraftPlan] at the start so each node's admission
- * decision can sum the upper bounds of the workloads still ahead of it; the default [predictor] is
- * the process-wide [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
+ * Construct one per draft sequence with the plan (the admission stages that will run, in order, plus
+ * whether the save is a pending request); the default [predictor] is the process-wide
+ * [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
  */
 private const val TAG = "DraftSequenceExecutionProfiler"
 
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
+    private val plannedAdmissionStages: List<NodeId>,
+    private val savingIsPendingRequest: Boolean,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
 ) {
-
-    private var plannedAdmissionStages: List<NodeId> = emptyList()
-    private var savingIsPendingRequest: Boolean = false
-
-    /**
-     * Draft-start configuration, set once before the first [profileNodeExecution]:
-     *   - [admissionStages]: the ordered admission-gated stages (e.g. Bokeh, Filter) that will run;
-     *     the mandatory Encoding + Saving are implicit and must not be listed.
-     *   - [savingIsPendingRequest]: whether this capture's save is a pending request (the Saving
-     *     workload key splits on it, so admission must predict the matching bucket).
-     *
-     * Lets each [profileNodeExecution] sum the upper bounds of every workload still ahead of the
-     * running node, instead of the caller threading them in per node. NodeIds the predictor does not
-     * yet model as admission stages (e.g. a future Watermark) are stored but stay ignored until
-     * [WorkloadCategory.isAdmissionStage] covers them.
-     */
-    fun setDraftPlan(admissionStages: List<NodeId>, savingIsPendingRequest: Boolean) {
-        plannedAdmissionStages = admissionStages.toList()
-        this.savingIsPendingRequest = savingIsPendingRequest
-    }
 
     /**
      * Step 1 (node): record this node and return a session whose [DraftSequenceExecutionSession.complete]
      * feeds the observed duration into the per-stage model.
      *
-     * Only an admission stage (see [WorkloadCategory.isAdmissionStage]) predicts: its
+     * Only an admission stage (see [WorkloadKey.isAdmissionStageNode]) predicts: its
      * [DraftSequenceExecutionSession.shouldRun] is the sum of upper bounds - this stage, the admission
-     * stages still ahead of it (from [setDraftPlan]), and the mandatory Encoding + Saving - against
+     * stages still ahead of it (from the constructor's plan), and the mandatory Encoding + Saving - against
      * the remaining budget, so the gate reflects what actually has to finish in time, not the stage
      * alone. Every other node skips prediction and reports shouldRun == true, so the caller runs it
      * unconditionally and only its cost is learned.
@@ -369,7 +312,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             WorkloadKey.saving(resultImageSize, resultImageFormat, savingIsPendingRequest),
         )
 
-        val isAdmissionStage = WorkloadCategory.ofNode(nodeId).isAdmissionStage
+        val isAdmissionStage = WorkloadKey.isAdmissionStageNode(nodeId)
         val prediction = if (isAdmissionStage) {
             val stageKeys = (listOf(nodeId) + followingAdmissionStages(nodeId)).map {
                 WorkloadKey.node(it, inputImageSize, resultImageSize, resultImageFormat)
@@ -428,7 +371,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             return emptyList()
         }
         return plannedAdmissionStages.drop(index + 1)
-            .filter { WorkloadCategory.ofNode(it).isAdmissionStage }
+            .filter { WorkloadKey.isAdmissionStageNode(it) }
     }
 }
 
@@ -458,86 +401,40 @@ class DraftSequenceExecutionSession internal constructor(
     private val startedAtMs = SystemClock.uptimeMillis()
 
     private var completed = false
-    private var watchdogArmed = false
     private var watchdogTimedOut = false
-    private var delayMs = 0L
+
+    /** Time from start until the mandatory tail must begin; 0 when no watchdog is set. */
+    private val delayMs: Long =
+        watchdogDeadlineMs?.let { (it - startedAtMs).coerceAtLeast(0L) } ?: 0L
+
+    /**
+     * Single-shot watchdog: at the deadline, if the work has not finished, flag the timeout and
+     * notify [watchdogTimeoutCallback]; [complete]/[abort] cancel it. Currently armed but inert - the
+     * profiler passes no callback (the Node.java wiring is commented out). When re-enabled, also gate
+     * arming on shouldRun and a non-null callback.
+     */
+    private val watchdogJob: Job? = watchdogDeadlineMs?.let {
+        CoroutineScope(Dispatchers.Default).launch {
+            delay(delayMs)
+            val timedOut = synchronized(this@DraftSequenceExecutionSession) {
+                if (completed) false else { watchdogTimedOut = true; true }
+            }
+            if (timedOut) {
+                CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
+                watchdogTimeoutCallback?.onTimeout(this@DraftSequenceExecutionSession)
+            }
+        }
+    }
 
     fun isWatchdogTimedOut(): Boolean = watchdogTimedOut
     fun getDelayMs(): Long = delayMs
-
-    /**
-     * Per-session watchdog resources. They are created only when this session actually arms a
-     * watchdog, and are released when complete/abort is called or after the watchdog callback returns.
-     */
-    private var watchdogJob: kotlinx.coroutines.Job? = null
-
-    init {
-        armWatchdogIfNeeded()
-    }
-
-    private fun armWatchdogIfNeeded() {
-        val deadlineMs = watchdogDeadlineMs ?: return
-//        if (!shouldRun || watchdogTimeoutCallback == null) {
-//            CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - shouldRun($shouldRun), watchdogTimeoutCallback($watchdogTimeoutCallback)")
-//            return
-//        }
-        delayMs = (deadlineMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
-
-        synchronized(this) {
-            if (completed || watchdogTimedOut) {
-                CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - completed($completed), watchdogTimedOut($watchdogTimedOut)")
-                return
-            }
-
-            watchdogArmed = true
-            watchdogJob = CoroutineScope(Dispatchers.Default).launch {
-                delay(delayMs)
-
-                val callback = synchronized(this@DraftSequenceExecutionSession) {
-                    if (completed || watchdogTimedOut) {
-                        null
-                    } else {
-                        watchdogTimedOut = true
-                        watchdogArmed = false
-                        watchdogTimeoutCallback
-                    }
-                }
-
-                try {
-                    if (callback != null) {
-                        CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
-                        callback.onTimeout(this@DraftSequenceExecutionSession)
-                    }
-                } finally {
-                    releaseWatchdogJob()
-                }
-            }
-            CLog.i(TAG, "[mhyun2.park] armWatchdogIfNeeded - delayMs($delayMs)")
-        }
-    }
-
-    private fun cancelWatchdogLocked() {
-        watchdogJob?.cancel()
-        watchdogArmed = false
-    }
-
-    private fun releaseWatchdogJob() {
-        synchronized(this) {
-            cancelWatchdogLocked()
-            watchdogJob = null
-        }
-    }
 
     /**
      * Step 3: mark this session as cancelled without learning from it. Call this when the caller
      * skips the work or switches to fallback after the watchdog callback.
      */
     fun abort() {
-        synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession.abort() called more than once." }
-            completed = true
-        }
-        releaseWatchdogJob()
+        markCompleted()
     }
 
     /**
@@ -545,16 +442,19 @@ class DraftSequenceExecutionSession internal constructor(
      * model. Call this only after the work has actually run, exactly once.
      */
     fun complete() {
-        synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession.complete() called more than once." }
-            completed = true
-
-            postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
-            postExecutionMetrics.gcSnapshot = gcTracker.delta()
-            postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
-        }
-
-        releaseWatchdogJob()
+        markCompleted()
+        postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
+        postExecutionMetrics.gcSnapshot = gcTracker.delta()
+        postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
         onComplete()
+    }
+
+    /** Marks the session done exactly once and stops the watchdog. */
+    private fun markCompleted() {
+        synchronized(this) {
+            check(!completed) { "DraftSequenceExecutionSession already completed." }
+            completed = true
+        }
+        watchdogJob?.cancel()
     }
 }
