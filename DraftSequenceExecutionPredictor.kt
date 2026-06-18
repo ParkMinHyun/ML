@@ -16,13 +16,12 @@ import kotlinx.coroutines.launch
 /**
  * Base for every draft-sequence execution predictor.
  *
- * This class owns the functionality that is common to *all* predictors and independent of how any
- * one of them models execution cost:
- *   - the workload taxonomy (how a node / saving / tail maps to a stable [WorkloadKey]),
- *   - the public entry points the profiler calls (combined admission + per-stage learning), and
+ * This class owns what is common to *all* predictors and independent of how any one models cost:
+ *   - the workload taxonomy (how a node / saving maps to a stable [WorkloadKey]),
+ *   - admission as a sum of independent per-workload upper bounds ([predictAdmission]), and
  *   - history replay ([warmUpFromHistory]).
  *
- * A concrete predictor implements only the four model-specific hooks below; it never sees raw
+ * A concrete predictor implements only the two model-specific hooks below; it never sees raw
  * nodeIds, image sizes, or formats - it receives the already-bucketed [WorkloadKey] and the
  * pre/post-execution metrics. To add a new predictor, subclass this and implement the hooks; all
  * routing, keying, and replay are inherited unchanged.
@@ -31,290 +30,66 @@ abstract class DraftSequenceExecutionPredictor {
 
     // ---- Model-specific hooks (the only thing a concrete predictor must implement) ----
 
-    /** Predicts a single bucketed workload's execution cost. */
-    protected abstract fun predictForKey(
+    /** Predicts one workload's point estimate and upper bound. */
+    protected abstract fun predictWorkload(
         workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction
 
-    /** Corrects the model for a single bucketed workload from its observed outcome. */
-    protected abstract fun updateForKey(
+    /** Records one workload's observed cost. Pure observation: no prediction, no budget. */
+    protected abstract fun updateWorkload(
         workloadKey: WorkloadKey,
-        preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     )
 
-    /** Predicts a decision-level (one or more stages + mandatory tail) cost for admission. */
-    protected abstract fun predictForDecision(
-        stageWorkloadKeys: List<WorkloadKey>,
-        tailWorkloadKey: WorkloadKey,
-        decisionKey: DecisionKey,
+    // ---- Admission: sum of independent per-workload upper bounds ----
+
+    /**
+     * Predicts a stage's admission as the sum of each listed workload's independent upper bound:
+     *     admit  <=>  Σ upperBound(workload) <= budget
+     *
+     * The caller lists every workload that still has to finish in the draft sequence - the running
+     * stage, the admission stages after it, and the mandatory Encoding + Saving - so the gate
+     * reflects the whole remaining cost. A workload with no samples contributes 0, so admission stays
+     * lenient until the model has learned.
+     */
+    fun predictAdmission(
+        workloadKeys: List<WorkloadKey>,
         preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction
+    ): ExecutionPrediction {
+        var sumDurationMs = 0L
+        var sumUpperBoundMs = 0L
+        workloadKeys.forEach { workloadKey ->
+            val prediction = predictWorkload(workloadKey, preExecutionMetrics)
+            sumDurationMs += prediction.predictedDurationMs
+            sumUpperBoundMs += prediction.predictedUpperBoundMs
+        }
+        return ExecutionPrediction(
+            admit = sumUpperBoundMs <= preExecutionMetrics.budgetMs,
+            predictedDurationMs = sumDurationMs,
+            predictedUpperBoundMs = sumUpperBoundMs,
+        )
+    }
 
-    /** Corrects the decision-level model from the combined observed outcome. */
-    protected abstract fun updateForDecision(
-        decisionKey: DecisionKey,
-        predictedCombinedDurationMs: Long,
-        predictedCombinedUpperBoundMs: Long,
-        actualAdmissionStagesDurationMs: Long,
-        actualEncodingDurationMs: Long,
-        actualSavingDurationMs: Long,
-    )
-
-    // ---- Node ----
+    // ---- Per-workload learning ----
 
     fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, imageFormat: Int) {
-        updateForKey(
+        updateWorkload(
             workloadKey = WorkloadKey.node(
                 nodeExecutionMetrics.nodeId,
                 nodeExecutionMetrics.inputImageSize,
                 nodeExecutionMetrics.outputImageSize,
                 imageFormat,
             ),
-            preExecutionMetrics = nodeExecutionMetrics.preExecutionMetrics,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
         )
     }
 
-    // ---- Saving ----
-
     fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
-        updateForKey(
+        updateWorkload(
             workloadKey = WorkloadKey.saving(savingExecutionMetrics),
-            preExecutionMetrics = savingExecutionMetrics.preExecutionMetrics,
             postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
         )
-    }
-
-    // ---- Tail ----
-
-    /** Predicts Encoding + Saving tail only. Used by admission and by stage watchdog deadlines. */
-    fun predictTailExecution(
-        tailResultImageSize: Size,
-        tailResultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction {
-        return predictForKey(
-            workloadKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat),
-            preExecutionMetrics = preExecutionMetrics,
-        )
-    }
-
-    private fun updateTailExecution(
-        tailResultImageSize: Size,
-        tailResultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-        actualEncodingDurationMs: Long,
-        actualSavingDurationMs: Long,
-    ): Boolean {
-        val actualTailDurationMs = actualEncodingDurationMs.coerceAtLeast(0L) +
-                actualSavingDurationMs.coerceAtLeast(0L)
-        if (actualTailDurationMs <= 0L) {
-            return false
-        }
-
-        updateForKey(
-            workloadKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat),
-            preExecutionMetrics = preExecutionMetrics,
-            postExecutionMetrics = PostExecutionMetrics().apply {
-                durationMs = actualTailDurationMs
-            },
-        )
-        return true
-    }
-
-    // ---- Combined (one or more stages + mandatory tail) admission ----
-
-    /**
-     * Predicts one or more stages + mandatory tail together for stage admission:
-     *     elapsedSoFar + predictedUpperBound(stages + tail) <= totalBudget
-     *
-     * The primary stage is [stageNodeId]. Optional [additionalAdmissionStages] can be used when an
-     * earlier admission decision must include a following admission-gated stage too. For example, a
-     * Bokeh decision can include Filter by passing NODE_SEC_FILTER as an additional stage, making the
-     * decision cover Bokeh + Filter + Encoding + Saving.
-     *
-     * The tail means Encoding + Saving; correct it later via [updateCombinedAdmission].
-     */
-    fun predictCombinedAdmission(
-        stageNodeId: NodeId,
-        stageInputImageSize: Size,
-        stageOutputImageSize: Size,
-        tailResultImageSize: Size,
-        tailResultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-        additionalAdmissionStages: List<AdmissionStageSpec> = emptyList(),
-    ): ExecutionPrediction {
-        val stageKeys = buildStageWorkloadKeys(
-            stageNodeId = stageNodeId,
-            stageInputImageSize = stageInputImageSize,
-            stageOutputImageSize = stageOutputImageSize,
-            imageFormat = tailResultImageFormat,
-            additionalAdmissionStages = additionalAdmissionStages,
-        )
-        val tailKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat)
-
-        return predictForDecision(
-            stageWorkloadKeys = stageKeys,
-            tailWorkloadKey = tailKey,
-            decisionKey = DecisionKey.combined(stageKeys, tailKey),
-            preExecutionMetrics = preExecutionMetrics,
-        )
-    }
-
-    fun updateCombinedAdmission(
-        stageNodeId: NodeId,
-        stageInputImageSize: Size,
-        stageOutputImageSize: Size,
-        tailResultImageSize: Size,
-        tailResultImageFormat: Int,
-        predictedCombinedDurationMs: Long,
-        predictedCombinedUpperBoundMs: Long,
-        actualStageDurationMs: Long,
-        actualEncodingDurationMs: Long,
-        actualSavingDurationMs: Long,
-        additionalAdmissionStages: List<AdmissionStageSpec> = emptyList(),
-    ) {
-        val stageKeys = buildStageWorkloadKeys(
-            stageNodeId = stageNodeId,
-            stageInputImageSize = stageInputImageSize,
-            stageOutputImageSize = stageOutputImageSize,
-            imageFormat = tailResultImageFormat,
-            additionalAdmissionStages = additionalAdmissionStages,
-        )
-        val tailKey = WorkloadKey.tail(tailResultImageSize, tailResultImageFormat)
-
-        updateForDecision(
-            decisionKey = DecisionKey.combined(stageKeys, tailKey),
-            predictedCombinedDurationMs = predictedCombinedDurationMs,
-            predictedCombinedUpperBoundMs = predictedCombinedUpperBoundMs,
-            actualAdmissionStagesDurationMs = actualStageDurationMs,
-            actualEncodingDurationMs = actualEncodingDurationMs,
-            actualSavingDurationMs = actualSavingDurationMs,
-        )
-    }
-
-    private fun buildStageWorkloadKeys(
-        stageNodeId: NodeId,
-        stageInputImageSize: Size,
-        stageOutputImageSize: Size,
-        imageFormat: Int,
-        additionalAdmissionStages: List<AdmissionStageSpec>,
-    ): List<WorkloadKey> {
-        val stageKeys = mutableListOf(
-            WorkloadKey.node(
-                nodeId = stageNodeId,
-                inputImageSize = stageInputImageSize,
-                outputImageSize = stageOutputImageSize,
-                imageFormat = imageFormat,
-            )
-        )
-
-        additionalAdmissionStages.forEach { stage ->
-            stageKeys += WorkloadKey.node(
-                nodeId = stage.nodeId,
-                inputImageSize = stage.inputImageSize,
-                outputImageSize = stage.outputImageSize,
-                imageFormat = imageFormat,
-            )
-        }
-
-        return stageKeys
-    }
-
-    /**
-     * Corrects the combined-admission model from one completed draft sequence: pairs each admission
-     * stage (see [WorkloadCategory.isAdmissionStage]) with the mandatory Encoding + Saving tail and
-     * feeds its combined residual. For Bokeh, if a Filter admission stage also ran later in the same
-     * draft, the Bokeh decision is corrected as Bokeh + Filter + Encoding + Saving.
-     *
-     * No-op unless the admission stage(s), the encoding node, and saving all actually ran (a skipped
-     * stage or a censored fallback leaves their durations at 0). Returns the number of samples fed.
-     */
-    fun updateCombinedAdmissions(captureMetrics: CaptureMetrics): Int {
-        val draftMetrics = captureMetrics.draftSequenceMetrics ?: return 0
-
-        val admissionStages = draftMetrics.nodeExecutionMetricsList.filter {
-            WorkloadCategory.ofNode(it.nodeId).isAdmissionStage
-        }
-        if (admissionStages.isEmpty()) {
-            return 0
-        }
-
-        val encoding = draftMetrics.nodeExecutionMetricsList.firstOrNull {
-            WorkloadCategory.ofNode(it.nodeId) == WorkloadCategory.ENCODING
-        } ?: return 0
-
-        val saving = draftMetrics.savingExecutionMetrics ?: return 0
-
-        val encodingDurationMs = encoding.postExecutionMetrics.durationMs
-        val savingDurationMs = saving.postExecutionMetrics.durationMs
-        if (encodingDurationMs <= 0L || savingDurationMs <= 0L) {
-            return 0
-        }
-
-        var updatedCount = 0
-        if (updateTailExecution(
-                tailResultImageSize = captureMetrics.resultImageSize,
-                tailResultImageFormat = captureMetrics.resultImageFormat,
-                preExecutionMetrics = encoding.preExecutionMetrics,
-                actualEncodingDurationMs = encodingDurationMs,
-                actualSavingDurationMs = savingDurationMs,
-            )
-        ) {
-            updatedCount++
-        }
-        val predictions = draftMetrics.nodeExecutionPredictionList
-
-        admissionStages.forEachIndexed { index, stage ->
-            val prediction = predictions.getOrNull(index) ?: return@forEachIndexed
-            val stageCategory = WorkloadCategory.ofNode(stage.nodeId)
-
-            val additionalStageMetrics = if (stageCategory == WorkloadCategory.BOKEH) {
-                admissionStages
-                    .drop(index + 1)
-                    .filter { WorkloadCategory.ofNode(it.nodeId) == WorkloadCategory.FILTER }
-            } else {
-                emptyList()
-            }
-
-            val admissionStageMetrics = listOf(stage) + additionalStageMetrics
-            if (admissionStageMetrics.any { it.postExecutionMetrics.durationMs <= 0L }) {
-                return@forEachIndexed
-            }
-
-            val admissionStagesDurationMs = admissionStageMetrics.sumOf {
-                it.postExecutionMetrics.durationMs
-            }
-
-            updateCombinedAdmission(
-                stageNodeId = stage.nodeId,
-                stageInputImageSize = stage.inputImageSize,
-                stageOutputImageSize = stage.outputImageSize,
-                tailResultImageSize = captureMetrics.resultImageSize,
-                tailResultImageFormat = captureMetrics.resultImageFormat,
-                predictedCombinedDurationMs = prediction.predictedDurationMs,
-                predictedCombinedUpperBoundMs = prediction.predictedUpperBoundMs,
-                actualStageDurationMs = admissionStagesDurationMs,
-                actualEncodingDurationMs = encodingDurationMs,
-                actualSavingDurationMs = savingDurationMs,
-                additionalAdmissionStages = additionalStageMetrics.map {
-                    AdmissionStageSpec(
-                        nodeId = it.nodeId,
-                        inputImageSize = it.inputImageSize,
-                        outputImageSize = it.outputImageSize,
-                    )
-                },
-            )
-            updatedCount++
-        }
-
-        return updatedCount
-    }
-
-    fun updateCombinedAdmission(captureMetrics: CaptureMetrics): Boolean {
-        return updateCombinedAdmissions(captureMetrics) > 0
     }
 
     /**
@@ -342,8 +117,6 @@ abstract class DraftSequenceExecutionPredictor {
                     updatedCount++
                 }
             }
-
-            updatedCount += updateCombinedAdmissions(captureMetrics)
         }
         return updatedCount
     }
@@ -398,29 +171,20 @@ abstract class DraftSequenceExecutionPredictor {
     }
 }
 
-/** Extra stage included in a combined admission decision. */
-data class AdmissionStageSpec(
-    val nodeId: NodeId,
-    val inputImageSize: Size,
-    val outputImageSize: Size,
-)
-
 /**
- * Coarse workload family a node / saving / tail maps to. This is the grouping level the predictors
- * fall back to when an exact [WorkloadKey] cell does not yet have enough samples.
+ * Coarse workload family a node / saving maps to. This is the grouping level the predictors fall
+ * back to when an exact [WorkloadKey] cell does not yet have enough samples.
  */
 enum class WorkloadCategory {
     BOKEH,
     FILTER,
     ENCODING,
-    TAIL,
     SAVING,
     NODE;
 
     /**
-     * Whether this family is gated on a combined admission bound rather than run unconditionally.
-     * Single source of truth for both the profiler (whether to predict) and the combined-admission
-     * learner (which node is the stage).
+     * Whether this family is gated on an admission bound rather than run unconditionally. The
+     * profiler predicts admission only for these; Encoding and Saving are mandatory and only learned.
      */
     val isAdmissionStage: Boolean
         get() = this == BOKEH || this == FILTER
@@ -461,7 +225,7 @@ enum class SizeBucket(val megaPixels: Int) {
  * Stable workload bucket shared by every predictor:
  *   Bokeh : DualBokeh output [SizeBucket]
  *   Filter: input [SizeBucket]
- *   Encoding/Tail/Saving: [SizeBucket] x image format (Saving also splits on the pending flag)
+ *   Encoding/Saving: [SizeBucket] x image format (Saving also splits on the pending flag)
  *
  * Identity is the typed fields of each subtype, so it can be used directly as a map key without any
  * string format to keep in sync.
@@ -489,13 +253,6 @@ sealed interface WorkloadKey {
         override val category: WorkloadCategory = WorkloadCategory.SAVING
     }
 
-    data class Tail(
-        val sizeBucket: SizeBucket,
-        val imageFormat: Int,
-    ) : WorkloadKey {
-        override val category: WorkloadCategory = WorkloadCategory.TAIL
-    }
-
     companion object {
         fun node(
             nodeId: NodeId,
@@ -514,14 +271,12 @@ sealed interface WorkloadKey {
             }
         }
 
-        fun tail(
-            resultImageSize: Size,
-            resultImageFormat: Int,
-        ): WorkloadKey {
-            return Tail(
-                sizeBucket = SizeBucket.of(resultImageSize),
-                imageFormat = resultImageFormat,
-            )
+        fun encoding(resultImageSize: Size, imageFormat: Int): WorkloadKey {
+            return Encoding(SizeBucket.of(resultImageSize), imageFormat)
+        }
+
+        fun saving(resultImageSize: Size, imageFormat: Int, isPendingRequest: Boolean): WorkloadKey {
+            return Saving(SizeBucket.of(resultImageSize), imageFormat, isPendingRequest)
         }
 
         fun saving(savingExecutionMetrics: SavingExecutionMetrics): WorkloadKey {
@@ -530,31 +285,6 @@ sealed interface WorkloadKey {
                 sizeBucket = SizeBucket.of(savingExecutionMetrics.resultImageSize),
                 imageFormat = savingExecutionMetrics.resultImageFormat
             )
-        }
-    }
-}
-
-/**
- * Decision-level key for one or more stages + mandatory tail admission. Identity is the typed
- * (stage list, tail) pair, so Bokeh + Tail and Bokeh + Filter + Tail learn separate residuals.
- */
-@ConsistentCopyVisibility
-data class DecisionKey internal constructor(
-    val stageKeys: List<WorkloadKey>,
-    val tailKey: WorkloadKey,
-) {
-
-    init {
-        require(stageKeys.isNotEmpty()) { "DecisionKey requires at least one stage key." }
-    }
-
-    companion object {
-        fun combined(stageKey: WorkloadKey, tailKey: WorkloadKey): DecisionKey {
-            return DecisionKey(listOf(stageKey), tailKey)
-        }
-
-        fun combined(stageKeys: List<WorkloadKey>, tailKey: WorkloadKey): DecisionKey {
-            return DecisionKey(stageKeys.toList(), tailKey)
         }
     }
 }
@@ -569,8 +299,9 @@ data class DecisionKey internal constructor(
  *   3. if the work ran, caller calls [DraftSequenceExecutionSession.complete] exactly once to fill
  *      [PostExecutionMetrics] and correct the model.
  *
- * This profiler is cheap and may be created per capture; the default [predictor] is the process-wide
- * [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
+ * Create one per draft sequence and call [setDraftPlan] at the start so each node's admission
+ * decision can sum the upper bounds of the workloads still ahead of it; the default [predictor] is
+ * the process-wide [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
  */
 private const val TAG = "DraftSequenceExecutionProfiler"
 
@@ -579,25 +310,43 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
 ) {
 
+    private var plannedAdmissionStages: List<NodeId> = emptyList()
+    private var savingIsPendingRequest: Boolean = false
+
+    /**
+     * Draft-start configuration, set once before the first [profileNodeExecution]:
+     *   - [admissionStages]: the ordered admission-gated stages (e.g. Bokeh, Filter) that will run;
+     *     the mandatory Encoding + Saving are implicit and must not be listed.
+     *   - [savingIsPendingRequest]: whether this capture's save is a pending request (the Saving
+     *     workload key splits on it, so admission must predict the matching bucket).
+     *
+     * Lets each [profileNodeExecution] sum the upper bounds of every workload still ahead of the
+     * running node, instead of the caller threading them in per node. NodeIds the predictor does not
+     * yet model as admission stages (e.g. a future Watermark) are stored but stay ignored until
+     * [WorkloadCategory.isAdmissionStage] covers them.
+     */
+    fun setDraftPlan(admissionStages: List<NodeId>, savingIsPendingRequest: Boolean) {
+        plannedAdmissionStages = admissionStages.toList()
+        this.savingIsPendingRequest = savingIsPendingRequest
+    }
 
     /**
      * Step 1 (node): record this node and return a session whose [DraftSequenceExecutionSession.complete]
      * feeds the observed duration into the per-stage model.
      *
      * Only an admission stage (see [WorkloadCategory.isAdmissionStage]) predicts: its
-     * [DraftSequenceExecutionSession.shouldRun] is the COMBINED upper bound - this stage plus any
-     * [admissionAdditionalStages] plus the mandatory Encoding + Saving tail (keyed by the capture's
-     * final result image size/format) - against the remaining budget, so the gate reflects what
-     * actually has to finish in time, not the stage alone. Every other node skips prediction and
-     * reports shouldRun == true, so the caller runs it unconditionally and only its cost is learned.
+     * [DraftSequenceExecutionSession.shouldRun] is the sum of upper bounds - this stage, the admission
+     * stages still ahead of it (from [setDraftPlan]), and the mandatory Encoding + Saving - against
+     * the remaining budget, so the gate reflects what actually has to finish in time, not the stage
+     * alone. Every other node skips prediction and reports shouldRun == true, so the caller runs it
+     * unconditionally and only its cost is learned.
      *
      * @param nodeId node identifier (model bucket key).
      * @param timeoutMs absolute deadline for this node; the remaining budget is derived at read time.
      * @param inputImageSize input image dimensions.
-     * @param resultImageSize final capture result image dimensions for this node output and mandatory tail key.
-     * @param resultImageFormat final capture result image format for the mandatory tail key.
+     * @param resultImageSize final capture result image dimensions for this node output and Encoding/Saving keys.
+     * @param resultImageFormat final capture result image format for the Encoding/Saving keys.
      * @param draftMetrics draft metrics to append this node's record to.
-     * @param admissionAdditionalStages optional following admission stages to include in this decision.
      */
     fun profileNodeExecution(
         nodeId: NodeId,
@@ -606,7 +355,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         resultImageSize: Size,
         resultImageFormat: Int,
         draftMetrics: DraftSequenceMetrics,
-        admissionAdditionalStages: List<AdmissionStageSpec> = emptyList(),
     ): DraftSequenceExecutionSession {
         val deviceState = deviceStateReader.read()
         val preExecutionMetrics = PreExecutionMetrics(
@@ -616,17 +364,17 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             storageSnapshot = deviceState.storageSnapshot,
         )
 
+        val mandatoryKeys = listOf(
+            WorkloadKey.encoding(resultImageSize, resultImageFormat),
+            WorkloadKey.saving(resultImageSize, resultImageFormat, savingIsPendingRequest),
+        )
+
         val isAdmissionStage = WorkloadCategory.ofNode(nodeId).isAdmissionStage
         val prediction = if (isAdmissionStage) {
-            predictor.predictCombinedAdmission(
-                stageNodeId = nodeId,
-                stageInputImageSize = inputImageSize,
-                stageOutputImageSize = resultImageSize,
-                tailResultImageSize = resultImageSize,
-                tailResultImageFormat = resultImageFormat,
-                preExecutionMetrics = preExecutionMetrics,
-                additionalAdmissionStages = admissionAdditionalStages,
-            )
+            val stageKeys = (listOf(nodeId) + followingAdmissionStages(nodeId)).map {
+                WorkloadKey.node(it, inputImageSize, resultImageSize, resultImageFormat)
+            }
+            predictor.predictAdmission(stageKeys + mandatoryKeys, preExecutionMetrics)
         } else {
             null
         }
@@ -639,17 +387,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             postExecutionMetrics = PostExecutionMetrics(),
         )
 
-        val tailPrediction = if (isAdmissionStage) {
-            predictor.predictTailExecution(
-                tailResultImageSize = resultImageSize,
-                tailResultImageFormat = resultImageFormat,
-                preExecutionMetrics = preExecutionMetrics,
-            )
+        // Watchdog: the latest moment the mandatory Encoding + Saving can still start and meet budget.
+        val watchdogDeadlineMs = if (isAdmissionStage) {
+            val mandatoryUpperBoundMs =
+                predictor.predictAdmission(mandatoryKeys, preExecutionMetrics).predictedUpperBoundMs
+            timeoutMs - mandatoryUpperBoundMs.coerceAtLeast(0L)
         } else {
             null
-        }
-        val watchdogDeadlineMs = tailPrediction?.let {
-            timeoutMs - it.predictedUpperBoundMs.coerceAtLeast(0L)
         }
 
         synchronized(draftMetrics) {
@@ -663,8 +407,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             CLog.i(TAG, "[mhyun2.park] prediction - $prediction")
         }
         if (watchdogDeadlineMs != null) {
-            CLog.i(TAG, "[mhyun2.park] watchdog - nodeId=$nodeId, deadlineMs=$watchdogDeadlineMs, " +
-                        "tailUpperBoundMs=${tailPrediction.predictedUpperBoundMs}")
+            CLog.i(TAG, "[mhyun2.park] watchdog - nodeId=$nodeId, deadlineMs=$watchdogDeadlineMs")
         }
 
         return DraftSequenceExecutionSession(
@@ -673,6 +416,19 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             onComplete = { predictor.updateNodeExecution(nodeExecutionMetrics, resultImageFormat) },
             watchdogDeadlineMs = watchdogDeadlineMs,
         )
+    }
+
+    /**
+     * The admission stages planned to run after [nodeId]. Empty when [nodeId] is not in the planned
+     * sequence; unmodeled NodeIds are dropped so only keyable admission stages remain.
+     */
+    private fun followingAdmissionStages(nodeId: NodeId): List<NodeId> {
+        val index = plannedAdmissionStages.indexOf(nodeId)
+        if (index < 0) {
+            return emptyList()
+        }
+        return plannedAdmissionStages.drop(index + 1)
+            .filter { WorkloadCategory.ofNode(it).isAdmissionStage }
     }
 }
 

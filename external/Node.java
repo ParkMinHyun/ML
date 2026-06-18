@@ -1277,39 +1277,44 @@ public abstract class Node implements PictureFormatProcessableInterface {
                 draftSequenceMetrics,
                 admissionStageSpecs);
 
-        final ExecutorService executorService = Executors.newSingleThreadExecutor();
-        final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
+        // final ExecutorService executorService = Executors.newSingleThreadExecutor();
+        // final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
 
-        final ImageBuffer resultBuffer;
-        try {
-            if (session.getDelayMs() > 0) {
-                CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
-                resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
-            } else {
-                resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
-            }
-        } catch (TimeoutException e) {
-            future.cancel(true);
-            CLog.w(getNodeTag(), "processPicture timed out.");
-            return null;
-        } catch (Exception e) {
-            future.cancel(true);
-            session.abort();
-            CLog.e(getNodeTag(), "processPicture error", e);
-            return null;
-        } finally {
-            executorService.shutdown();
+        // final ImageBuffer resultBuffer;
+        // try {
+        //     if (session.getDelayMs() > 0) {
+        //         CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
+        //         resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
+        //     } else {
+        //         resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
+        //     }
+        // } catch (TimeoutException e) {
+        //     future.cancel(true);
+        //     CLog.w(getNodeTag(), "processPicture timed out.");
+        //     return null;
+        // } catch (Exception e) {
+        //     future.cancel(true);
+        //     session.abort();
+        //     CLog.e(getNodeTag(), "processPicture error", e);
+        //     return null;
+        // } finally {
+        //     executorService.shutdown();
+        // }
+        if (!session.getShouldRun()) {
+            return picture;
         }
+        final ImageBuffer resultBuffer = executor.apply(picture, bundle);
 
         if (null != resultBuffer) {
             session.complete();
         }
+        return resultBuffer;
 
-        if (session.isWatchdogTimedOut()) {
-            return null;
-        } else {
-            return resultBuffer;
-        }
+        // if (session.isWatchdogTimedOut()) {
+        //     return null;
+        // } else {
+        //     return resultBuffer;
+        // }
     }
 
     protected boolean isPredictable() {

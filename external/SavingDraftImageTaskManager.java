@@ -192,12 +192,10 @@ public class SavingDraftImageTaskManager {
                         new PostExecutionMetrics(null, null, SystemClock.uptimeMillis() - savingExecutionMetrics.getStartTimestampMs()),
                         savingExecutionMetrics.getStartTimestampMs());
                 draftSequenceMetrics.setSavingExecutionMetrics(completedSavingExecutionMetrics);
-                // Saving needs no prediction; feed its observed cost into the shared model, then close
-                // the loop by learning the combined (bokeh + encoding + saving) admission residual now
-                // that every stage of this draft sequence has finished.
+                // Saving needs no prediction; feed its observed cost into the shared model so the
+                // Saving workload's upper bound keeps learning for later admission decisions.
                 final DraftSequenceExecutionPredictor predictor = DraftSequenceExecutionPredictor.getInstance();
                 predictor.updateSavingExecution(completedSavingExecutionMetrics);
-                predictor.updateCombinedAdmission(captureMetrics);
 
                 if (isLastTimeout) {
                     draftSequenceMetrics.setTimeout(true);

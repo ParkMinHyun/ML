@@ -1,6 +1,5 @@
 package com.samsung.android.camera.core2.ml
 
-import com.samsung.android.camera.core2.util.CLog
 import java.util.ArrayDeque
 import kotlin.math.ceil
 import kotlin.math.roundToLong
@@ -8,11 +7,9 @@ import kotlin.math.roundToLong
 /**
  * Baseline EWMA predictor with residual upper-bound correction.
  *
- * This intentionally keeps only the basic study behavior:
- *   - point estimate: per-workload EWMA duration,
- *   - upper bound: fixed rolling quantile of the same cell's recent positive residuals,
- *   - no minimum residual sample gate, margin floor, adaptive conformal quantile, drift detector,
- *     pressure logic, or parametric bridge.
+ * Per workload: the point estimate is the EWMA duration; the upper bound adds a fixed rolling
+ * quantile of that cell's recent positive residuals. Admission sums these per-workload upper bounds
+ * in the base class - this predictor only ever sees one workload at a time.
  */
 class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val ewmaAlpha: Double = 0.20,
@@ -20,42 +17,34 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val residualQuantile: Double = 0.95,
 ) : DraftSequenceExecutionPredictor() {
 
-    private val TAG = "EwmaDraftSequenceExecutionPredictor"
-
     private val durationStatsByWorkload: MutableMap<WorkloadKey, EwmaStats> = mutableMapOf()
     private val positiveResidualsByWorkload: MutableMap<WorkloadKey, RollingQuantile> = mutableMapOf()
-    private val combinedPositiveResidualsByDecision: MutableMap<DecisionKey, RollingQuantile> = mutableMapOf()
 
     @Synchronized
-    override fun predictForKey(
+    override fun predictWorkload(
         workloadKey: WorkloadKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val stats = durationStatsByWorkload[workloadKey]
 
         val predictedMs = stats?.ewmaMs ?: 0.0
-        val predictedDurationMs = predictedMs.roundToLong()
-
         val marginMs = residualMargin(workloadKey)
         val upperBoundMs = if (stats == null || stats.count == 0) {
             0L
         } else {
             (predictedMs + marginMs).roundToLong()
         }
-        val budgetMs = preExecutionMetrics.budgetMs
-        val admit = upperBoundMs <= budgetMs
 
         return ExecutionPrediction(
-            predictedDurationMs = predictedDurationMs,
+            predictedDurationMs = predictedMs.roundToLong(),
             predictedUpperBoundMs = upperBoundMs,
-            admit = admit,
+            admit = upperBoundMs <= preExecutionMetrics.budgetMs,
         )
     }
 
     @Synchronized
-    override fun updateForKey(
+    override fun updateWorkload(
         workloadKey: WorkloadKey,
-        preExecutionMetrics: PreExecutionMetrics,
         postExecutionMetrics: PostExecutionMetrics,
     ) {
         val observedMs = postExecutionMetrics.durationMs.coerceAtLeast(0L)
@@ -63,78 +52,19 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
             return
         }
 
-        val issued = predictForKey(workloadKey, preExecutionMetrics)
-        durationStatsByWorkload.getOrPut(workloadKey) { EwmaStats() }.update(observedMs.toDouble(), ewmaAlpha)
+        // Residual is measured against the point estimate from before this observation.
+        val stats = durationStatsByWorkload.getOrPut(workloadKey) { EwmaStats() }
+        val predictedDurationMs = stats.ewmaMs.roundToLong()
+        stats.update(observedMs.toDouble(), ewmaAlpha)
 
-        if (issued.predictedDurationMs > 0) {
-            val positiveResidualMs = (observedMs - issued.predictedDurationMs).coerceAtLeast(0L)
+        if (predictedDurationMs > 0) {
+            val positiveResidualMs = (observedMs - predictedDurationMs).coerceAtLeast(0L)
             positiveResidualsByWorkload.getOrPut(workloadKey) { RollingQuantile(residualWindowSize) }.add(positiveResidualMs)
         }
     }
 
-    @Synchronized
-    override fun predictForDecision(
-        stageWorkloadKeys: List<WorkloadKey>,
-        tailWorkloadKey: WorkloadKey,
-        decisionKey: DecisionKey,
-        preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction {
-        val stageStatsList = stageWorkloadKeys.map { durationStatsByWorkload[it] }
-        val tailStats = durationStatsByWorkload[tailWorkloadKey]
-
-        val stagePredMs = stageStatsList.sumOf { it?.ewmaMs ?: 0.0 }
-        val tailPredMs = tailStats?.ewmaMs ?: 0.0
-        val predictedCombinedMs = stagePredMs + tailPredMs
-
-        val hasAnySample = stageStatsList.any { (it?.count ?: 0) > 0 } || (tailStats?.count ?: 0) > 0
-        val marginMs = combinedResidualMargin(decisionKey)
-        val upperBoundMs = if (!hasAnySample) {
-            0L
-        } else {
-            (predictedCombinedMs + marginMs).roundToLong()
-        }
-        val budgetMs = preExecutionMetrics.budgetMs
-        val admit = upperBoundMs <= budgetMs
-
-        CLog.e(
-            TAG,
-            "[mhyun2.park] predictForDecision - stageStatsList: $stageStatsList, " +
-                    "tailStats: $tailStats, upperBoundMs: $upperBoundMs"
-        )
-
-        return ExecutionPrediction(
-            predictedDurationMs = predictedCombinedMs.roundToLong(),
-            predictedUpperBoundMs = upperBoundMs,
-            admit = admit,
-        )
-    }
-
-    @Synchronized
-    override fun updateForDecision(
-        decisionKey: DecisionKey,
-        predictedCombinedDurationMs: Long,
-        predictedCombinedUpperBoundMs: Long,
-        actualAdmissionStagesDurationMs: Long,
-        actualEncodingDurationMs: Long,
-        actualSavingDurationMs: Long,
-    ) {
-        val actualCombinedMs = actualAdmissionStagesDurationMs.coerceAtLeast(0L) +
-                actualEncodingDurationMs.coerceAtLeast(0L) +
-                actualSavingDurationMs.coerceAtLeast(0L)
-        val positiveResidualMs = (actualCombinedMs - predictedCombinedDurationMs).coerceAtLeast(0L)
-        combinedPositiveResidualsByDecision.getOrPut(decisionKey) {
-            RollingQuantile(residualWindowSize)
-        }.add(positiveResidualMs)
-    }
-
     private fun residualMargin(workloadKey: WorkloadKey): Double {
         return positiveResidualsByWorkload[workloadKey]
-            ?.quantile(residualQuantile)
-            ?: 0.0
-    }
-
-    private fun combinedResidualMargin(decisionKey: DecisionKey): Double {
-        return combinedPositiveResidualsByDecision[decisionKey]
             ?.quantile(residualQuantile)
             ?: 0.0
     }
@@ -157,9 +87,6 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
 
     private class RollingQuantile(private val maxSize: Int) {
         private val values = ArrayDeque<Double>()
-
-        val count: Int
-            get() = values.size
 
         fun add(value: Long) {
             add(value.toDouble())
