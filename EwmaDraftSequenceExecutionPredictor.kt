@@ -21,24 +21,24 @@ class EwmaDraftSequenceExecutionPredictor @JvmOverloads constructor(
     private val positiveResidualsByWorkload: MutableMap<WorkloadKey, RollingQuantile> = mutableMapOf()
 
     @Synchronized
-    override fun predictWorkload(
-        workloadKey: WorkloadKey,
+    override fun predictAdmission(
+        workloadKeys: List<WorkloadKey>,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
-        val stats = durationStatsByWorkload[workloadKey]
-
-        val predictedMs = stats?.ewmaMs ?: 0.0
-        val marginMs = residualMargin(workloadKey)
-        val upperBoundMs = if (stats == null || stats.count == 0) {
-            0L
-        } else {
-            (predictedMs + marginMs).roundToLong()
+        var sumDurationMs = 0L
+        var sumUpperBoundMs = 0L
+        workloadKeys.forEach { workloadKey ->
+            val stats = durationStatsByWorkload[workloadKey]
+            val predictedMs = stats?.ewmaMs ?: 0.0
+            sumDurationMs += predictedMs.roundToLong()
+            if (stats != null && stats.count > 0) {
+                sumUpperBoundMs += (predictedMs + residualMargin(workloadKey)).roundToLong()
+            }
         }
-
         return ExecutionPrediction(
-            predictedDurationMs = predictedMs.roundToLong(),
-            predictedUpperBoundMs = upperBoundMs,
-            admit = upperBoundMs <= preExecutionMetrics.budgetMs,
+            admit = sumUpperBoundMs <= preExecutionMetrics.budgetMs,
+            predictedDurationMs = sumDurationMs,
+            predictedUpperBoundMs = sumUpperBoundMs,
         )
     }
 

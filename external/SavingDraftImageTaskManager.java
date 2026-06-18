@@ -14,6 +14,7 @@ import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
 import com.samsung.android.camera.core2.ml.PostExecutionMetrics;
 import com.samsung.android.camera.core2.ml.SavingExecutionMetrics;
+import com.samsung.android.camera.core2.ml.WorkloadKey;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
 import com.samsung.android.camera.core2.processor.request.ProcessRequest;
@@ -184,18 +185,14 @@ public class SavingDraftImageTaskManager {
                 final DraftSequenceMetrics draftSequenceMetrics = Objects.requireNonNull(captureMetrics.getDraftSequenceMetrics(), "draftSequenceMetrics");
                 final SavingExecutionMetrics savingExecutionMetrics = Objects.requireNonNull(draftSequenceMetrics.getSavingExecutionMetrics(), "savingExecutionMetrics");
 
-                final SavingExecutionMetrics completedSavingExecutionMetrics = new SavingExecutionMetrics(
-                        savingExecutionMetrics.isPendingRequest(),
-                        savingExecutionMetrics.getResultImageSize(),
-                        savingExecutionMetrics.getResultImageFormat(),
-                        savingExecutionMetrics.getPreExecutionMetrics(),
-                        new PostExecutionMetrics(null, null, SystemClock.uptimeMillis() - savingExecutionMetrics.getStartTimestampMs()),
-                        savingExecutionMetrics.getStartTimestampMs());
-                draftSequenceMetrics.setSavingExecutionMetrics(completedSavingExecutionMetrics);
                 // Saving needs no prediction; feed its observed cost into the shared model so the
                 // Saving workload's upper bound keeps learning for later admission decisions.
                 final DraftSequenceExecutionPredictor predictor = DraftSequenceExecutionPredictor.getInstance();
-                predictor.updateSavingExecution(completedSavingExecutionMetrics);
+                predictor.updateWorkload(WorkloadKey.saving(
+                            savingExecutionMetrics.isPendingRequest(),
+                            savingExecutionMetrics.getResultImageSize(),
+                            savingExecutionMetrics.getResultImageFormat()),
+                        new PostExecutionMetrics(null, null, SystemClock.uptimeMillis() - savingExecutionMetrics.getStartTimestampMs()));
 
                 if (isLastTimeout) {
                     draftSequenceMetrics.setTimeout(true);

@@ -29,24 +29,10 @@ import kotlinx.coroutines.launch
  */
 abstract class DraftSequenceExecutionPredictor {
 
-    // ---- Model-specific hooks (the only thing a concrete predictor must implement) ----
-
-    /** Predicts one workload's point estimate and upper bound. */
-    protected abstract fun predictWorkload(
-        workloadKey: WorkloadKey,
-        preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction
-
-    /** Records one workload's observed cost. Pure observation: no prediction, no budget. */
-    protected abstract fun updateWorkload(
-        workloadKey: WorkloadKey,
-        postExecutionMetrics: PostExecutionMetrics,
-    )
-
-    // ---- Admission: sum of independent per-workload upper bounds ----
+    // ---- Model-specific hooks (the only two a concrete predictor must implement) ----
 
     /**
-     * Predicts a stage's admission as the sum of each listed workload's independent upper bound:
+     * Predicts admission for a set of workloads as the sum of each one's independent upper bound:
      *     admit  <=>  Σ upperBound(workload) <= budget
      *
      * The caller lists every workload that still has to finish in the draft sequence - the running
@@ -54,77 +40,16 @@ abstract class DraftSequenceExecutionPredictor {
      * reflects the whole remaining cost. A workload with no samples contributes 0, so admission stays
      * lenient until the model has learned.
      */
-    fun predictAdmission(
+    abstract fun predictAdmission(
         workloadKeys: List<WorkloadKey>,
         preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction {
-        var sumDurationMs = 0L
-        var sumUpperBoundMs = 0L
-        workloadKeys.forEach { workloadKey ->
-            val prediction = predictWorkload(workloadKey, preExecutionMetrics)
-            sumDurationMs += prediction.predictedDurationMs
-            sumUpperBoundMs += prediction.predictedUpperBoundMs
-        }
-        return ExecutionPrediction(
-            admit = sumUpperBoundMs <= preExecutionMetrics.budgetMs,
-            predictedDurationMs = sumDurationMs,
-            predictedUpperBoundMs = sumUpperBoundMs,
-        )
-    }
+    ): ExecutionPrediction
 
-    // ---- Per-workload learning ----
-
-    fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, imageFormat: Int) {
-        updateWorkload(
-            workloadKey = WorkloadKey.node(
-                nodeExecutionMetrics.nodeId,
-                nodeExecutionMetrics.inputImageSize,
-                nodeExecutionMetrics.outputImageSize,
-                imageFormat,
-            ),
-            postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
-        )
-    }
-
-    fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
-        updateWorkload(
-            workloadKey = WorkloadKey.saving(
-                savingExecutionMetrics.resultImageSize,
-                savingExecutionMetrics.resultImageFormat,
-                savingExecutionMetrics.isPendingRequest,
-            ),
-            postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
-        )
-    }
-
-    /**
-     * Replays complete capture history. Timed-out captures are skipped because later-stage samples
-     * may be censored by the fallback path. Returns the number of samples fed.
-     */
-    fun warmUpFromHistory(history: List<CaptureMetrics>): Int {
-        var updatedCount = 0
-        history.forEach { captureMetrics ->
-            val draftMetrics = captureMetrics.draftSequenceMetrics ?: return@forEach
-            if (draftMetrics.isTimeout == true) {
-                return@forEach
-            }
-
-            draftMetrics.nodeExecutionMetricsList.forEach { node ->
-                if (node.postExecutionMetrics.durationMs > 0L) {
-                    updateNodeExecution(node, captureMetrics.resultImageFormat)
-                    updatedCount++
-                }
-            }
-
-            draftMetrics.savingExecutionMetrics?.let { saving ->
-                if (saving.postExecutionMetrics.durationMs > 0L) {
-                    updateSavingExecution(saving)
-                    updatedCount++
-                }
-            }
-        }
-        return updatedCount
-    }
+    /** Records one workload's observed cost. Pure observation: no prediction, no budget. */
+    abstract fun updateWorkload(
+        workloadKey: WorkloadKey,
+        postExecutionMetrics: PostExecutionMetrics,
+    )
 
     companion object {
         private const val TAG = "DraftSequenceExecutionPredictor"
@@ -135,44 +60,6 @@ abstract class DraftSequenceExecutionPredictor {
          */
         @JvmStatic
         val instance: DraftSequenceExecutionPredictor = EwmaDraftSequenceExecutionPredictor()
-
-        private val warmUpScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-        @Volatile
-        private var warmUpStarted: Boolean = false
-
-        /**
-         * Feeds [instance] with the capture history stored in the metrics database, restoring
-         * the learned state lost on process death. Call once at process start; subsequent calls
-         * are no-ops. Retries are allowed after a failure.
-         */
-        @JvmStatic
-        @JvmOverloads
-        @Synchronized
-        fun warmUp(context: Context, callback: Consumer<Int>? = null) {
-            if (warmUpStarted) {
-                return
-            }
-            warmUpStarted = true
-
-            val appContext = context.applicationContext
-            warmUpScope.launch {
-                try {
-                    CLog.i(TAG, "[mhyun2.park] warmUp start")
-                    val history = CaptureMetricsRepository
-                        .getInstance(appContext)
-                        .getAll()
-
-                    val updatedCount = instance.warmUpFromHistory(history)
-
-                    CLog.i(TAG, "[mhyun2.park] warmUp completed. updatedCount=$updatedCount")
-                    callback?.accept(updatedCount)
-                } catch (t: Throwable) {
-                    warmUpStarted = false
-                    CLog.e(TAG, "[mhyun2.park] warmUp failed", t)
-                }
-            }
-        }
     }
 }
 
@@ -210,7 +97,7 @@ sealed interface WorkloadKey {
 
     data class Encoding(val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
 
-    data class Saving(val sizeBucket: SizeBucket, val imageFormat: Int, val isPendingRequest: Boolean) : WorkloadKey
+    data class Saving(val isPendingRequest: Boolean, val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
 
     companion object {
         /** Bokeh and Filter are gated on an admission bound; Encoding and Saving are mandatory. */
@@ -224,7 +111,7 @@ sealed interface WorkloadKey {
             }
         }
 
-        fun node(
+        fun imageProcessing(
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
@@ -235,8 +122,7 @@ sealed interface WorkloadKey {
                 NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
                 NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
-                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(inputImageSize), imageFormat)
-                else -> throw IllegalArgumentException("not supported node type($nodeId)")
+                else -> throw IllegalArgumentException("not supported nodeId($nodeId)")
             }
         }
 
@@ -244,8 +130,8 @@ sealed interface WorkloadKey {
             return Encoding(SizeBucket.of(resultImageSize), imageFormat)
         }
 
-        fun saving(resultImageSize: Size, imageFormat: Int, isPendingRequest: Boolean): WorkloadKey {
-            return Saving(SizeBucket.of(resultImageSize), imageFormat, isPendingRequest)
+        fun saving(isPendingRequest: Boolean, resultImageSize: Size, imageFormat: Int): WorkloadKey {
+            return Saving(isPendingRequest, SizeBucket.of(resultImageSize), imageFormat)
         }
     }
 }
@@ -264,12 +150,10 @@ sealed interface WorkloadKey {
  * whether the save is a pending request); the default [predictor] is the process-wide
  * [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
  */
-private const val TAG = "DraftSequenceExecutionProfiler"
-
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
+    private val isPendingRequest: Boolean,
     private val deviceStateReader: DeviceStateReader,
     private val plannedAdmissionStages: List<NodeId>,
-    private val savingIsPendingRequest: Boolean,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
 ) {
 
@@ -309,13 +193,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         val mandatoryKeys = listOf(
             WorkloadKey.encoding(resultImageSize, resultImageFormat),
-            WorkloadKey.saving(resultImageSize, resultImageFormat, savingIsPendingRequest),
+            WorkloadKey.saving(isPendingRequest, resultImageSize, resultImageFormat),
         )
 
         val isAdmissionStage = WorkloadKey.isAdmissionStageNode(nodeId)
         val prediction = if (isAdmissionStage) {
             val stageKeys = (listOf(nodeId) + followingAdmissionStages(nodeId)).map {
-                WorkloadKey.node(it, inputImageSize, resultImageSize, resultImageFormat)
+                WorkloadKey.imageProcessing(it, inputImageSize, resultImageSize, resultImageFormat)
             }
             predictor.predictAdmission(stageKeys + mandatoryKeys, preExecutionMetrics)
         } else {
@@ -356,8 +240,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return DraftSequenceExecutionSession(
             executionPrediction = prediction,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
-            onComplete = { predictor.updateNodeExecution(nodeExecutionMetrics, resultImageFormat) },
             watchdogDeadlineMs = watchdogDeadlineMs,
+            onComplete = {
+                predictor.updateWorkload(
+                    WorkloadKey.node(nodeId, inputImageSize, resultImageSize, resultImageFormat),
+                    nodeExecutionMetrics.postExecutionMetrics,
+                )
+            }
         )
     }
 
@@ -385,27 +274,23 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 class DraftSequenceExecutionSession internal constructor(
     val executionPrediction: ExecutionPrediction?,
     private val postExecutionMetrics: PostExecutionMetrics,
-    private val onComplete: () -> Unit,
     private val watchdogDeadlineMs: Long? = null,
     private val watchdogTimeoutCallback: WatchdogTimeoutCallback? = null,
+    private val onComplete: () -> Unit
 ) {
     interface WatchdogTimeoutCallback {
         fun onTimeout(session: DraftSequenceExecutionSession)
     }
 
-    /** True when there is no admission gate (update-only), or the upper bound fits within the budget. */
     val shouldRun: Boolean = executionPrediction?.admit ?: true
+    var watchdogTimedOut = false
+    val delayMs: Long = watchdogDeadlineMs?.let { (it - startedAtMs).coerceAtLeast(0L) } ?: 0L
 
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()
     private val startedAtMs = SystemClock.uptimeMillis()
 
     private var completed = false
-    private var watchdogTimedOut = false
-
-    /** Time from start until the mandatory tail must begin; 0 when no watchdog is set. */
-    private val delayMs: Long =
-        watchdogDeadlineMs?.let { (it - startedAtMs).coerceAtLeast(0L) } ?: 0L
 
     /**
      * Single-shot watchdog: at the deadline, if the work has not finished, flag the timeout and
@@ -425,9 +310,6 @@ class DraftSequenceExecutionSession internal constructor(
             }
         }
     }
-
-    fun isWatchdogTimedOut(): Boolean = watchdogTimedOut
-    fun getDelayMs(): Long = delayMs
 
     /**
      * Step 3: mark this session as cancelled without learning from it. Call this when the caller
