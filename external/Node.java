@@ -1277,7 +1277,6 @@ public abstract class Node implements PictureFormatProcessableInterface {
         // the mandatory [Encoding, Saving] tail; the per-stage timeout only reserves that tail.
         if (!session.getShouldRun()) {
             CLog.i(getNodeTag(), "processPicture - skipped by admission, nodeId=" + mNodeId);
-            session.abort();
             return picture;
         }
 
@@ -1286,18 +1285,23 @@ public abstract class Node implements PictureFormatProcessableInterface {
 
         final ImageBuffer resultBuffer;
         try {
-            // Run only until the mandatory [Encoding, Saving] tail must start. profileNodeExecution
-            // sized this as (remaining budget - UB([Encoding, Saving])).
-            resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
+            if (null == session.getExecutionPrediction()) {
+                // Mandatory / non-admission stage (e.g. Encoding): must always complete. The discard
+                // timeout exists only to stop a slow quality stage from eating the tail, so never apply
+                // it here - a discarded Encoding/Saving would break the capture.
+                resultBuffer = future.get();
+            } else {
+                // Quality stage (Bokeh/Filter): run only until the mandatory [Encoding, Saving] tail
+                // must start, sized by profileNodeExecution as (remaining budget - UB([Encoding, Saving])).
+                resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
+            }
         } catch (TimeoutException e) {
-            // Stage overran its budget: discard its result so the reserved tail still fits the timeout.
+            // Quality stage overran its budget: discard its result so the reserved tail still fits.
             future.cancel(true);
-            session.abort();
             CLog.w(getNodeTag(), "processPicture - timeout, nodeId=" + mNodeId);
             return null;
         } catch (Exception e) {
             future.cancel(true);
-            session.abort();
             CLog.e(getNodeTag(), "processPicture error", e);
             return null;
         } finally {
@@ -1305,7 +1309,6 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
 
         if (null == resultBuffer) {
-            session.abort();
             return null;
         }
 

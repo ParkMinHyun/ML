@@ -44,15 +44,13 @@ class DraftSequenceExecutionPredictor {
 
     @Synchronized
     fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, outputImageFormat: Int) {
-        updateWorkload(
-            WorkloadKey.node(
-                nodeExecutionMetrics.nodeId,
-                nodeExecutionMetrics.inputImageSize,
-                nodeExecutionMetrics.outputImageSize,
-                outputImageFormat,
-            ),
-            nodeExecutionMetrics.postExecutionMetrics,
-        )
+        val workloadKey = WorkloadKey.node(
+            nodeExecutionMetrics.nodeId,
+            nodeExecutionMetrics.inputImageSize,
+            nodeExecutionMetrics.outputImageSize,
+            outputImageFormat,
+        ) ?: return
+        updateWorkload(workloadKey, nodeExecutionMetrics.postExecutionMetrics)
     }
 
     @Synchronized
@@ -225,12 +223,7 @@ sealed interface WorkloadKey {
             }
         }
 
-        fun isEncodingNode(nodeId: NodeId): Boolean {
-            return nodeId == NodeId.NODE_SEC_V2_IMAGE_CODEC
-        }
-
-        @Suppress("UNUSED_PARAMETER")
-        fun nodeOrNull(
+        fun node(
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
@@ -244,16 +237,6 @@ sealed interface WorkloadKey {
                 NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(outputImageSize), outputImageFormat)
                 else -> null
             }
-        }
-
-        fun node(
-            nodeId: NodeId,
-            inputImageSize: Size,
-            outputImageSize: Size,
-            outputImageFormat: Int,
-        ): WorkloadKey {
-            return nodeOrNull(nodeId, inputImageSize, outputImageSize, outputImageFormat)
-                ?: throw IllegalArgumentException("not supported node type($nodeId)")
         }
 
         fun encoding(resultImageSize: Size, resultImageFormat: Int): WorkloadKey {

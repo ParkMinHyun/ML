@@ -12,8 +12,8 @@ private const val TAG = "DraftSequenceExecutionProfiler"
 /**
  * Drives one draft sequence's node lifecycle, recording both individual stage observations
  * ([WorkloadKey]) and remaining-suffix observations ([WorkloadSequenceKey]). The suffix observation
- * starts at Bokeh / Filter / Encoding entry and closes at saving completion; admission then uses the
- * learned suffix bound instead of summing independent stage upper bounds.
+ * starts at an admission stage (Bokeh / Filter) entry and closes at saving completion; admission then
+ * uses the learned suffix bound instead of summing independent stage upper bounds.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val context: Context,
@@ -59,7 +59,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         val resultImageSize = captureMetrics.resultImageSize
         val resultImageFormat = captureMetrics.resultImageFormat
-        val nodeWorkloadKey = WorkloadKey.nodeOrNull(
+        val nodeWorkloadKey = WorkloadKey.node(
             nodeId = nodeId,
             inputImageSize = inputImageSize,
             outputImageSize = resultImageSize,
@@ -125,7 +125,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 }
 
                 // complete() runs only when the stage produced a usable result, so this is a valid
-                // suffix sample. Skipped or timed-out stages call abort() and never reach here.
+                // suffix sample. Skipped or timed-out stages are dropped and never reach here.
                 if (session.shouldRun) {
                     pendingSequenceObservation?.let { addOpenSequenceObservation(it) }
                 }
@@ -198,6 +198,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
+    /** Suffix starting at an admission stage: [thisStage, ...followingAdmissionStages, Encoding, Saving]. */
     private fun remainingSequenceKeyStartingAtNode(
         nodeId: NodeId,
         nodeWorkloadKey: WorkloadKey,
@@ -205,20 +206,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         resultImageSize: Size,
         resultImageFormat: Int,
     ): WorkloadSequenceKey {
-        val savingKey = WorkloadKey.saving(resultImageSize, resultImageFormat, isPendingRequest)
-        val mandatoryKeys = mandatoryWorkloadKeys(resultImageSize, resultImageFormat)
-        val workloadKeys = when {
-            WorkloadKey.isAdmissionStageNode(nodeId) -> {
-                listOf(nodeWorkloadKey) + followingAdmissionWorkloadKeys(
-                    currentNodeId = nodeId,
-                    inputImageSize = inputImageSize,
-                    resultImageSize = resultImageSize,
-                    resultImageFormat = resultImageFormat,
-                ) + mandatoryKeys
-            }
-            WorkloadKey.isEncodingNode(nodeId) -> listOf(nodeWorkloadKey, savingKey)
-            else -> listOf(nodeWorkloadKey)
-        }
+        val workloadKeys = listOf(nodeWorkloadKey) +
+            followingAdmissionWorkloadKeys(nodeId, inputImageSize, resultImageSize, resultImageFormat) +
+            mandatoryWorkloadKeys(resultImageSize, resultImageFormat)
         return WorkloadSequenceKey(workloadKeys)
     }
 
@@ -229,7 +219,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         resultImageSize: Size,
         resultImageFormat: Int,
     ): PendingSequenceObservation? {
-        if (!WorkloadKey.isAdmissionStageNode(nodeId) && !WorkloadKey.isEncodingNode(nodeId)) {
+        if (!WorkloadKey.isAdmissionStageNode(nodeId)) {
             return null
         }
         return PendingSequenceObservation(
@@ -271,7 +261,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             return emptyList()
         }
         return plannedAdmissionStages.drop(index + 1).mapNotNull { nodeId ->
-            WorkloadKey.nodeOrNull(nodeId, inputImageSize, resultImageSize, resultImageFormat)
+            WorkloadKey.node(nodeId, inputImageSize, resultImageSize, resultImageFormat)
         }
     }
 
@@ -337,9 +327,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 /**
  * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution].
  *
- * Exactly one of [complete] / [abort] must be called. Call [complete] when the stage ran to a usable
- * result; call [abort] when it was skipped by admission, or it overran [getProcessTimeoutMs] and the
- * result was discarded. Timing enforcement lives at the call site (a `Future.get` timeout).
+ * Call [complete] when the stage ran to a usable result so the predictor learns from it. If the stage
+ * was skipped by admission or discarded after overrunning [getProcessTimeoutMs], just drop the session
+ * without calling [complete]. Timing enforcement lives at the call site (a `Future.get` timeout).
  */
 class DraftSequenceExecutionSession internal constructor(
     val executionPrediction: ExecutionPrediction?,
@@ -353,7 +343,6 @@ class DraftSequenceExecutionSession internal constructor(
     private val startedAtMs = SystemClock.uptimeMillis()
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()
-    private var completed = false
 
     /**
      * Max time the stage may run before the mandatory [Encoding, Saving] tail must start, i.e.
@@ -361,24 +350,11 @@ class DraftSequenceExecutionSession internal constructor(
      */
     fun getProcessTimeoutMs(): Long = processTimeoutMs
 
-    /** Marks this session as skipped/cancelled without learning from it. */
-    fun abort() {
-        markCompleted()
-    }
-
-    /** Fills [PostExecutionMetrics] and updates the predictor exactly once. */
+    /** Fills [PostExecutionMetrics] and feeds them to the predictor. Call at most once. */
     fun complete() {
-        markCompleted()
         postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
         postExecutionMetrics.gcSnapshot = gcTracker.delta()
         postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
         onComplete(this)
-    }
-
-    private fun markCompleted() {
-        synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession already completed." }
-            completed = true
-        }
     }
 }
