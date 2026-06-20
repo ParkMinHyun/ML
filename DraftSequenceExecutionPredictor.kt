@@ -8,9 +8,9 @@ import com.samsung.android.camera.core2.node.NodeId
 import com.samsung.android.camera.core2.util.CLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.util.Objects
 import kotlin.math.abs
 
 /**
@@ -72,25 +72,26 @@ abstract class DraftSequenceExecutionPredictor {
 
     // ---- Per-workload learning ----
 
-    fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, imageFormat: Int) {
+    fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, outputImageFormat: Int) {
         updateWorkload(
-            workloadKey = WorkloadKey.node(
+            WorkloadKey.node(
                 nodeExecutionMetrics.nodeId,
                 nodeExecutionMetrics.inputImageSize,
                 nodeExecutionMetrics.outputImageSize,
-                imageFormat,
+                outputImageFormat,
             ),
-            postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
+            nodeExecutionMetrics.postExecutionMetrics,
         )
     }
 
     fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
         updateWorkload(
-            workloadKey = WorkloadKey.saving(
-                savingExecutionMetrics.isPendingRequest,
+            WorkloadKey.saving(
                 savingExecutionMetrics.resultImageSize,
-                savingExecutionMetrics.resultImageFormat),
-            postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
+                savingExecutionMetrics.resultImageFormat,
+                savingExecutionMetrics.isPendingRequest,
+            ),
+            savingExecutionMetrics.postExecutionMetrics,
         )
     }
 
@@ -159,34 +160,30 @@ sealed interface WorkloadKey {
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
-            imageFormat: Int,
+            outputImageFormat: Int,
         ): WorkloadKey {
             return when (nodeId) {
                 NodeId.NODE_SEC_V1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
                 NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
-                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(inputImageSize), imageFormat)
+                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(inputImageSize), outputImageFormat)
                 else -> throw IllegalArgumentException("not supported node type($nodeId)")
             }
         }
 
-        fun encoding(resultImageSize: Size, imageFormat: Int): WorkloadKey {
-            return Encoding(SizeBucket.of(resultImageSize), imageFormat)
-        }
+        fun encoding(resultImageSize: Size, resultImageFormat: Int): WorkloadKey =
+            Encoding(SizeBucket.of(resultImageSize), resultImageFormat)
 
-        fun saving(isPendingRequest: Boolean, resultImageSize: Size, resultImageFormat: Int): WorkloadKey {
-            return Saving(
-                isPendingRequest = isPendingRequest,
-                sizeBucket = SizeBucket.of(resultImageSize),
-                imageFormat = resultImageFormat,
-            )
-        }
+        fun saving(resultImageSize: Size, resultImageFormat: Int, isPendingRequest: Boolean): WorkloadKey =
+            Saving(SizeBucket.of(resultImageSize), resultImageFormat, isPendingRequest)
     }
 }
 
+private const val TAG = "DraftSequenceExecutionProfiler"
+
 /**
- * Drives one node's lifecycle in two steps:
+ * Drives one node's lifecycle in three steps:
  *
  *   1. [profileNodeExecution] - reads device state, builds [PreExecutionMetrics], predicts (admission
  *      stages only), records the metrics (+ prediction) onto [DraftSequenceMetrics], and returns a
@@ -195,12 +192,13 @@ sealed interface WorkloadKey {
  *   3. if the work ran, caller calls [DraftSequenceExecutionSession.complete] exactly once to fill
  *      [PostExecutionMetrics] and correct the model.
  *
+ * The saving stage mirrors this: [profileSavingExecution] starts it and [completeSavingExecution]
+ * ends it (both funnel through the same [DraftSequenceExecutionSession]).
+ *
  * Create one per draft sequence and call [setDraftPlan] at the start so each node's admission
  * decision can sum the upper bounds of the workloads still ahead of it; the default [predictor] is
  * the process-wide [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
  */
-private const val TAG = "DraftSequenceExecutionProfiler"
-
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val context: Context,
     private val deviceStateReader: DeviceStateReader,
@@ -246,20 +244,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * @param inputImageSize input image dimensions.
      */
     fun profileNodeExecution(nodeId: NodeId, inputImageSize: Size): DraftSequenceExecutionSession {
-        val deviceState = deviceStateReader.read()
-        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (SystemClock.uptimeMillis() + MakerFeature.CAPTURE_TIMEOUT_MS)
-        val preExecutionMetrics = PreExecutionMetrics(
-            budgetMs = timeoutTimestampMs - SystemClock.uptimeMillis(),
-            memorySnapshot = deviceState.memorySnapshot,
-            thermalSnapshot = deviceState.thermalSnapshot,
-            storageSnapshot = deviceState.storageSnapshot,
-        )
+        val nowMs = SystemClock.uptimeMillis()
+        val timeoutTimestampMs = timeoutTimestampMs(nowMs)
+        val preExecutionMetrics = readPreExecutionMetrics(timeoutTimestampMs - nowMs)
 
         val resultImageSize = captureMetrics.resultImageSize
         val resultImageFormat = captureMetrics.resultImageFormat
         val mandatoryKeys = listOf(
             WorkloadKey.encoding(resultImageSize, resultImageFormat),
-            WorkloadKey.saving(isPendingRequest, resultImageSize, resultImageFormat),
+            WorkloadKey.saving(resultImageSize, resultImageFormat, isPendingRequest),
         )
 
         val isAdmissionStage = WorkloadKey.isAdmissionStageNode(nodeId)
@@ -279,16 +272,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
             postExecutionMetrics = PostExecutionMetrics(),
         )
-
-        // Watchdog: the latest moment the mandatory Encoding + Saving can still start and meet budget.
-        val watchdogDeadlineMs = if (isAdmissionStage) {
-            val mandatoryUpperBoundMs = predictor.predictAdmission(mandatoryKeys, preExecutionMetrics).predictedUpperBoundMs
-            timeoutTimestampMs - mandatoryUpperBoundMs.coerceAtLeast(0L)
-        } else {
-            null
-        }
-
-        val draftSequenceMetrics = captureMetrics.draftSequenceMetrics!!
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
             if (prediction != null) {
@@ -296,11 +279,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             }
         }
 
-        if (prediction != null) {
-            CLog.i(TAG, "[mhyun2.park] prediction - $prediction")
-        }
-        if (watchdogDeadlineMs != null) {
-            CLog.i(TAG, "[mhyun2.park] watchdog - nodeId=$nodeId, deadlineMs=$watchdogDeadlineMs")
+        // Watchdog: the latest moment the mandatory Encoding + Saving can still start and meet budget.
+        val watchdogDeadlineMs = if (isAdmissionStage) {
+            val mandatoryUpperBoundMs = predictor.predictAdmission(mandatoryKeys, preExecutionMetrics).predictedUpperBoundMs
+            timeoutTimestampMs - mandatoryUpperBoundMs.coerceAtLeast(0L)
+        } else {
+            null
         }
 
         return DraftSequenceExecutionSession(
@@ -312,29 +296,21 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     fun profileSavingExecution() {
-        val deviceStateSnapshot = deviceStateReader.read()
+        val nowMs = SystemClock.uptimeMillis()
+        val timeoutTimestampMs = timeoutTimestampMs(nowMs)
+        val preExecutionMetrics = readPreExecutionMetrics(timeoutTimestampMs - nowMs)
 
-        val savingStartTimestampMs = SystemClock.uptimeMillis()
-        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (savingStartTimestampMs + MakerFeature.CAPTURE_TIMEOUT_MS)
-        val budgetMs: Long = timeoutTimestampMs - savingStartTimestampMs
-
-        val postExecutionMetrics = PostExecutionMetrics()
         val savingExecutionMetrics = SavingExecutionMetrics(
-            isPendingRequest,
-            captureMetrics.resultImageSize,
-            captureMetrics.resultImageFormat,
-            PreExecutionMetrics(
-                budgetMs,
-                deviceStateSnapshot.memorySnapshot,
-                deviceStateSnapshot.thermalSnapshot,
-                deviceStateSnapshot.storageSnapshot
-            ),
-            postExecutionMetrics
+            isPendingRequest = isPendingRequest,
+            resultImageSize = captureMetrics.resultImageSize,
+            resultImageFormat = captureMetrics.resultImageFormat,
+            preExecutionMetrics = preExecutionMetrics,
+            postExecutionMetrics = PostExecutionMetrics(),
         )
         draftSequenceMetrics.savingExecutionMetrics = savingExecutionMetrics
         savingExecutionSession = DraftSequenceExecutionSession(
             executionPrediction = null,
-            postExecutionMetrics = postExecutionMetrics,
+            postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
             onComplete = { predictor.updateSavingExecution(savingExecutionMetrics) },
         )
     }
@@ -352,6 +328,21 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
         draftSequenceMetrics.isTimeout = isTimeout
         return isTimeout
+    }
+
+    /** Capture deadline, or a fresh budget window from [nowMs] when the capture has not set one yet. */
+    private fun timeoutTimestampMs(nowMs: Long): Long =
+        captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
+
+    /** Snapshots current device state into [PreExecutionMetrics] for the given remaining [budgetMs]. */
+    private fun readPreExecutionMetrics(budgetMs: Long): PreExecutionMetrics {
+        val deviceState = deviceStateReader.read()
+        return PreExecutionMetrics(
+            budgetMs = budgetMs,
+            memorySnapshot = deviceState.memorySnapshot,
+            thermalSnapshot = deviceState.thermalSnapshot,
+            storageSnapshot = deviceState.storageSnapshot,
+        )
     }
 
     /**
@@ -394,86 +385,40 @@ class DraftSequenceExecutionSession internal constructor(
     private val startedAtMs = SystemClock.uptimeMillis()
 
     private var completed = false
-    private var watchdogArmed = false
     private var watchdogTimedOut = false
-    private var delayMs = 0L
+
+    /** Time from start until the mandatory tail must begin; 0 when no watchdog is set. */
+    private val delayMs: Long =
+        watchdogDeadlineMs?.let { (it - startedAtMs).coerceAtLeast(0L) } ?: 0L
+
+    /**
+     * Single-shot watchdog: at the deadline, if the work has not finished, flag the timeout and
+     * notify [watchdogTimeoutCallback]; [complete]/[abort] cancel it. Currently armed but inert - the
+     * profiler passes no callback. When re-enabled, also gate arming on [shouldRun] and a non-null
+     * callback.
+     */
+    private val watchdogJob: Job? = watchdogDeadlineMs?.let {
+        CoroutineScope(Dispatchers.Default).launch {
+            delay(delayMs)
+            val timedOut = synchronized(this@DraftSequenceExecutionSession) {
+                if (completed) false else { watchdogTimedOut = true; true }
+            }
+            if (timedOut) {
+                CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
+                watchdogTimeoutCallback?.onTimeout(this@DraftSequenceExecutionSession)
+            }
+        }
+    }
 
     fun isWatchdogTimedOut(): Boolean = watchdogTimedOut
     fun getDelayMs(): Long = delayMs
-
-    /**
-     * Per-session watchdog resources. They are created only when this session actually arms a
-     * watchdog, and are released when complete/abort is called or after the watchdog callback returns.
-     */
-    private var watchdogJob: kotlinx.coroutines.Job? = null
-
-    init {
-        armWatchdogIfNeeded()
-    }
-
-    private fun armWatchdogIfNeeded() {
-        val deadlineMs = watchdogDeadlineMs ?: return
-//        if (!shouldRun || watchdogTimeoutCallback == null) {
-//            CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - shouldRun($shouldRun), watchdogTimeoutCallback($watchdogTimeoutCallback)")
-//            return
-//        }
-        delayMs = (deadlineMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
-
-        synchronized(this) {
-            if (completed || watchdogTimedOut) {
-                CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - completed($completed), watchdogTimedOut($watchdogTimedOut)")
-                return
-            }
-
-            watchdogArmed = true
-            watchdogJob = CoroutineScope(Dispatchers.Default).launch {
-                delay(delayMs)
-
-                val callback = synchronized(this@DraftSequenceExecutionSession) {
-                    if (completed || watchdogTimedOut) {
-                        null
-                    } else {
-                        watchdogTimedOut = true
-                        watchdogArmed = false
-                        watchdogTimeoutCallback
-                    }
-                }
-
-                try {
-                    if (callback != null) {
-                        CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
-                        callback.onTimeout(this@DraftSequenceExecutionSession)
-                    }
-                } finally {
-                    releaseWatchdogJob()
-                }
-            }
-            CLog.i(TAG, "[mhyun2.park] armWatchdogIfNeeded - delayMs($delayMs)")
-        }
-    }
-
-    private fun cancelWatchdogLocked() {
-        watchdogJob?.cancel()
-        watchdogArmed = false
-    }
-
-    private fun releaseWatchdogJob() {
-        synchronized(this) {
-            cancelWatchdogLocked()
-            watchdogJob = null
-        }
-    }
 
     /**
      * Step 3: mark this session as cancelled without learning from it. Call this when the caller
      * skips the work or switches to fallback after the watchdog callback.
      */
     fun abort() {
-        synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession.abort() called more than once." }
-            completed = true
-        }
-        releaseWatchdogJob()
+        markCompleted()
     }
 
     /**
@@ -481,16 +426,19 @@ class DraftSequenceExecutionSession internal constructor(
      * model. Call this only after the work has actually run, exactly once.
      */
     fun complete() {
-        synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession.complete() called more than once." }
-            completed = true
-
-            postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
-            postExecutionMetrics.gcSnapshot = gcTracker.delta()
-            postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
-        }
-
-        releaseWatchdogJob()
+        markCompleted()
+        postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
+        postExecutionMetrics.gcSnapshot = gcTracker.delta()
+        postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
         onComplete()
+    }
+
+    /** Marks the session done exactly once and stops the watchdog. */
+    private fun markCompleted() {
+        synchronized(this) {
+            check(!completed) { "DraftSequenceExecutionSession already completed." }
+            completed = true
+        }
+        watchdogJob?.cancel()
     }
 }
