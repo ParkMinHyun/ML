@@ -1,7 +1,6 @@
 package com.samsung.android.camera.core2.processor.draftSaving;
 
 import android.content.Context;
-import android.os.SystemClock;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -10,15 +9,12 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
-import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
-import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
-import com.samsung.android.camera.core2.ml.PostExecutionMetrics;
-import com.samsung.android.camera.core2.ml.SavingExecutionMetrics;
-import com.samsung.android.camera.core2.ml.WorkloadKey;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
 import com.samsung.android.camera.core2.processor.request.ProcessRequest;
 import com.samsung.android.camera.core2.util.CLog;
+import com.samsung.android.camera.core2.util.ConditionChecker;
 import com.samsung.android.camera.core2.util.ImageBuffer;
 import com.samsung.android.camera.core2.util.PLog;
 
@@ -179,43 +175,24 @@ public class SavingDraftImageTaskManager {
             final boolean skipSaveDraftImage = savingDraftImageTask.skipSaveDraftImage;
             final boolean isDraftProcessing = Optional.ofNullable(extraBundle.get(ExtraBundle.PROCESSOR_INFO_IS_DRAFT_PROCESSING)).orElse(false);
             if (skipSaveDraftImage || isDraftProcessing) {
-                CLog.w(TAG, "[mhyun2.park] onDraftPictureSaved : skip insert captureMetric [skipSaveDraftImage: %s, isDraftProcessing: %s]", skipSaveDraftImage, isDraftProcessing);
+                CLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetric [skipSaveDraftImage: %s, isDraftProcessing: %s]", skipSaveDraftImage, isDraftProcessing);
             } else {
-                final CaptureMetrics captureMetrics = Objects.requireNonNull(extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS), "captureMetrics");
-                final DraftSequenceMetrics draftSequenceMetrics = Objects.requireNonNull(captureMetrics.getDraftSequenceMetrics(), "draftSequenceMetrics");
-                final SavingExecutionMetrics savingExecutionMetrics = Objects.requireNonNull(draftSequenceMetrics.getSavingExecutionMetrics(), "savingExecutionMetrics");
+                final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
+                ConditionChecker.checkNotNull(draftSequenceExecutionProfiler, "draftSequenceExecutionProfiler");
+                final CaptureMetrics captureMetrics = extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
+                ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
 
-                // Saving needs no prediction; feed its observed cost into the shared model so the
-                // Saving workload's upper bound keeps learning for later admission decisions.
-                final DraftSequenceExecutionPredictor predictor = DraftSequenceExecutionPredictor.getInstance();
-                predictor.updateWorkload(WorkloadKey.saving(
-                            savingExecutionMetrics.isPendingRequest(),
-                            savingExecutionMetrics.getResultImageSize(),
-                            savingExecutionMetrics.getResultImageFormat()),
-                        new PostExecutionMetrics(null, null, SystemClock.uptimeMillis() - savingExecutionMetrics.getStartTimestampMs()));
+                // Update the saving stage and record whether this capture overran its timeout.
+                final boolean isTimeout = draftSequenceExecutionProfiler.completeSavingExecution();
 
-                if (isLastTimeout) {
-                    draftSequenceMetrics.setTimeout(true);
+                // Insert until the first timeout of a streak; skip consecutive timeouts after that.
+                if (isTimeout && isLastTimeout) {
+                    CLog.e(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout already recorded");
                 } else {
-                    draftSequenceMetrics.setTimeout(Optional.ofNullable(captureMetrics.getTimeoutTimestampMs())
-                            .map(timeoutTimestampMs -> timeoutTimestampMs < SystemClock.uptimeMillis())
-                            .orElse(false));
-                }
-
-                if (Boolean.TRUE.equals(draftSequenceMetrics.isTimeout())) {
-                    if (!isLastTimeout) {
-                        isLastTimeout = true;
-                        CLog.w(TAG, "[mhyun2.park] onDraftPictureSaved : insert captureMetrics E");
-                        CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-                        CLog.w(TAG, "[mhyun2.park] onDraftPictureSaved : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
-                    } else {
-                        CLog.e(TAG, "[mhyun2.park] Timeout Already Occurred");
-                    }
-                } else {
-                    isLastTimeout = false;
-                    CLog.w(TAG, "[mhyun2.park] onDraftPictureSaved : insert captureMetrics E");
+                    isLastTimeout = isTimeout;
+                    CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
                     CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-                    CLog.w(TAG, "[mhyun2.park] onDraftPictureSaved : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
+                    CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
                 }
             }
         }

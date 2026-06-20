@@ -1,7 +1,5 @@
 package com.samsung.android.camera.core2.processor.draftSaving;
 
-import android.os.SystemClock;
-
 import androidx.annotation.GuardedBy;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -9,16 +7,11 @@ import androidx.annotation.Nullable;
 import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
-import com.samsung.android.camera.core2.ml.CaptureMetrics;
-import com.samsung.android.camera.core2.ml.DeviceStateReader;
-import com.samsung.android.camera.core2.ml.DeviceStateSnapshot;
-import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
-import com.samsung.android.camera.core2.ml.PostExecutionMetrics;
-import com.samsung.android.camera.core2.ml.PreExecutionMetrics;
-import com.samsung.android.camera.core2.ml.SavingExecutionMetrics;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
 import com.samsung.android.camera.core2.processor.request.ProcessRequest;
+import com.samsung.android.camera.core2.util.ConditionChecker;
 import com.samsung.android.camera.core2.util.ImageBuffer;
 import com.samsung.android.camera.core2.util.ImageInfo;
 import com.samsung.android.camera.core2.util.PLog;
@@ -26,7 +19,6 @@ import com.samsung.android.camera.core2.util.PLog;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Objects;
 import java.util.function.Consumer;
 
 /**
@@ -44,8 +36,6 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
     private static final String TAG = "SavingMultiDraftImageTask";
     private static final int FIRST_IMAGE_INDEX = 0;
     private final List<ImageBuffer> originalBufferList = new ArrayList<>();
-    private final CaptureMetrics captureMetrics;
-    private final DeviceStateReader deviceStateReader;
 
     public SavingMultiDraftImageTask(@NonNull ProcessRequest<ImageBuffer> processRequest,
                                      @NonNull PostSavingStateManagerGroup postSavingStateManagerGroup,
@@ -54,10 +44,6 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
                                      @NonNull Consumer<Integer> skippedDraftImageConsumer,
                                      @NonNull Consumer<Integer> finishedTaskConsumer) {
         super(processRequest, postSavingStateManagerGroup, draftJpegNodeChainAccessor, savedDraftImageConsumer, skippedDraftImageConsumer, finishedTaskConsumer);
-
-        captureMetrics = Objects.requireNonNull(processRequest.getExtraBundle().get(ExtraBundle.DATA_CAPTURE_METRICS), "captureMetrics");
-        captureMetrics.setDraftSequenceMetrics(new DraftSequenceMetrics());
-        deviceStateReader = Objects.requireNonNull(processRequest.getExtraBundle().get(ExtraBundle.DATA_DEVICE_STATE_READER), "deviceStateReader");
     }
 
     @GuardedBy("processLock")
@@ -97,6 +83,9 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
     protected ImageBuffer processDraftImageInternal() {
         PLog.i(TAG, "processDraftImageInternal(ppSequenceId:%d, sequenceId:%d) E", ppSequenceId, sequenceId);
 
+        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
+        ConditionChecker.checkNotNull(draftSequenceExecutionProfiler, "draftSequenceExecutionProfiler");
+
         try {
             if (saveOriginalDraftImage && !needDraftProcessing()) {
                 PLog.i(TAG, "processDraftImageInternal - save original draft image (ppSequenceId:%d, sequenceId:%d)", ppSequenceId, sequenceId);
@@ -114,9 +103,10 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
                     draftJpegNodeChainAccessor.configureNodeChain(buffer.getImageInfo(), camCapability, extraBundle, nodeChainConfiguration);
                 }
 
-                PLog.i(TAG, "processDraftImageInternal - NodeChain process E");
+                PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process E - " + draftJpegNodeChainAccessor.getConfiguredNodeIdList());
+                draftSequenceExecutionProfiler.setDraftPlan(draftJpegNodeChainAccessor.getConfiguredNodeIdList());
                 resultBuffer = draftJpegNodeChainAccessor.getNodeChain().processFull(ImageBuffer.class, buffer, extraBundle);
-                PLog.i(TAG, "processDraftImageInternal - NodeChain process X");
+                PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process X");
 
                 if (iterator.hasNext()
                         && isValidResultBuffer(resultBuffer)) {
@@ -134,19 +124,7 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
             PLog.w(TAG, "processDraftImageInternal fail : " + e);
             return getOriginalJpegBuffer();
         } finally {
-            final DeviceStateSnapshot deviceStateSnapshot = deviceStateReader.read();
-            final long budgetMs = Objects.requireNonNull(captureMetrics.getTimeoutTimestampMs(), "timeoutMs") - SystemClock.uptimeMillis();
-            final DraftSequenceMetrics draftSequenceMetrics = Objects.requireNonNull(captureMetrics.getDraftSequenceMetrics(), "draftSequenceMetrics");
-            draftSequenceMetrics.setSavingExecutionMetrics(new SavingExecutionMetrics(
-                    /*isPendingRequest*/true,
-                    captureMetrics.getResultImageSize(),
-                    captureMetrics.getResultImageFormat(),
-                    new PreExecutionMetrics(budgetMs,
-                            deviceStateSnapshot.getMemorySnapshot(),
-                            deviceStateSnapshot.getThermalSnapshot(),
-                            deviceStateSnapshot.getStorageSnapshot()),
-                    new PostExecutionMetrics(),
-                    SystemClock.uptimeMillis()));
+            draftSequenceExecutionProfiler.profileSavingExecution();
             draftJpegNodeChainAccessor.deinitializeNodeChain();
             PLog.i(TAG, "processDraftImageInternal(ppSequenceId:%d, sequenceId:%d) X", ppSequenceId, sequenceId);
         }

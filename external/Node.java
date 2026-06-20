@@ -1,6 +1,25 @@
+/*
+ * Copyright (C) 2017 Samsung Electronics Co., Ltd. All rights reserved.
+ *
+ * IT & Mobile Communications,
+ * Mobile Communications Business, Samsung Electronics Co., Ltd.
+ *
+ * This software and its documentation are confidential and proprietary
+ * information of Samsung Electronics Co., Ltd.
+ * No part of the software and documents may be copied, reproduced, transmitted,
+ * translated, or reduced to any electronic medium or machine-readable form
+ * without the prior written consent of Samsung Electronics.
+ *
+ * Samsung Electronics makes no representations with respect to the contents,
+ * and assumes no responsibility for any errors that might appear in the software and
+ * documents. This publication and the contents hereof are subject
+ * to change without notice.
+ */
+
 package com.samsung.android.camera.core2.node;
 
 import android.media.Image;
+import android.util.Size;
 
 import androidx.annotation.CallSuper;
 import androidx.annotation.GuardedBy;
@@ -11,12 +30,8 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.CaptureMetadataKey;
 import com.samsung.android.camera.core2.local.vendorkey.metadata.RequiredCaptureMetadataProvider;
-import com.samsung.android.camera.core2.ml.AdmissionStageSpec;
-import com.samsung.android.camera.core2.ml.CaptureMetrics;
-import com.samsung.android.camera.core2.ml.DeviceStateReader;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionSession;
-import com.samsung.android.camera.core2.ml.DraftSequenceMetrics;
 import com.samsung.android.camera.core2.node.NodeFeature.NodeFeatureVersion;
 import com.samsung.android.camera.core2.util.CLog;
 import com.samsung.android.camera.core2.util.ConditionChecker;
@@ -1242,79 +1257,53 @@ public abstract class Node implements PictureFormatProcessableInterface {
      */
     @CallSuper
     protected ImageBuffer processPicture(@NonNull ImageBuffer picture, @NonNull ExtraBundle bundle) {
-        final SemImageFormat imgFormat = picture.getImageInfo().getFormat();
-        final BiFunction<ImageBuffer, ExtraBundle, ImageBuffer> executor = mProcessPictureMap.get(imgFormat);
+        final ImageInfo imageInfo = picture.getImageInfo();
+        final Size imageSize = Objects.requireNonNull(imageInfo.getSize(), "imageSize");
+        final SemImageFormat imageFormat = picture.getImageInfo().getFormat();
+        final BiFunction<ImageBuffer, ExtraBundle, ImageBuffer> executor = mProcessPictureMap.get(imageFormat);
         if (null == executor) {
             return picture;
         }
 
-        final CaptureMetrics captureMetrics = bundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
-        final DeviceStateReader deviceStateReader = bundle.get(ExtraBundle.DATA_DEVICE_STATE_READER);
-        final DraftSequenceMetrics draftSequenceMetrics = Optional.ofNullable(captureMetrics)
-                .map(CaptureMetrics::getDraftSequenceMetrics)
-                .orElse(null);
-        if (null == draftSequenceMetrics || null == deviceStateReader || !isPredictable()) {
+        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = bundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
+        if (null == draftSequenceExecutionProfiler || !isPredictable()) {
             return executor.apply(picture, bundle);
         }
 
-        // DualBokeh is gated on its combined (bokeh + encoding + saving) admission; every other node
-        // reports shouldRun == true and merely feeds its observed cost back into the model.
-        final long timeoutTimestampMs = Objects.requireNonNull(captureMetrics.getTimeoutTimestampMs(), "timeoutMs");
-        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(deviceStateReader);
-        final List<AdmissionStageSpec> admissionStageSpecs;
-        if (mNodeId == NodeId.NODE_SEC_V2_DUAL_BOKEH) {
-            admissionStageSpecs = List.of(new AdmissionStageSpec(NodeId.NODE_SEC_FILTER, picture.getImageInfo().getSize(), captureMetrics.getResultImageSize()));
-        } else {
-            admissionStageSpecs = Collections.emptyList();
+        final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(mNodeId, imageSize);
+        final ExecutorService executorService = Executors.newSingleThreadExecutor();
+        final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
+
+        final ImageBuffer resultBuffer;
+        try {
+            if (session.getDelayMs() > 0) {
+                CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
+                resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
+            } else {
+                resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
+            }
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            CLog.w(getNodeTag(), "processPicture timed out.");
+            return null;
+        } catch (Exception e) {
+            future.cancel(true);
+            session.abort();
+            CLog.e(getNodeTag(), "processPicture error", e);
+            return null;
+        } finally {
+            executorService.shutdown();
         }
-
-        final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(
-                mNodeId,
-                timeoutTimestampMs,
-                picture.getImageInfo().getSize(),
-                captureMetrics.getResultImageSize(),
-                captureMetrics.getResultImageFormat(),
-                draftSequenceMetrics,
-                admissionStageSpecs);
-
-        // final ExecutorService executorService = Executors.newSingleThreadExecutor();
-        // final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
-
-        // final ImageBuffer resultBuffer;
-        // try {
-        //     if (session.getDelayMs() > 0) {
-        //         CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
-        //         resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
-        //     } else {
-        //         resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
-        //     }
-        // } catch (TimeoutException e) {
-        //     future.cancel(true);
-        //     CLog.w(getNodeTag(), "processPicture timed out.");
-        //     return null;
-        // } catch (Exception e) {
-        //     future.cancel(true);
-        //     session.abort();
-        //     CLog.e(getNodeTag(), "processPicture error", e);
-        //     return null;
-        // } finally {
-        //     executorService.shutdown();
-        // }
-        if (!session.getShouldRun()) {
-            return picture;
-        }
-        final ImageBuffer resultBuffer = executor.apply(picture, bundle);
 
         if (null != resultBuffer) {
             session.complete();
         }
-        return resultBuffer;
 
-        // if (session.isWatchdogTimedOut()) {
-        //     return null;
-        // } else {
-        //     return resultBuffer;
-        // }
+        if (session.isWatchdogTimedOut()) {
+            return null;
+        } else {
+            return resultBuffer;
+        }
     }
 
     protected boolean isPredictable() {
@@ -1562,6 +1551,11 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
         CLog.i(getNodeTag(), "isSupportedCamType : " + mSupportedCamType + ", cameraUsage :" + cameraUsage);
         return mSupportedCamType.contains(cameraUsage);
+    }
+
+    @NonNull
+    public NodeId getNodeId() {
+        return mNodeId;
     }
 
     /**

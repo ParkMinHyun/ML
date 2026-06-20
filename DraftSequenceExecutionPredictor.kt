@@ -3,16 +3,15 @@ package com.samsung.android.camera.core2.ml
 import android.content.Context
 import android.os.SystemClock
 import android.util.Size
+import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.NodeId
 import com.samsung.android.camera.core2.util.CLog
-import java.util.function.Consumer
-import kotlin.math.abs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.Objects
+import kotlin.math.abs
 
 /**
  * Base for every draft-sequence execution predictor.
@@ -20,7 +19,6 @@ import kotlinx.coroutines.launch
  * This class owns what is common to *all* predictors and independent of how any one models cost:
  *   - the workload taxonomy (how a node / saving maps to a stable [WorkloadKey]),
  *   - admission as a sum of independent per-workload upper bounds ([predictAdmission]), and
- *   - history replay ([warmUpFromHistory]).
  *
  * A concrete predictor implements only the two model-specific hooks below; it never sees raw
  * nodeIds, image sizes, or formats - it receives the already-bucketed [WorkloadKey] and the
@@ -29,10 +27,24 @@ import kotlinx.coroutines.launch
  */
 abstract class DraftSequenceExecutionPredictor {
 
-    // ---- Model-specific hooks (the only two a concrete predictor must implement) ----
+    // ---- Model-specific hooks (the only thing a concrete predictor must implement) ----
+
+    /** Predicts one workload's point estimate and upper bound. */
+    protected abstract fun predictWorkload(
+        workloadKey: WorkloadKey,
+        preExecutionMetrics: PreExecutionMetrics,
+    ): ExecutionPrediction
+
+    /** Records one workload's observed cost. Pure observation: no prediction, no budget. */
+    protected abstract fun updateWorkload(
+        workloadKey: WorkloadKey,
+        postExecutionMetrics: PostExecutionMetrics,
+    )
+
+    // ---- Admission: sum of independent per-workload upper bounds ----
 
     /**
-     * Predicts admission for a set of workloads as the sum of each one's independent upper bound:
+     * Predicts a stage's admission as the sum of each listed workload's independent upper bound:
      *     admit  <=>  Σ upperBound(workload) <= budget
      *
      * The caller lists every workload that still has to finish in the draft sequence - the running
@@ -40,19 +52,49 @@ abstract class DraftSequenceExecutionPredictor {
      * reflects the whole remaining cost. A workload with no samples contributes 0, so admission stays
      * lenient until the model has learned.
      */
-    abstract fun predictAdmission(
+    fun predictAdmission(
         workloadKeys: List<WorkloadKey>,
         preExecutionMetrics: PreExecutionMetrics,
-    ): ExecutionPrediction
+    ): ExecutionPrediction {
+        var sumDurationMs = 0L
+        var sumUpperBoundMs = 0L
+        workloadKeys.forEach { workloadKey ->
+            val prediction = predictWorkload(workloadKey, preExecutionMetrics)
+            sumDurationMs += prediction.predictedDurationMs
+            sumUpperBoundMs += prediction.predictedUpperBoundMs
+        }
+        return ExecutionPrediction(
+            admit = sumUpperBoundMs <= preExecutionMetrics.budgetMs,
+            predictedDurationMs = sumDurationMs,
+            predictedUpperBoundMs = sumUpperBoundMs,
+        )
+    }
 
-    /** Records one workload's observed cost. Pure observation: no prediction, no budget. */
-    abstract fun updateWorkload(
-        workloadKey: WorkloadKey,
-        postExecutionMetrics: PostExecutionMetrics,
-    )
+    // ---- Per-workload learning ----
+
+    fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, imageFormat: Int) {
+        updateWorkload(
+            workloadKey = WorkloadKey.node(
+                nodeExecutionMetrics.nodeId,
+                nodeExecutionMetrics.inputImageSize,
+                nodeExecutionMetrics.outputImageSize,
+                imageFormat,
+            ),
+            postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
+        )
+    }
+
+    fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
+        updateWorkload(
+            workloadKey = WorkloadKey.saving(
+                savingExecutionMetrics.isPendingRequest,
+                savingExecutionMetrics.resultImageSize,
+                savingExecutionMetrics.resultImageFormat),
+            postExecutionMetrics = savingExecutionMetrics.postExecutionMetrics,
+        )
+    }
 
     companion object {
-        private const val TAG = "DraftSequenceExecutionPredictor"
 
         /**
          * Process-wide instance. The predictor's learned state lives here, so profilers created
@@ -63,7 +105,9 @@ abstract class DraftSequenceExecutionPredictor {
     }
 }
 
-/** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */
+/**
+ * Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy.
+ */
 enum class SizeBucket(val megaPixels: Int) {
     MP12(12),
     MP24(24),
@@ -97,7 +141,7 @@ sealed interface WorkloadKey {
 
     data class Encoding(val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
 
-    data class Saving(val isPendingRequest: Boolean, val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
+    data class Saving(val sizeBucket: SizeBucket, val imageFormat: Int, val isPendingRequest: Boolean) : WorkloadKey
 
     companion object {
         /** Bokeh and Filter are gated on an admission bound; Encoding and Saving are mandatory. */
@@ -111,7 +155,7 @@ sealed interface WorkloadKey {
             }
         }
 
-        fun imageProcessing(
+        fun node(
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
@@ -122,7 +166,8 @@ sealed interface WorkloadKey {
                 NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
                 NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
-                else -> throw IllegalArgumentException("not supported nodeId($nodeId)")
+                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(inputImageSize), imageFormat)
+                else -> throw IllegalArgumentException("not supported node type($nodeId)")
             }
         }
 
@@ -130,8 +175,12 @@ sealed interface WorkloadKey {
             return Encoding(SizeBucket.of(resultImageSize), imageFormat)
         }
 
-        fun saving(isPendingRequest: Boolean, resultImageSize: Size, imageFormat: Int): WorkloadKey {
-            return Saving(isPendingRequest, SizeBucket.of(resultImageSize), imageFormat)
+        fun saving(isPendingRequest: Boolean, resultImageSize: Size, resultImageFormat: Int): WorkloadKey {
+            return Saving(
+                isPendingRequest = isPendingRequest,
+                sizeBucket = SizeBucket.of(resultImageSize),
+                imageFormat = resultImageFormat,
+            )
         }
     }
 }
@@ -146,16 +195,41 @@ sealed interface WorkloadKey {
  *   3. if the work ran, caller calls [DraftSequenceExecutionSession.complete] exactly once to fill
  *      [PostExecutionMetrics] and correct the model.
  *
- * Construct one per draft sequence with the plan (the admission stages that will run, in order, plus
- * whether the save is a pending request); the default [predictor] is the process-wide
- * [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
+ * Create one per draft sequence and call [setDraftPlan] at the start so each node's admission
+ * decision can sum the upper bounds of the workloads still ahead of it; the default [predictor] is
+ * the process-wide [DraftSequenceExecutionPredictor.instance] predictor, so the learned model persists.
  */
+private const val TAG = "DraftSequenceExecutionProfiler"
+
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
-    private val isPendingRequest: Boolean,
+    private val context: Context,
     private val deviceStateReader: DeviceStateReader,
-    private val plannedAdmissionStages: List<NodeId>,
+    private val captureMetrics: CaptureMetrics,
+    private val isPendingRequest: Boolean,
+    private val draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
 ) {
+    
+    init {
+        captureMetrics.draftSequenceMetrics = draftSequenceMetrics
+    }
+
+    private var plannedAdmissionStages: List<NodeId> = emptyList()
+    private lateinit var savingExecutionSession: DraftSequenceExecutionSession
+
+    /**
+     * Draft-start configuration, set once before the first [profileNodeExecution]:
+     *   - [admissionStages]: the ordered admission-gated stages (e.g. Bokeh, Filter) that will run;
+     *     the mandatory Encoding + Saving are implicit and must not be listed.
+     *
+     * Lets each [profileNodeExecution] sum the upper bounds of every workload still ahead of the
+     * running node, instead of the caller threading them in per node. NodeIds the predictor does not
+     * yet model as admission stages (e.g. a future Watermark) are stored but stay ignored until
+     * [WorkloadKey.isAdmissionStageNode] covers them.
+     */
+    fun setDraftPlan(admissionStages: List<NodeId>) {
+        plannedAdmissionStages = admissionStages.toList()
+    }
 
     /**
      * Step 1 (node): record this node and return a session whose [DraftSequenceExecutionSession.complete]
@@ -163,34 +237,26 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      *
      * Only an admission stage (see [WorkloadKey.isAdmissionStageNode]) predicts: its
      * [DraftSequenceExecutionSession.shouldRun] is the sum of upper bounds - this stage, the admission
-     * stages still ahead of it (from the constructor's plan), and the mandatory Encoding + Saving - against
+     * stages still ahead of it (from [setDraftPlan]), and the mandatory Encoding + Saving - against
      * the remaining budget, so the gate reflects what actually has to finish in time, not the stage
      * alone. Every other node skips prediction and reports shouldRun == true, so the caller runs it
      * unconditionally and only its cost is learned.
      *
      * @param nodeId node identifier (model bucket key).
-     * @param timeoutMs absolute deadline for this node; the remaining budget is derived at read time.
      * @param inputImageSize input image dimensions.
-     * @param resultImageSize final capture result image dimensions for this node output and Encoding/Saving keys.
-     * @param resultImageFormat final capture result image format for the Encoding/Saving keys.
-     * @param draftMetrics draft metrics to append this node's record to.
      */
-    fun profileNodeExecution(
-        nodeId: NodeId,
-        timeoutMs: Long,
-        inputImageSize: Size,
-        resultImageSize: Size,
-        resultImageFormat: Int,
-        draftMetrics: DraftSequenceMetrics,
-    ): DraftSequenceExecutionSession {
+    fun profileNodeExecution(nodeId: NodeId, inputImageSize: Size): DraftSequenceExecutionSession {
         val deviceState = deviceStateReader.read()
+        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (SystemClock.uptimeMillis() + MakerFeature.CAPTURE_TIMEOUT_MS)
         val preExecutionMetrics = PreExecutionMetrics(
-            budgetMs = timeoutMs - SystemClock.uptimeMillis(),
+            budgetMs = timeoutTimestampMs - SystemClock.uptimeMillis(),
             memorySnapshot = deviceState.memorySnapshot,
             thermalSnapshot = deviceState.thermalSnapshot,
             storageSnapshot = deviceState.storageSnapshot,
         )
 
+        val resultImageSize = captureMetrics.resultImageSize
+        val resultImageFormat = captureMetrics.resultImageFormat
         val mandatoryKeys = listOf(
             WorkloadKey.encoding(resultImageSize, resultImageFormat),
             WorkloadKey.saving(isPendingRequest, resultImageSize, resultImageFormat),
@@ -199,7 +265,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val isAdmissionStage = WorkloadKey.isAdmissionStageNode(nodeId)
         val prediction = if (isAdmissionStage) {
             val stageKeys = (listOf(nodeId) + followingAdmissionStages(nodeId)).map {
-                WorkloadKey.imageProcessing(it, inputImageSize, resultImageSize, resultImageFormat)
+                WorkloadKey.node(it, inputImageSize, resultImageSize, resultImageFormat)
             }
             predictor.predictAdmission(stageKeys + mandatoryKeys, preExecutionMetrics)
         } else {
@@ -216,17 +282,17 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         // Watchdog: the latest moment the mandatory Encoding + Saving can still start and meet budget.
         val watchdogDeadlineMs = if (isAdmissionStage) {
-            val mandatoryUpperBoundMs =
-                predictor.predictAdmission(mandatoryKeys, preExecutionMetrics).predictedUpperBoundMs
-            timeoutMs - mandatoryUpperBoundMs.coerceAtLeast(0L)
+            val mandatoryUpperBoundMs = predictor.predictAdmission(mandatoryKeys, preExecutionMetrics).predictedUpperBoundMs
+            timeoutTimestampMs - mandatoryUpperBoundMs.coerceAtLeast(0L)
         } else {
             null
         }
 
-        synchronized(draftMetrics) {
-            draftMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
+        val draftSequenceMetrics = captureMetrics.draftSequenceMetrics!!
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
             if (prediction != null) {
-                draftMetrics.nodeExecutionPredictionList += prediction
+                draftSequenceMetrics.nodeExecutionPredictionList += prediction
             }
         }
 
@@ -240,14 +306,52 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return DraftSequenceExecutionSession(
             executionPrediction = prediction,
             postExecutionMetrics = nodeExecutionMetrics.postExecutionMetrics,
+            onComplete = { predictor.updateNodeExecution(nodeExecutionMetrics, resultImageFormat) },
             watchdogDeadlineMs = watchdogDeadlineMs,
-            onComplete = {
-                predictor.updateWorkload(
-                    WorkloadKey.node(nodeId, inputImageSize, resultImageSize, resultImageFormat),
-                    nodeExecutionMetrics.postExecutionMetrics,
-                )
-            }
         )
+    }
+
+    fun profileSavingExecution() {
+        val deviceStateSnapshot = deviceStateReader.read()
+
+        val savingStartTimestampMs = SystemClock.uptimeMillis()
+        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (savingStartTimestampMs + MakerFeature.CAPTURE_TIMEOUT_MS)
+        val budgetMs: Long = timeoutTimestampMs - savingStartTimestampMs
+
+        val postExecutionMetrics = PostExecutionMetrics()
+        val savingExecutionMetrics = SavingExecutionMetrics(
+            isPendingRequest,
+            captureMetrics.resultImageSize,
+            captureMetrics.resultImageFormat,
+            PreExecutionMetrics(
+                budgetMs,
+                deviceStateSnapshot.memorySnapshot,
+                deviceStateSnapshot.thermalSnapshot,
+                deviceStateSnapshot.storageSnapshot
+            ),
+            postExecutionMetrics
+        )
+        draftSequenceMetrics.savingExecutionMetrics = savingExecutionMetrics
+        savingExecutionSession = DraftSequenceExecutionSession(
+            executionPrediction = null,
+            postExecutionMetrics = postExecutionMetrics,
+            onComplete = { predictor.updateSavingExecution(savingExecutionMetrics) },
+        )
+    }
+
+    /**
+     * End of the saving stage. Fills the saving [PostExecutionMetrics] and feeds the observed cost to
+     * the predictor (only when saving was profiled), then records whether the capture overran its
+     * timeout onto [DraftSequenceMetrics.isTimeout] and returns it.
+     */
+    fun completeSavingExecution(): Boolean {
+        if (this::savingExecutionSession.isInitialized) {
+            savingExecutionSession.complete()
+        }
+        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
+        val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
+        draftSequenceMetrics.isTimeout = isTimeout
+        return isTimeout
     }
 
     /**
@@ -274,40 +378,89 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 class DraftSequenceExecutionSession internal constructor(
     val executionPrediction: ExecutionPrediction?,
     private val postExecutionMetrics: PostExecutionMetrics,
+    private val onComplete: () -> Unit,
     private val watchdogDeadlineMs: Long? = null,
     private val watchdogTimeoutCallback: WatchdogTimeoutCallback? = null,
-    private val onComplete: () -> Unit
 ) {
     interface WatchdogTimeoutCallback {
         fun onTimeout(session: DraftSequenceExecutionSession)
     }
 
+    /** True when there is no admission gate (update-only), or the upper bound fits within the budget. */
     val shouldRun: Boolean = executionPrediction?.admit ?: true
-    var watchdogTimedOut = false
-    val delayMs: Long = watchdogDeadlineMs?.let { (it - startedAtMs).coerceAtLeast(0L) } ?: 0L
 
     private val gcTracker = GcTracker()
     private val cpuProcessingTracker = CpuProcessingTracker()
     private val startedAtMs = SystemClock.uptimeMillis()
 
     private var completed = false
+    private var watchdogArmed = false
+    private var watchdogTimedOut = false
+    private var delayMs = 0L
+
+    fun isWatchdogTimedOut(): Boolean = watchdogTimedOut
+    fun getDelayMs(): Long = delayMs
 
     /**
-     * Single-shot watchdog: at the deadline, if the work has not finished, flag the timeout and
-     * notify [watchdogTimeoutCallback]; [complete]/[abort] cancel it. Currently armed but inert - the
-     * profiler passes no callback (the Node.java wiring is commented out). When re-enabled, also gate
-     * arming on shouldRun and a non-null callback.
+     * Per-session watchdog resources. They are created only when this session actually arms a
+     * watchdog, and are released when complete/abort is called or after the watchdog callback returns.
      */
-    private val watchdogJob: Job? = watchdogDeadlineMs?.let {
-        CoroutineScope(Dispatchers.Default).launch {
-            delay(delayMs)
-            val timedOut = synchronized(this@DraftSequenceExecutionSession) {
-                if (completed) false else { watchdogTimedOut = true; true }
+    private var watchdogJob: kotlinx.coroutines.Job? = null
+
+    init {
+        armWatchdogIfNeeded()
+    }
+
+    private fun armWatchdogIfNeeded() {
+        val deadlineMs = watchdogDeadlineMs ?: return
+//        if (!shouldRun || watchdogTimeoutCallback == null) {
+//            CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - shouldRun($shouldRun), watchdogTimeoutCallback($watchdogTimeoutCallback)")
+//            return
+//        }
+        delayMs = (deadlineMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+
+        synchronized(this) {
+            if (completed || watchdogTimedOut) {
+                CLog.w(TAG, "[mhyun2.park] armWatchdogIfNeeded - completed($completed), watchdogTimedOut($watchdogTimedOut)")
+                return
             }
-            if (timedOut) {
-                CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
-                watchdogTimeoutCallback?.onTimeout(this@DraftSequenceExecutionSession)
+
+            watchdogArmed = true
+            watchdogJob = CoroutineScope(Dispatchers.Default).launch {
+                delay(delayMs)
+
+                val callback = synchronized(this@DraftSequenceExecutionSession) {
+                    if (completed || watchdogTimedOut) {
+                        null
+                    } else {
+                        watchdogTimedOut = true
+                        watchdogArmed = false
+                        watchdogTimeoutCallback
+                    }
+                }
+
+                try {
+                    if (callback != null) {
+                        CLog.e(TAG, "[mhyun2.park] watchdog timer - onTimeout")
+                        callback.onTimeout(this@DraftSequenceExecutionSession)
+                    }
+                } finally {
+                    releaseWatchdogJob()
+                }
             }
+            CLog.i(TAG, "[mhyun2.park] armWatchdogIfNeeded - delayMs($delayMs)")
+        }
+    }
+
+    private fun cancelWatchdogLocked() {
+        watchdogJob?.cancel()
+        watchdogArmed = false
+    }
+
+    private fun releaseWatchdogJob() {
+        synchronized(this) {
+            cancelWatchdogLocked()
+            watchdogJob = null
         }
     }
 
@@ -316,7 +469,11 @@ class DraftSequenceExecutionSession internal constructor(
      * skips the work or switches to fallback after the watchdog callback.
      */
     fun abort() {
-        markCompleted()
+        synchronized(this) {
+            check(!completed) { "DraftSequenceExecutionSession.abort() called more than once." }
+            completed = true
+        }
+        releaseWatchdogJob()
     }
 
     /**
@@ -324,19 +481,16 @@ class DraftSequenceExecutionSession internal constructor(
      * model. Call this only after the work has actually run, exactly once.
      */
     fun complete() {
-        markCompleted()
-        postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
-        postExecutionMetrics.gcSnapshot = gcTracker.delta()
-        postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
-        onComplete()
-    }
-
-    /** Marks the session done exactly once and stops the watchdog. */
-    private fun markCompleted() {
         synchronized(this) {
-            check(!completed) { "DraftSequenceExecutionSession already completed." }
+            check(!completed) { "DraftSequenceExecutionSession.complete() called more than once." }
             completed = true
+
+            postExecutionMetrics.durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
+            postExecutionMetrics.gcSnapshot = gcTracker.delta()
+            postExecutionMetrics.cpuProcessingSnapshot = cpuProcessingTracker.delta()
         }
-        watchdogJob?.cancel()
+
+        releaseWatchdogJob()
+        onComplete()
     }
 }

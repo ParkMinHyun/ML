@@ -36,7 +36,6 @@ data class SavingExecutionMetrics(
     val resultImageFormat: Int,
     val preExecutionMetrics: PreExecutionMetrics,
     val postExecutionMetrics: PostExecutionMetrics,
-    var startTimestampMs: Long = 0L,
 )
 
 data class PreExecutionMetrics(
