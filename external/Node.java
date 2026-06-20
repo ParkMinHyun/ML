@@ -1271,20 +1271,29 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
 
         final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(mNodeId, imageSize);
+
+        // Admission gate: when the predicted suffix UB(...) does not fit the remaining budget, skip
+        // this quality stage and pass the picture through unchanged. Skipping here is what preserves
+        // the mandatory [Encoding, Saving] tail; the per-stage timeout only reserves that tail.
+        if (!session.getShouldRun()) {
+            CLog.i(getNodeTag(), "processPicture - skipped by admission, nodeId=" + mNodeId);
+            session.abort();
+            return picture;
+        }
+
         final ExecutorService executorService = Executors.newSingleThreadExecutor();
         final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
 
         final ImageBuffer resultBuffer;
         try {
-            if (session.getDelayMs() > 0) {
-                CLog.w(getNodeTag(), "[mhyun2.park] session.getDelayMs() " + session.getDelayMs());
-                resultBuffer = future.get(session.getDelayMs(), TimeUnit.MILLISECONDS);
-            } else {
-                resultBuffer = future.get(3000, TimeUnit.MILLISECONDS);
-            }
+            // Run only until the mandatory [Encoding, Saving] tail must start. profileNodeExecution
+            // sized this as (remaining budget - UB([Encoding, Saving])).
+            resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
+            // Stage overran its budget: discard its result so the reserved tail still fits the timeout.
             future.cancel(true);
-            CLog.w(getNodeTag(), "processPicture timed out.");
+            session.abort();
+            CLog.w(getNodeTag(), "processPicture - timeout, nodeId=" + mNodeId);
             return null;
         } catch (Exception e) {
             future.cancel(true);
@@ -1295,15 +1304,13 @@ public abstract class Node implements PictureFormatProcessableInterface {
             executorService.shutdown();
         }
 
-        if (null != resultBuffer) {
-            session.complete();
+        if (null == resultBuffer) {
+            session.abort();
+            return null;
         }
 
-        if (session.isWatchdogTimedOut()) {
-            return null;
-        } else {
-            return resultBuffer;
-        }
+        session.complete();
+        return resultBuffer;
     }
 
     protected boolean isPredictable() {
