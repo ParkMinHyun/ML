@@ -67,13 +67,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
 
         val admissionSequenceKey = if (WorkloadKey.isAdmissionStageNode(nodeId) && nodeWorkloadKey != null) {
-            remainingSequenceKeyStartingAtNode(
-                nodeId = nodeId,
-                nodeWorkloadKey = nodeWorkloadKey,
-                inputImageSize = inputImageSize,
-                resultImageSize = resultImageSize,
-                resultImageFormat = resultImageFormat,
-            )
+            remainingSequenceKeyStartingAtNode(nodeId, nodeWorkloadKey, inputImageSize)
         } else {
             null
         }
@@ -82,7 +76,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             predictor.predictAdmission(sequenceKey, preExecutionMetrics)
         }
 
-        val processTimeoutMs = processTimeoutMs(resultImageSize, resultImageFormat, preExecutionMetrics)
+        val processTimeoutMs = processTimeoutMs(preExecutionMetrics)
 
         val nodeExecutionMetrics = NodeExecutionMetrics(
             nodeId = nodeId,
@@ -93,13 +87,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
 
         val pendingSequenceObservation = nodeWorkloadKey?.let {
-            sequenceObservationStartingAtNode(
-                nodeId = nodeId,
-                nodeWorkloadKey = it,
-                inputImageSize = inputImageSize,
-                resultImageSize = resultImageSize,
-                resultImageFormat = resultImageFormat,
-            )
+            sequenceObservationStartingAtNode(nodeId, it, inputImageSize)
         }
 
         synchronized(draftSequenceMetrics) {
@@ -191,7 +179,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
-    private fun mandatoryWorkloadKeys(resultImageSize: Size, resultImageFormat: Int): List<WorkloadKey> {
+    private fun mandatoryWorkloadKeys(): List<WorkloadKey> {
+        val resultImageSize = captureMetrics.resultImageSize
+        val resultImageFormat = captureMetrics.resultImageFormat
         return listOf(
             WorkloadKey.encoding(resultImageSize, resultImageFormat),
             WorkloadKey.saving(resultImageSize, resultImageFormat, isPendingRequest),
@@ -203,12 +193,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         nodeId: NodeId,
         nodeWorkloadKey: WorkloadKey,
         inputImageSize: Size,
-        resultImageSize: Size,
-        resultImageFormat: Int,
     ): WorkloadSequenceKey {
         val workloadKeys = listOf(nodeWorkloadKey) +
-            followingAdmissionWorkloadKeys(nodeId, inputImageSize, resultImageSize, resultImageFormat) +
-            mandatoryWorkloadKeys(resultImageSize, resultImageFormat)
+            followingAdmissionWorkloadKeys(nodeId, inputImageSize) +
+            mandatoryWorkloadKeys()
         return WorkloadSequenceKey(workloadKeys)
     }
 
@@ -216,20 +204,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         nodeId: NodeId,
         nodeWorkloadKey: WorkloadKey,
         inputImageSize: Size,
-        resultImageSize: Size,
-        resultImageFormat: Int,
     ): PendingSequenceObservation? {
         if (!WorkloadKey.isAdmissionStageNode(nodeId)) {
             return null
         }
         return PendingSequenceObservation(
-            sequenceKey = remainingSequenceKeyStartingAtNode(
-                nodeId = nodeId,
-                nodeWorkloadKey = nodeWorkloadKey,
-                inputImageSize = inputImageSize,
-                resultImageSize = resultImageSize,
-                resultImageFormat = resultImageFormat,
-            ),
+            remainingSequenceKeyStartingAtNode(nodeId, nodeWorkloadKey, inputImageSize),
         )
     }
 
@@ -239,29 +219,20 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * timeout so a slow quality stage can never eat into the tail's reserved time. Filter preservation
      * is handled by the next Filter admission check, not by this timeout.
      */
-    private fun processTimeoutMs(
-        resultImageSize: Size,
-        resultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-    ): Long {
-        val tailKey = WorkloadSequenceKey(mandatoryWorkloadKeys(resultImageSize, resultImageFormat))
+    private fun processTimeoutMs(preExecutionMetrics: PreExecutionMetrics): Long {
+        val tailKey = WorkloadSequenceKey(mandatoryWorkloadKeys())
         val tailUpperBoundMs = predictor.predictAdmission(tailKey, preExecutionMetrics).predictedUpperBoundMs
         return (preExecutionMetrics.budgetMs - tailUpperBoundMs).coerceAtLeast(0L)
     }
 
     /** Workload keys for the planned admission stages that run after [currentNodeId]. */
-    private fun followingAdmissionWorkloadKeys(
-        currentNodeId: NodeId,
-        inputImageSize: Size,
-        resultImageSize: Size,
-        resultImageFormat: Int,
-    ): List<WorkloadKey> {
+    private fun followingAdmissionWorkloadKeys(currentNodeId: NodeId, inputImageSize: Size): List<WorkloadKey> {
         val index = plannedAdmissionStages.indexOf(currentNodeId)
         if (index < 0) {
             return emptyList()
         }
         return plannedAdmissionStages.drop(index + 1).mapNotNull { nodeId ->
-            WorkloadKey.node(nodeId, inputImageSize, resultImageSize, resultImageFormat)
+            WorkloadKey.node(nodeId, inputImageSize, captureMetrics.resultImageSize, captureMetrics.resultImageFormat)
         }
     }
 

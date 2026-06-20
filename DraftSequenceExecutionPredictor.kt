@@ -32,7 +32,7 @@ class DraftSequenceExecutionPredictor {
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
         val fallback = sequenceKey.workloads.fold(WorkloadPrediction.ZERO) { acc, key ->
-            acc.plusSaturated(predictWorkload(key))
+            acc + predictWorkload(key)
         }
         val prediction = predictWorkloadSequence(sequenceKey, fallback)
         return ExecutionPrediction(
@@ -109,21 +109,13 @@ class DraftSequenceExecutionPredictor {
         val predictedDurationMs: Long,
         val predictedUpperBoundMs: Long,
     ) {
-        init {
-            require(predictedDurationMs >= 0L) { "predictedDurationMs must be non-negative." }
-            require(predictedUpperBoundMs >= 0L) { "predictedUpperBoundMs must be non-negative." }
-        }
-
-        fun plusSaturated(other: WorkloadPrediction) = WorkloadPrediction(
-            saturatedAdd(predictedDurationMs, other.predictedDurationMs),
-            saturatedAdd(predictedUpperBoundMs, other.predictedUpperBoundMs),
+        operator fun plus(other: WorkloadPrediction) = WorkloadPrediction(
+            predictedDurationMs + other.predictedDurationMs,
+            predictedUpperBoundMs + other.predictedUpperBoundMs,
         )
 
         companion object {
             val ZERO = WorkloadPrediction(0L, 0L)
-
-            private fun saturatedAdd(left: Long, right: Long): Long =
-                if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
         }
     }
 
@@ -135,13 +127,17 @@ class DraftSequenceExecutionPredictor {
         private val positiveResiduals = ArrayDeque<Double>()
 
         fun update(observedMs: Long) {
-            if (observedMs <= 0L) return
+            if (observedMs <= 0L) {
+                return
+            }
             val predictedMs = ewmaMs.roundToNonNegativeLong()
             ewmaMs = if (count == 0) observedMs.toDouble() else EWMA_ALPHA * observedMs + (1.0 - EWMA_ALPHA) * ewmaMs
             count++
             if (predictedMs > 0L) {
                 positiveResiduals.addLast((observedMs - predictedMs).coerceAtLeast(0L).toDouble())
-                while (positiveResiduals.size > RESIDUAL_WINDOW_SIZE) positiveResiduals.removeFirst()
+                while (positiveResiduals.size > RESIDUAL_WINDOW_SIZE) {
+                    positiveResiduals.removeFirst()
+                }
             }
         }
 
@@ -154,7 +150,9 @@ class DraftSequenceExecutionPredictor {
         }
 
         private fun residualQuantile(): Double {
-            if (positiveResiduals.isEmpty()) return 0.0
+            if (positiveResiduals.isEmpty()) {
+                return 0.0
+            }
             val sorted = positiveResiduals.sorted()
             val rank = ceil(RESIDUAL_QUANTILE * sorted.size).toInt() - 1
             return sorted[rank.coerceIn(0, sorted.lastIndex)]
