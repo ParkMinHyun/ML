@@ -27,7 +27,7 @@ data class NodeExecutionMetrics(
     val inputImageSize: Size,
     val outputImageSize: Size,
     val preExecutionMetrics: PreExecutionMetrics,
-    val postExecutionMetrics: PostExecutionMetrics,
+    var postExecutionMetrics: PostExecutionMetrics = PostExecutionMetrics(),
 )
 
 data class SavingExecutionMetrics(
@@ -35,7 +35,7 @@ data class SavingExecutionMetrics(
     val resultImageSize: Size,
     val resultImageFormat: Int,
     val preExecutionMetrics: PreExecutionMetrics,
-    val postExecutionMetrics: PostExecutionMetrics,
+    var postExecutionMetrics: PostExecutionMetrics = PostExecutionMetrics(),
 )
 
 data class PreExecutionMetrics(

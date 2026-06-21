@@ -49,8 +49,8 @@ class DraftSequenceExecutionPredictor {
             nodeExecutionMetrics.inputImageSize,
             nodeExecutionMetrics.outputImageSize,
             outputImageFormat,
-        ) ?: return
-        updateModel(WorkloadSequenceKey(workloadKey), nodeExecutionMetrics.postExecutionMetrics)
+        )
+        updateModel(WorkloadSequenceKey(workloadKey), nodeExecutionMetrics.postExecutionMetrics.durationMs)
     }
 
     @Synchronized
@@ -63,14 +63,14 @@ class DraftSequenceExecutionPredictor {
                     savingExecutionMetrics.isPendingRequest,
                 ),
             ),
-            savingExecutionMetrics.postExecutionMetrics,
+            savingExecutionMetrics.postExecutionMetrics.durationMs,
         )
     }
 
     /** Records the observed duration from the start of a suffix to final saving completion. */
     @Synchronized
-    fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, postExecutionMetrics: PostExecutionMetrics) {
-        updateModel(sequenceKey, postExecutionMetrics)
+    fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long) {
+        updateModel(sequenceKey, observedDurationMs)
     }
 
     /** Unseen stage predicts zero: an optimistic cold start that admission tightens as it learns. */
@@ -92,9 +92,9 @@ class DraftSequenceExecutionPredictor {
         return blend(fallback, direct, model.count.toDouble() / DIRECT_PREDICTION_MIN_SAMPLES)
     }
 
-    private fun updateModel(sequenceKey: WorkloadSequenceKey, postExecutionMetrics: PostExecutionMetrics) {
+    private fun updateModel(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long) {
         models.getOrPut(sequenceKey) { EwmaModel() }
-            .update(postExecutionMetrics.durationMs.coerceAtLeast(0L))
+            .update(observedDurationMs.coerceAtLeast(0L))
     }
 
     private fun blend(low: WorkloadPrediction, high: WorkloadPrediction, highWeight: Double): WorkloadPrediction {
@@ -222,19 +222,20 @@ sealed interface WorkloadKey {
             }
         }
 
+        /** Only the predictable nodes (Bokeh / Filter / Encoding) have a workload key; others are a bug here. */
         fun node(
             nodeId: NodeId,
             inputImageSize: Size,
             outputImageSize: Size,
             outputImageFormat: Int,
-        ): WorkloadKey? {
+        ): WorkloadKey {
             return when (nodeId) {
                 NodeId.NODE_SEC_V1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
                 NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
                 NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(outputImageSize), outputImageFormat)
-                else -> null
+                else -> error("WorkloadKey.node: unsupported nodeId $nodeId")
             }
         }
 

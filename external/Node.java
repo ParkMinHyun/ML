@@ -1285,15 +1285,15 @@ public abstract class Node implements PictureFormatProcessableInterface {
 
         final ImageBuffer resultBuffer;
         try {
-            if (null == session.getExecutionPrediction()) {
+            if (session.getBounded()) {
+                // Quality stage (Bokeh/Filter): run only until the mandatory [Encoding, Saving] tail
+                // must start, sized by profileNodeExecution as (remaining budget - UB([Encoding, Saving])).
+                resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
+            } else {
                 // Mandatory / non-admission stage (e.g. Encoding): must always complete. The discard
                 // timeout exists only to stop a slow quality stage from eating the tail, so never apply
                 // it here - a discarded Encoding/Saving would break the capture.
                 resultBuffer = future.get();
-            } else {
-                // Quality stage (Bokeh/Filter): run only until the mandatory [Encoding, Saving] tail
-                // must start, sized by profileNodeExecution as (remaining budget - UB([Encoding, Saving])).
-                resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
             }
         } catch (TimeoutException e) {
             // Quality stage overran its budget: discard its result so the reserved tail still fits.
