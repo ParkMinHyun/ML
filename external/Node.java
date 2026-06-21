@@ -1281,7 +1281,9 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
 
         final ExecutorService executorService = Executors.newSingleThreadExecutor();
-        final Future<ImageBuffer> future = executorService.submit(() -> executor.apply(picture, bundle));
+        // runMeasured wraps the work so the session samples CPU on this worker thread, not the caller's.
+        final Future<ImageBuffer> future = executorService.submit(
+                () -> session.runMeasured(() -> executor.apply(picture, bundle)));
 
         final ImageBuffer resultBuffer;
         try {

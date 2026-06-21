@@ -3,6 +3,7 @@ package com.samsung.android.camera.core2.ml
 import android.content.Context
 import android.os.SystemClock
 import android.util.Size
+import java.util.concurrent.Callable
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.NodeId
 import com.samsung.android.camera.core2.util.CLog
@@ -248,9 +249,10 @@ class DraftSequenceExecutionSession internal constructor(
     private val processTimeoutMs: Long = 0L,
     private val onComplete: (PostExecutionMetrics) -> Unit = {},
 ) {
-    private val startedAtMs = SystemClock.uptimeMillis()
-    private val gcTracker = GcTracker()
-    private val cpuProcessingTracker = CpuProcessingTracker()
+    // Measured on the creating thread — correct for a stage that runs start-to-finish there (saving).
+    // A node offloads its work to an executor thread and re-measures it there via runMeasured.
+    private val stopwatch = ExecutionStopwatch()
+    private var workerMeasurement: PostExecutionMetrics? = null
 
     /**
      * Max time the stage may run before the mandatory [Encoding, Saving] tail must start, i.e.
@@ -258,14 +260,37 @@ class DraftSequenceExecutionSession internal constructor(
      */
     fun getProcessTimeoutMs(): Long = processTimeoutMs
 
-    /** Measures the stage (duration + GC + CPU), feeds it to [onComplete], and returns it. Call once. */
+    /**
+     * Runs [work] on the calling thread and measures it there. CPU counters are thread-scoped, so a
+     * stage that executes on its own worker thread (a node on its executor) must be measured on that
+     * thread — call this from inside the worker task, not the thread that created the session.
+     */
+    fun <T> runMeasured(work: Callable<T>): T {
+        val stopwatch = ExecutionStopwatch()
+        try {
+            return work.call()
+        } finally {
+            workerMeasurement = stopwatch.stop()
+        }
+    }
+
+    /** Feeds the stage measurement to [onComplete] and returns it. Call at most once, after the run. */
     fun complete(): PostExecutionMetrics {
-        val postExecutionMetrics = PostExecutionMetrics(
-            gcSnapshot = gcTracker.delta(),
-            cpuProcessingSnapshot = cpuProcessingTracker.delta(),
-            durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L),
-        )
+        val postExecutionMetrics = workerMeasurement ?: stopwatch.stop()
         onComplete(postExecutionMetrics)
         return postExecutionMetrics
     }
+}
+
+/** Measures duration + GC + CPU from construction until [stop]; construct and [stop] on one thread. */
+private class ExecutionStopwatch {
+    private val startedAtMs = SystemClock.uptimeMillis()
+    private val gcTracker = GcTracker()
+    private val cpuProcessingTracker = CpuProcessingTracker()
+
+    fun stop(): PostExecutionMetrics = PostExecutionMetrics(
+        gcSnapshot = gcTracker.delta(),
+        cpuProcessingSnapshot = cpuProcessingTracker.delta(),
+        durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L),
+    )
 }
