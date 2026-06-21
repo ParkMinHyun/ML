@@ -76,7 +76,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             predictor.predictAdmission(sequenceKey, preExecutionMetrics)
         }
 
-        val processTimeoutMs = processTimeoutMs(preExecutionMetrics)
+        // Only quality (admission) stages are bounded by the discard timeout; mandatory stages run to
+        // completion, so they don't need one.
+        val processTimeoutMs = if (prediction != null) processTimeoutMs(preExecutionMetrics) else 0L
 
         val nodeExecutionMetrics = NodeExecutionMetrics(
             nodeId = nodeId,
@@ -86,9 +88,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             postExecutionMetrics = PostExecutionMetrics(),
         )
 
-        val pendingSequenceObservation = nodeWorkloadKey?.let {
-            sequenceObservationStartingAtNode(nodeId, it, inputImageSize)
-        }
+        // The suffix observation reuses the admission suffix key (non-null only for admission stages).
+        val pendingSequenceObservation = admissionSequenceKey?.let { PendingSequenceObservation(it) }
 
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
@@ -99,8 +100,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         if (prediction != null) {
             CLog.i(TAG, "prediction - nodeId=$nodeId, sequence=$admissionSequenceKey, prediction=$prediction")
+            CLog.i(TAG, "process timeout - nodeId=$nodeId, timeoutMs=$processTimeoutMs")
         }
-        CLog.i(TAG, "process timeout - nodeId=$nodeId, timeoutMs=$processTimeoutMs")
 
         return DraftSequenceExecutionSession(
             executionPrediction = prediction,
@@ -198,19 +199,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             followingAdmissionWorkloadKeys(nodeId, inputImageSize) +
             mandatoryWorkloadKeys()
         return WorkloadSequenceKey(workloadKeys)
-    }
-
-    private fun sequenceObservationStartingAtNode(
-        nodeId: NodeId,
-        nodeWorkloadKey: WorkloadKey,
-        inputImageSize: Size,
-    ): PendingSequenceObservation? {
-        if (!WorkloadKey.isAdmissionStageNode(nodeId)) {
-            return null
-        }
-        return PendingSequenceObservation(
-            remainingSequenceKeyStartingAtNode(nodeId, nodeWorkloadKey, inputImageSize),
-        )
     }
 
     /**

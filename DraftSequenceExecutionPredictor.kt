@@ -7,10 +7,11 @@ import kotlin.math.ceil
 import kotlin.math.roundToLong
 
 /**
- * Two-level EWMA cost model for draft-sequence admission.
+ * EWMA cost model for draft-sequence admission.
  *
- *   1. Per-stage:  [WorkloadKey]         -> EWMA mean + positive-residual quantile (point + upper bound).
- *   2. Per-suffix: [WorkloadSequenceKey] -> the same model on the remaining-suffix duration.
+ * Every learned cost is keyed by a [WorkloadSequenceKey] mapping to an EWMA mean plus a positive-residual
+ * quantile (point estimate + upper bound). A single stage is just a length-1 sequence, so one map serves
+ * both the per-stage fallback and the per-suffix bound.
  *
  * [predictAdmission] uses the learned suffix bound once that exact suffix has enough samples, otherwise
  * it blends toward the conservative per-stage upper-bound sum. Suffix keys are plain ordered lists, so
@@ -18,8 +19,7 @@ import kotlin.math.roundToLong
  */
 class DraftSequenceExecutionPredictor {
 
-    private val workloadModels = mutableMapOf<WorkloadKey, EwmaModel>()
-    private val sequenceModels = mutableMapOf<WorkloadSequenceKey, EwmaModel>()
+    private val models = mutableMapOf<WorkloadSequenceKey, EwmaModel>()
 
     /**
      * Admission against a dynamically-built remaining suffix, e.g. Bokeh entry ->
@@ -50,16 +50,18 @@ class DraftSequenceExecutionPredictor {
             nodeExecutionMetrics.outputImageSize,
             outputImageFormat,
         ) ?: return
-        updateWorkload(workloadKey, nodeExecutionMetrics.postExecutionMetrics)
+        updateModel(WorkloadSequenceKey(workloadKey), nodeExecutionMetrics.postExecutionMetrics)
     }
 
     @Synchronized
     fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
-        updateWorkload(
-            WorkloadKey.saving(
-                savingExecutionMetrics.resultImageSize,
-                savingExecutionMetrics.resultImageFormat,
-                savingExecutionMetrics.isPendingRequest,
+        updateModel(
+            WorkloadSequenceKey(
+                WorkloadKey.saving(
+                    savingExecutionMetrics.resultImageSize,
+                    savingExecutionMetrics.resultImageFormat,
+                    savingExecutionMetrics.isPendingRequest,
+                ),
             ),
             savingExecutionMetrics.postExecutionMetrics,
         )
@@ -68,20 +70,19 @@ class DraftSequenceExecutionPredictor {
     /** Records the observed duration from the start of a suffix to final saving completion. */
     @Synchronized
     fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, postExecutionMetrics: PostExecutionMetrics) {
-        sequenceModels.getOrPut(sequenceKey) { EwmaModel() }
-            .update(postExecutionMetrics.durationMs.coerceAtLeast(0L))
+        updateModel(sequenceKey, postExecutionMetrics)
     }
 
     /** Unseen stage predicts zero: an optimistic cold start that admission tightens as it learns. */
     private fun predictWorkload(workloadKey: WorkloadKey): WorkloadPrediction {
-        return workloadModels[workloadKey]?.prediction() ?: WorkloadPrediction.ZERO
+        return models[WorkloadSequenceKey(workloadKey)]?.prediction() ?: WorkloadPrediction.ZERO
     }
 
     private fun predictWorkloadSequence(
         sequenceKey: WorkloadSequenceKey,
         fallback: WorkloadPrediction,
     ): WorkloadPrediction {
-        val model = sequenceModels[sequenceKey] ?: return fallback
+        val model = models[sequenceKey] ?: return fallback
         val direct = model.prediction()
         if (model.count >= DIRECT_PREDICTION_MIN_SAMPLES) {
             return direct
@@ -91,8 +92,8 @@ class DraftSequenceExecutionPredictor {
         return blend(fallback, direct, model.count.toDouble() / DIRECT_PREDICTION_MIN_SAMPLES)
     }
 
-    private fun updateWorkload(workloadKey: WorkloadKey, postExecutionMetrics: PostExecutionMetrics) {
-        workloadModels.getOrPut(workloadKey) { EwmaModel() }
+    private fun updateModel(sequenceKey: WorkloadSequenceKey, postExecutionMetrics: PostExecutionMetrics) {
+        models.getOrPut(sequenceKey) { EwmaModel() }
             .update(postExecutionMetrics.durationMs.coerceAtLeast(0L))
     }
 
@@ -255,6 +256,8 @@ sealed interface WorkloadKey {
  * if a caller ever mutates a list after using it as a key.
  */
 data class WorkloadSequenceKey(val workloads: List<WorkloadKey>) {
+    constructor(workloadKey: WorkloadKey) : this(listOf(workloadKey))
+
     init {
         require(workloads.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload." }
     }
