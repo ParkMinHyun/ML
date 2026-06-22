@@ -19,7 +19,6 @@
 package com.samsung.android.camera.core2.node;
 
 import android.media.Image;
-import android.util.Size;
 
 import androidx.annotation.CallSuper;
 import androidx.annotation.GuardedBy;
@@ -57,9 +56,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.Timer;
 import java.util.TimerTask;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.locks.Condition;
@@ -1257,8 +1253,6 @@ public abstract class Node implements PictureFormatProcessableInterface {
      */
     @CallSuper
     protected ImageBuffer processPicture(@NonNull ImageBuffer picture, @NonNull ExtraBundle bundle) {
-        final ImageInfo imageInfo = picture.getImageInfo();
-        final Size imageSize = Objects.requireNonNull(imageInfo.getSize(), "imageSize");
         final SemImageFormat imageFormat = picture.getImageInfo().getFormat();
         final BiFunction<ImageBuffer, ExtraBundle, ImageBuffer> executor = mProcessPictureMap.get(imageFormat);
         if (null == executor) {
@@ -1266,56 +1260,22 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
 
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = bundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
-        if (null == draftSequenceExecutionProfiler || !isPredictable()) {
-            return executor.apply(picture, bundle);
-        }
-
-        final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(mNodeId, imageSize);
-
-        // Admission gate: when the predicted suffix UB(...) does not fit the remaining budget, skip
-        // this quality stage and pass the picture through unchanged. Skipping here is what preserves
-        // the mandatory [Encoding, Saving] tail; the per-stage timeout only reserves that tail.
-        if (!session.getShouldRun()) {
-            CLog.i(getNodeTag(), "processPicture - skipped by admission, nodeId=" + mNodeId);
-            return picture;
-        }
-
-        final ExecutorService executorService = Executors.newSingleThreadExecutor();
-        // runMeasured wraps the work so the session samples CPU on this worker thread, not the caller's.
-        final Future<ImageBuffer> future = executorService.submit(
-                () -> session.runMeasured(() -> executor.apply(picture, bundle)));
-
-        final ImageBuffer resultBuffer;
-        try {
-            if (session.getBounded()) {
-                // Quality stage (Bokeh/Filter): run only until the mandatory [Encoding, Saving] tail
-                // must start, sized by profileNodeExecution as (remaining budget - UB([Encoding, Saving])).
-                resultBuffer = future.get(session.getProcessTimeoutMs(), TimeUnit.MILLISECONDS);
-            } else {
-                // Mandatory / non-admission stage (e.g. Encoding): must always complete. The discard
-                // timeout exists only to stop a slow quality stage from eating the tail, so never apply
-                // it here - a discarded Encoding/Saving would break the capture.
-                resultBuffer = future.get();
+        if (null != draftSequenceExecutionProfiler && isPredictable()) {
+            final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(mNodeId);
+            try {
+                return session.execute(picture, () -> executor.apply(picture, bundle));
+            } catch (TimeoutException e) {
+                CLog.w(getNodeTag(), "[mhyun2.park] processPictureWithProfiler - timeout, nodeId=" + mNodeId);
+                bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
+                return null;
+            } catch (Exception e) {
+                CLog.e(getNodeTag(), "[mhyun2.park] processPictureWithProfiler error", e);
+                bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
+                return null;
             }
-        } catch (TimeoutException e) {
-            // Quality stage overran its budget: discard its result so the reserved tail still fits.
-            future.cancel(true);
-            CLog.w(getNodeTag(), "processPicture - timeout, nodeId=" + mNodeId);
-            return null;
-        } catch (Exception e) {
-            future.cancel(true);
-            CLog.e(getNodeTag(), "processPicture error", e);
-            return null;
-        } finally {
-            executorService.shutdown();
         }
 
-        if (null == resultBuffer) {
-            return null;
-        }
-
-        session.complete();
-        return resultBuffer;
+        return executor.apply(picture, bundle);
     }
 
     protected boolean isPredictable() {

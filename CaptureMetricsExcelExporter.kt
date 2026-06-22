@@ -37,15 +37,10 @@ class CaptureMetricsExcelExporter(
                     NodeRow(node, draftMetrics?.nodeExecutionPredictionList?.getOrNull(order))
                 }
 
-                val savingRow = draftMetrics?.savingExecutionMetrics?.let { savingMetrics ->
-                    SavingRow(savingMetrics, draftMetrics.savingExecutionPrediction)
-                }
-
                 CaptureRow(
                     captureIndex = index + 1,
                     metrics = metrics,
                     nodeRows = nodeRows,
-                    savingRow = savingRow
                 )
             }
 
@@ -102,7 +97,7 @@ class CaptureMetricsExcelExporter(
         workbook: Workbook,
         styles: Styles,
         captures: List<EnrichedCaptureRow>,
-        sheetNamePrefix: String
+        sheetNamePrefix: String,
     ) {
         val nodeRowsByNodeId = captures
             .flatMap { enrichedCapture ->
@@ -116,14 +111,6 @@ class CaptureMetricsExcelExporter(
             val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeId")
             val nodeColumns = buildNodeColumns()
             writeSheet(workbook, styles, sheetName, rows, nodeColumns)
-        }
-
-        if (captures.any { it.row.savingRow != null }) {
-            val savingColumns = buildSavingColumns()
-            val flattenedSavingRows = captures.mapNotNull { enrichedCapture ->
-                enrichedCapture.row.savingRow?.let { Pair(enrichedCapture.row.captureIndex, it) }
-            }
-            writeSheet(workbook, styles, "${sheetNamePrefix}Saving", flattenedSavingRows, savingColumns)
         }
     }
 
@@ -196,7 +183,6 @@ class CaptureMetricsExcelExporter(
         val captureIndex: Int,
         val metrics: CaptureMetrics,
         val nodeRows: List<NodeRow>,
-        val savingRow: SavingRow?,
     )
 
     private class NodeRow(
@@ -209,20 +195,6 @@ class CaptureMetricsExcelExporter(
         fun predictionErrorMs(): Long? {
             val prediction = prediction ?: return null
             val durationMs = actualDurationMs ?: return null
-            return durationMs - prediction.predictedDurationMs
-        }
-    }
-
-    private class SavingRow(
-        val saving: SavingExecutionMetrics,
-        val prediction: ExecutionPrediction?,
-    ) {
-        private val actualDurationMs: Long?
-            get() = saving.postExecutionMetrics.durationMs.takeIf { it > 0L }
-
-        fun predictionErrorMs(): Long? {
-            val durationMs = actualDurationMs ?: return null
-            val prediction = prediction ?: return null
             return durationMs - prediction.predictedDurationMs
         }
     }
@@ -268,22 +240,15 @@ class CaptureMetricsExcelExporter(
             Column("thermalStatus") { it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalStatus },
             Column("thermalHeadroom") { it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom },
             Column("totalDurationMs") {
-                val row = it.row
-                val nodesDuration = row.nodeRows.sumOf { nodeRow -> nodeRow.node.postExecutionMetrics.durationMs }
-                val savingDuration = row.savingRow?.saving?.postExecutionMetrics?.durationMs ?: 0L
-                nodesDuration + savingDuration
+                it.row.nodeRows.sumOf { nodeRow -> nodeRow.node.postExecutionMetrics.durationMs }
             },
-            Column("timeoutCount") { it.timeoutCount?.let { idx -> "#$idx" } }
+            Column("timeoutCount") { it.timeoutCount?.let { idx -> "#$idx" } },
         )
 
         private fun buildNodeColumns(): List<Column<Triple<Int, String, NodeRow>>> {
             val columns = mutableListOf<Column<Triple<Int, String, NodeRow>>>(
                 Column("captureIndex") { it.first },
                 Column("nodeId") { it.second },
-                Column("outputImageWidth") { it.third.node.outputImageSize.width },
-                Column("outputImageHeight") { it.third.node.outputImageSize.height },
-                Column("inputImageWidth") { it.third.node.inputImageSize.width },
-                Column("inputImageHeight") { it.third.node.inputImageSize.height },
                 Column("budgetMs") { it.third.node.preExecutionMetrics.budgetMs },
                 Column("isLowMemory") { it.third.node.preExecutionMetrics.memorySnapshot.isLowMemory },
                 Column("ramAvailablePercent") { it.third.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
@@ -306,30 +271,5 @@ class CaptureMetricsExcelExporter(
             return columns
         }
 
-        private fun buildSavingColumns(): List<Column<Pair<Int, SavingRow>>> {
-            val columns = mutableListOf<Column<Pair<Int, SavingRow>>>(
-                Column("captureIndex") { it.first },
-                Column("isPendingRequest") { it.second.saving.isPendingRequest },
-                Column("resultImageWidth") { it.second.saving.resultImageSize.width },
-                Column("resultImageHeight") { it.second.saving.resultImageSize.height },
-                Column("resultImageFormat") { it.second.saving.resultImageFormat },
-                Column("budgetMs") { it.second.saving.preExecutionMetrics.budgetMs },
-                Column("isLowMemory") { it.second.saving.preExecutionMetrics.memorySnapshot.isLowMemory },
-                Column("ramAvailablePercent") { it.second.saving.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
-                Column("javaHeapUsedPercent") { it.second.saving.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent },
-                Column("nativeHeapAllocatedPercent") { it.second.saving.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
-                Column("overheatLevel") { it.second.saving.preExecutionMetrics.thermalSnapshot.overheatLevel },
-                Column("thermalStatus") { it.second.saving.preExecutionMetrics.thermalSnapshot.thermalStatus },
-                Column("thermalHeadroom") { it.second.saving.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
-                Column("storageUsedPercent") { it.second.saving.preExecutionMetrics.storageSnapshot.storageUsedPercent },
-                Column("cpuTimeMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
-                Column("wallTimeMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
-                Column("runQueueWaitMs") { it.second.saving.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
-                Column("durationMs") { it.second.saving.postExecutionMetrics.durationMs },
-                Column("predictionErrorMs") { it.second.predictionErrorMs() },
-            )
-            // ... (rest of the function is the same)
-            return columns
-        }
     }
 }

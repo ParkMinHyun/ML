@@ -2,7 +2,6 @@ package com.samsung.android.camera.core2.ml
 
 import android.util.Size
 import com.samsung.android.camera.core2.node.NodeId
-import org.json.JSONObject
 
 fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
     return CaptureMetricsEntity(
@@ -46,10 +45,6 @@ fun NodeExecutionMetrics.toEntity(
         order = order,
         nodeId = nodeId.name,
         budgetMs = preExecution.budgetMs,
-        inputImageWidth = inputImageSize.width,
-        inputImageHeight = inputImageSize.height,
-        outputImageWidth = outputImageSize.width,
-        outputImageHeight = outputImageSize.height,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
         thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
         storageSnapshot = preExecution.storageSnapshot.toEntity(),
@@ -59,38 +54,23 @@ fun NodeExecutionMetrics.toEntity(
     )
 }
 
-/** Node predictions: keyed by [target] = NODE and the node's order. */
 fun List<ExecutionPrediction>.toNodePredictionEntities(
     captureMetricsId: Int,
 ): List<ExecutionPredictionEntity> {
     return mapIndexed { index, prediction ->
         prediction.toEntity(
             captureMetricsId = captureMetricsId,
-            target = ExecutionPredictionEntity.PredictionTarget.NODE,
             order = index,
         )
     }
 }
 
-/** Saving prediction: keyed by [target] = SAVING and [SAVING_ORDER]. */
-fun ExecutionPrediction.toSavingPredictionEntity(
-    captureMetricsId: Int,
-): ExecutionPredictionEntity {
-    return toEntity(
-        captureMetricsId = captureMetricsId,
-        target = ExecutionPredictionEntity.PredictionTarget.SAVING,
-        order = ExecutionPredictionEntity.SAVING_ORDER,
-    )
-}
-
 fun ExecutionPrediction.toEntity(
     captureMetricsId: Int,
-    target: ExecutionPredictionEntity.PredictionTarget,
     order: Int,
 ): ExecutionPredictionEntity {
     return ExecutionPredictionEntity(
         captureMetricsId = captureMetricsId,
-        target = target.name,
         order = order,
         predictedDurationMs = predictedDurationMs,
         predictedUpperBoundMs = predictedUpperBoundMs,
@@ -138,35 +118,9 @@ fun StorageSnapshot.toEntity(): StorageSnapshotEntity {
     )
 }
 
-fun SavingExecutionMetrics.toEntity(
-    captureMetricsId: Int,
-): SavingExecutionMetricsEntity {
-    val preExecution = preExecutionMetrics
-    val postExecution = postExecutionMetrics
-    return SavingExecutionMetricsEntity(
-        captureMetricsId = captureMetricsId,
-        budgetMs = preExecution.budgetMs,
-        isPendingRequest = isPendingRequest,
-        resultImageWidth = resultImageSize.width,
-        resultImageHeight = resultImageSize.height,
-        resultImageFormat = resultImageFormat,
-        memorySnapshot = preExecution.memorySnapshot.toEntity(),
-        thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
-        storageSnapshot = preExecution.storageSnapshot.toEntity(),
-        gcSnapshot = postExecution.gcSnapshot?.toEntity(),
-        cpuProcessingSnapshot = postExecution.cpuProcessingSnapshot?.toEntity(),
-        durationMs = postExecution.durationMs,
-    )
-}
-
 fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
     val nodePredictions = executionPredictions
-        .filter { it.target == ExecutionPredictionEntity.PredictionTarget.NODE.name }
         .sortedBy { it.order }
-    val savingPrediction = executionPredictions
-        .filter { it.target == ExecutionPredictionEntity.PredictionTarget.SAVING.name }
-        .minByOrNull { it.executionPredictionId }
-
     return CaptureMetrics(
         ppSequenceId = capture.ppSequenceId,
         dsMode = capture.dsMode,
@@ -183,8 +137,6 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
             nodeExecutionPredictionList = nodePredictions
                 .map { it.toModel() }
                 .toMutableList(),
-            savingExecutionMetrics = savingExecutionMetrics?.toModel(),
-            savingExecutionPrediction = savingPrediction?.toModel(),
         ),
     )
 }
@@ -192,42 +144,17 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
 fun DraftSequenceMetricsEntity.toModel(
     nodeExecutionMetricsList: MutableList<NodeExecutionMetrics>,
     nodeExecutionPredictionList: MutableList<ExecutionPrediction>,
-    savingExecutionMetrics: SavingExecutionMetrics?,
-    savingExecutionPrediction: ExecutionPrediction? = null,
 ): DraftSequenceMetrics {
     return DraftSequenceMetrics(
         nodeExecutionMetricsList = nodeExecutionMetricsList,
         nodeExecutionPredictionList = nodeExecutionPredictionList,
-        savingExecutionMetrics = savingExecutionMetrics,
-        savingExecutionPrediction = savingExecutionPrediction,
         isTimeout = isTimeout,
-    )
-}
-
-fun SavingExecutionMetricsEntity.toModel(): SavingExecutionMetrics {
-    return SavingExecutionMetrics(
-        isPendingRequest = isPendingRequest,
-        resultImageSize = Size(resultImageWidth, resultImageHeight),
-        resultImageFormat = resultImageFormat,
-        preExecutionMetrics = PreExecutionMetrics(
-            budgetMs = budgetMs,
-            memorySnapshot = memorySnapshot.toModel(),
-            thermalSnapshot = thermalSnapshot.toModel(),
-            storageSnapshot = storageSnapshot.toModel(),
-        ),
-        postExecutionMetrics = PostExecutionMetrics(
-            gcSnapshot = gcSnapshot?.toModel(),
-            cpuProcessingSnapshot = cpuProcessingSnapshot?.toModel(),
-            durationMs = durationMs,
-        ),
     )
 }
 
 fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
     return NodeExecutionMetrics(
         nodeId = nodeId.toNodeId(),
-        inputImageSize = Size(inputImageWidth, inputImageHeight),
-        outputImageSize = Size(outputImageWidth, outputImageHeight),
         preExecutionMetrics = toPreExecutionMetrics(),
         postExecutionMetrics = toPostExecutionMetrics(),
     )

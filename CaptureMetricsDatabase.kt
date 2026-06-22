@@ -10,7 +10,6 @@ import androidx.room.RoomDatabase
         CaptureMetricsEntity::class,
         DraftSequenceMetricsEntity::class,
         NodeExecutionMetricsEntity::class,
-        SavingExecutionMetricsEntity::class,
         ExecutionPredictionEntity::class,
     ],
     version = 1,

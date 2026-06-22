@@ -17,6 +17,7 @@ import com.samsung.android.camera.core2.container.CodecConfiguration;
 import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.local.vendorkey.CaptureMetadata;
 import com.samsung.android.camera.core2.local.vendorkey.FileCaptureResult;
 import com.samsung.android.camera.core2.node.Node;
@@ -403,12 +404,29 @@ public abstract class SavingDraftImageTask implements Runnable {
         }
     }
 
+    protected void markSaveOriginalDraftImageOnly() {
+        handleIsDraftProcessing();
+    }
+
     @GuardedBy("processLock")
     protected abstract ImageBuffer processDraftImageInternal();
+
     @GuardedBy("processLock")
     protected abstract ImageBuffer getOriginalMainBuffer();
+
     @GuardedBy("processLock")
     protected abstract void initOriginalBuffers();
+
+    @GuardedBy("processLock")
+    protected void deinitializeDraftNodeChain() {
+        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
+        if (null != draftSequenceExecutionProfiler) {
+            draftSequenceExecutionProfiler.deinitializeDraftNodeChain();
+        } else {
+            draftJpegNodeChainAccessor.deinitializeNodeChain();
+        }
+    }
+
     @GuardedBy("processLock")
     @CallSuper
     protected void releaseBuffers() {

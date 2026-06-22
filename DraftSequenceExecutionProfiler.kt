@@ -1,23 +1,22 @@
 package com.samsung.android.camera.core2.ml
 
-import android.content.Context
 import android.os.SystemClock
 import android.util.Size
-import java.util.concurrent.Callable
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.NodeId
+import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor
 import com.samsung.android.camera.core2.util.CLog
+import java.util.concurrent.CompletableFuture
 
 private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
  * Drives one draft sequence's node lifecycle, recording both individual stage observations
  * ([WorkloadKey]) and remaining-suffix observations ([WorkloadSequenceKey]). The suffix observation
- * starts at an admission stage (Bokeh / Filter) entry and closes at saving completion; admission then
- * uses the learned suffix bound instead of summing independent stage upper bounds.
+ * starts at an admission stage (Bokeh / Filter) entry and closes when finalize execution completes;
+ * admission then uses the learned suffix bound instead of summing independent stage upper bounds.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
-    private val context: Context,
     private val deviceStateReader: DeviceStateReader,
     private val captureMetrics: CaptureMetrics,
     private val isPendingRequest: Boolean,
@@ -30,104 +29,140 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private val sequenceLock = Any()
+    private val nodeChainLifecycle = DraftNodeChainLifecycle()
 
     /**
-     * Suffix observations in progress, opened at admission stages and awaiting saving. Each tracks how
-     * many of its later stages still have to report in; saving flushes those that reached zero.
+     * Suffix observations in progress, opened at admission stages and awaiting finalization. Each
+     * tracks how many of its later stages still have to report before it can become a sample.
      */
     private val suffixObservations: MutableList<SuffixObservation> = mutableListOf()
 
     private var plannedAdmissionStages: List<NodeId> = emptyList()
-    private var savingExecutionSession: DraftSequenceExecutionSession? = null
+    private var finalizeExecutionSession: DraftSequenceExecutionSession? = null
 
-    /** Ordered quality stages for this draft, excluding mandatory Encoding + Saving. */
-    fun setDraftPlan(admissionStages: List<NodeId>) {
-        plannedAdmissionStages = admissionStages
-            .filter { WorkloadKey.isAdmissionStageNode(it) }
-            .toList()
+    fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
+        nodeChainLifecycle.reset(accessor)
+        updateDraftPlan(accessor.configuredNodeIdList)
+    }
+
+    fun deinitializeDraftNodeChain() {
+        nodeChainLifecycle.deinitializeWhenIdle()
+    }
+
+    private fun updateDraftPlan(nodeIds: List<NodeId>) {
+        plannedAdmissionStages = nodeIds.filter(WorkloadKey::isAdmissionStageNode)
     }
 
     /**
      * Profiles one node execution.
      *
      * For portrait mode with Filter enabled:
-     *   - Bokeh entry prediction uses UB([Bokeh, Filter, Encoding, Saving])
-     *   - Filter entry prediction uses UB([Filter, Encoding, Saving])
-     *   - Every admission stage is capped at (budget - UB([Encoding, Saving])) via its Future.get timeout
+     *   - Bokeh entry prediction uses UB([Bokeh, Filter, FinalizeExecution])
+     *   - Filter entry prediction uses UB([Filter, FinalizeExecution])
+     *   - Every admission stage is capped at (budget - UB([FinalizeExecution])) via its Future.get timeout
      *
-     * In other words, admission is quality-aware, while the per-stage timeout is a hard tail-safety guard.
-     * Mandatory stages (e.g. Encoding) skip both: they run to completion. Only ever called for predictable
-     * nodes (Bokeh / Filter / Encoding), so the node always resolves to a [WorkloadKey].
+     * Admission stages complete at node return. FinalizeExecution starts at ImageCodec and completes
+     * when SavingDraftImageTaskManager observes task finish, so it covers encode through saved draft.
      */
-    fun profileNodeExecution(nodeId: NodeId, inputImageSize: Size): DraftSequenceExecutionSession {
-        val preExecutionMetrics = readPreExecutionMetrics()
-        val resultImageSize = captureMetrics.resultImageSize
+    fun profileNodeExecution(nodeId: NodeId): DraftSequenceExecutionSession {
+        val nowMs = SystemClock.uptimeMillis()
+        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
+        val deviceState = deviceStateReader.read()
+        val preExecutionMetrics = PreExecutionMetrics(
+            budgetMs = timeoutTimestampMs - nowMs,
+            memorySnapshot = deviceState.memorySnapshot,
+            thermalSnapshot = deviceState.thermalSnapshot,
+            storageSnapshot = deviceState.storageSnapshot,
+        )
         val resultImageFormat = captureMetrics.resultImageFormat
-
         val nodeExecutionMetrics = NodeExecutionMetrics(
             nodeId = nodeId,
-            inputImageSize = inputImageSize,
-            outputImageSize = resultImageSize,
             preExecutionMetrics = preExecutionMetrics,
         )
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
         }
 
-        // Mandatory stage (e.g. Encoding): no admission gate, no discard timeout — it runs to completion.
-        // On finish it still counts down every suffix in progress, but opens none of its own.
-        if (!WorkloadKey.isAdmissionStageNode(nodeId)) {
-            return DraftSequenceExecutionSession(
-                onComplete = { postExecutionMetrics ->
-                    recordCompletedStage(nodeExecutionMetrics, resultImageFormat, postExecutionMetrics, openedSuffix = null)
-                },
-            )
-        }
-
-        // Admission stage (Bokeh / Filter): gated by the learned suffix bound and bounded by a discard
-        // timeout. The suffix is [thisStage, ...followingAdmissionStages, Encoding, Saving].
-        val nodeWorkloadKey = WorkloadKey.node(nodeId, inputImageSize, resultImageSize, resultImageFormat)
-        val followingIndex = plannedAdmissionStages.indexOf(nodeId)
-        val followingAdmissionKeys = if (followingIndex < 0) {
-            emptyList()
+        return if (WorkloadKey.isFinalizeExecutionNode(nodeId)) {
+            createFinalizeExecutionSession(resultImageFormat, preExecutionMetrics, nodeExecutionMetrics)
         } else {
-            plannedAdmissionStages.drop(followingIndex + 1).map { followingNodeId ->
-                WorkloadKey.node(followingNodeId, inputImageSize, resultImageSize, resultImageFormat)
-            }
+            createAdmissionExecutionSession(nodeId, resultImageFormat, preExecutionMetrics, nodeExecutionMetrics)
         }
-        val suffixKey = WorkloadSequenceKey(listOf(nodeWorkloadKey) + followingAdmissionKeys + mandatoryWorkloadKeys())
+    }
 
-        val prediction = predictor.predictAdmission(suffixKey, preExecutionMetrics)
+    private fun createFinalizeExecutionSession(
+        resultImageFormat: Int,
+        preExecutionMetrics: PreExecutionMetrics,
+        nodeExecutionMetrics: NodeExecutionMetrics,
+    ): DraftSequenceExecutionSession {
+        val prediction = predictor
+            .predictAdmission(WorkloadSequenceKey(mandatoryWorkloadKeys()), preExecutionMetrics)
+            .copy(admit = true)
+
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionPredictionList += prediction
         }
 
-        // Timer starts now; the suffix joins the in-progress set only once the stage actually completes.
-        val suffixObservation = SuffixObservation(suffixKey)
-        return DraftSequenceExecutionSession(
-            shouldRun = prediction.admit,
-            bounded = true,
-            processTimeoutMs = processTimeoutMs(preExecutionMetrics),
+        return DraftSequenceExecutionSession.deferred(
+            onCancel = { finalizeExecutionSession = null },
             onComplete = { postExecutionMetrics ->
-                recordCompletedStage(nodeExecutionMetrics, resultImageFormat, postExecutionMetrics, openedSuffix = suffixObservation)
+                recordCompletedStage(
+                    resultImageFormat,
+                    nodeExecutionMetrics,
+                    postExecutionMetrics,
+                    openedSuffix = null
+                )
+            },
+        ).also { session ->
+            finalizeExecutionSession = session
+        }
+    }
+
+    private fun createAdmissionExecutionSession(
+        nodeId: NodeId,
+        resultImageFormat: Int,
+        preExecutionMetrics: PreExecutionMetrics,
+        nodeExecutionMetrics: NodeExecutionMetrics,
+    ): DraftSequenceExecutionSession {
+        val resultImageSize = captureMetrics.resultImageSize
+        val suffixKey = admissionSuffixKey(nodeId, resultImageSize, resultImageFormat)
+        val prediction = predictor.predictAdmission(suffixKey, preExecutionMetrics)
+        val timeoutMs = processTimeoutMs(preExecutionMetrics)
+        val suffixObservation = SuffixObservation(suffixKey)
+
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.nodeExecutionPredictionList += prediction
+        }
+
+        return DraftSequenceExecutionSession.bounded(
+            shouldRun = prediction.admit,
+            processTimeoutMs = timeoutMs,
+            onTimedOutTask = nodeChainLifecycle::waitFor,
+            onComplete = { postExecutionMetrics ->
+                recordCompletedStage(
+                    resultImageFormat,
+                    nodeExecutionMetrics,
+                    postExecutionMetrics,
+                    openedSuffix = suffixObservation
+                )
             },
         )
     }
 
     /**
-     * A node stage finished: store its measurement, feed the per-stage model, and count the stage down on
+     * A stage finished: store its measurement, feed the per-stage model, and count the stage down on
      * every suffix in progress. An admission stage additionally opens [openedSuffix] for its own suffix.
      * A skipped/timed-out stage never reaches here, so it never decrements and leaves its enclosing
      * suffixes incomplete.
      */
     private fun recordCompletedStage(
+        resultImageFormat: Int,
         nodeExecutionMetrics: NodeExecutionMetrics,
-        outputImageFormat: Int,
         postExecutionMetrics: PostExecutionMetrics,
         openedSuffix: SuffixObservation?,
     ) {
         nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
-        predictor.updateNodeExecution(nodeExecutionMetrics, outputImageFormat)
+        predictor.updateNodeExecution(nodeExecutionMetrics, captureMetrics.resultImageSize, resultImageFormat, isPendingRequest)
         synchronized(sequenceLock) {
             suffixObservations.forEach { it.remainingStages-- }
             if (openedSuffix != null) {
@@ -136,79 +171,67 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    fun profileSavingExecution() {
-        draftSequenceMetrics.savingExecutionMetrics = SavingExecutionMetrics(
-            isPendingRequest = isPendingRequest,
-            resultImageSize = captureMetrics.resultImageSize,
-            resultImageFormat = captureMetrics.resultImageFormat,
-            preExecutionMetrics = readPreExecutionMetrics(),
-        )
-        savingExecutionSession = DraftSequenceExecutionSession()
-    }
-
     /**
-     * End of the saving stage. Measures the saving stage, feeds the saving and ready suffix models,
-     * then records whether the capture overran its timeout.
+     * End of the draft task. Completes FinalizeExecution, feeds ready suffix models, and records
+     * whether the capture overran its timeout.
      */
-    fun completeSavingExecution(): Boolean {
-        val session = savingExecutionSession
-        if (session != null) {
-            draftSequenceMetrics.savingExecutionMetrics?.let { savingExecutionMetrics ->
-                savingExecutionMetrics.postExecutionMetrics = session.complete()
-                predictor.updateSavingExecution(savingExecutionMetrics)
-            }
+    fun completeDraftSequenceExecution(): Boolean {
+        finalizeExecutionSession?.complete()
+        finalizeExecutionSession = null
 
-            // Saving is the final stage of every suffix: count it down, then flush. Observations that
-            // reached zero saw all their later stages complete and become samples; the rest had a
-            // skipped or timed-out stage in their suffix and are dropped.
-            val completedObservations = synchronized(sequenceLock) {
-                suffixObservations.forEach { it.remainingStages-- }
-                val (completed, dropped) = suffixObservations.partition { it.remainingStages == 0 }
-                suffixObservations.clear()
-                if (dropped.isNotEmpty()) {
-                    CLog.i(TAG, "drop incomplete suffix observations - count=${dropped.size}")
-                }
-                completed
+        val completedObservations = synchronized(sequenceLock) {
+            val (completed, dropped) = suffixObservations.partition { it.remainingStages == 0 }
+            suffixObservations.clear()
+            if (dropped.isNotEmpty()) {
+                CLog.i(TAG, "drop incomplete suffix observations - count=${dropped.size}")
             }
-            completedObservations.forEach { observation ->
-                predictor.updateWorkloadSequence(observation.sequenceKey, observation.durationMs())
-            }
+            completed
         }
+        completedObservations.forEach { observation ->
+            predictor.updateWorkloadSequence(observation.sequenceKey, observation.durationMs())
+        }
+
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
         draftSequenceMetrics.isTimeout = isTimeout
         return isTimeout
     }
 
-    private fun timeoutTimestampMs(nowMs: Long): Long {
-        return captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
+    /** Drops any open FinalizeExecution/suffix sample without feeding the predictor. */
+    fun cancelDraftSequenceExecution() {
+        finalizeExecutionSession?.cancel()
+        finalizeExecutionSession = null
+        synchronized(sequenceLock) {
+            suffixObservations.clear()
+        }
     }
 
-    private fun readPreExecutionMetrics(): PreExecutionMetrics {
-        val nowMs = SystemClock.uptimeMillis()
-        val deviceState = deviceStateReader.read()
-        return PreExecutionMetrics(
-            budgetMs = timeoutTimestampMs(nowMs) - nowMs,
-            memorySnapshot = deviceState.memorySnapshot,
-            thermalSnapshot = deviceState.thermalSnapshot,
-            storageSnapshot = deviceState.storageSnapshot,
-        )
+    private fun admissionSuffixKey(nodeId: NodeId, resultImageSize: Size, resultImageFormat: Int): WorkloadSequenceKey {
+        val followingIndex = plannedAdmissionStages.indexOf(nodeId)
+        val followingNodeIds = if (followingIndex < 0) {
+            emptyList()
+        } else {
+            plannedAdmissionStages.drop(followingIndex + 1)
+        }
+        val workloads = listOf(workloadKey(nodeId, resultImageSize, resultImageFormat)) +
+            followingNodeIds.map { workloadKey(it, resultImageSize, resultImageFormat) } +
+            mandatoryWorkloadKeys()
+        return WorkloadSequenceKey(workloads)
+    }
+
+    private fun workloadKey(nodeId: NodeId, resultImageSize: Size, resultImageFormat: Int): WorkloadKey {
+        return WorkloadKey.node(nodeId, resultImageSize, resultImageFormat, isPendingRequest)
     }
 
     private fun mandatoryWorkloadKeys(): List<WorkloadKey> {
-        val resultImageSize = captureMetrics.resultImageSize
-        val resultImageFormat = captureMetrics.resultImageFormat
         return listOf(
-            WorkloadKey.encoding(resultImageSize, resultImageFormat),
-            WorkloadKey.saving(resultImageSize, resultImageFormat, isPendingRequest),
+            WorkloadKey.finalizeExecution(captureMetrics.resultImageSize, captureMetrics.resultImageFormat, isPendingRequest),
         )
     }
 
     /**
-     * Wall-clock budget the current stage may run before the mandatory [Encoding, Saving] tail must
-     * start: remaining budget minus UB([Encoding, Saving]). The call site uses this as its Future.get
-     * timeout so a slow quality stage can never eat into the tail's reserved time. Filter preservation
-     * is handled by the next Filter admission check, not by this timeout.
+     * Wall-clock budget the current quality stage may run before FinalizeExecution must start. The call
+     * site uses this as its Future.get timeout so a slow quality stage cannot eat into the mandatory tail.
      */
     private fun processTimeoutMs(preExecutionMetrics: PreExecutionMetrics): Long {
         val tailKey = WorkloadSequenceKey(mandatoryWorkloadKeys())
@@ -217,10 +240,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     /**
-     * One suffix observation: the wall-clock duration of running [sequenceKey] from its first
-     * (admission) stage through saving. Only duration feeds the suffix model, so GC / CPU aren't
-     * tracked here. [remainingStages] is how many stages after the first must still complete for this to
-     * be a valid sample.
+     * One suffix observation: the wall-clock duration from the first admission stage through draft task
+     * completion. Only duration feeds the suffix model. [remainingStages] is how many stages after the
+     * first must still complete for this to be a valid sample.
      */
     private class SuffixObservation(
         val sequenceKey: WorkloadSequenceKey,
@@ -232,65 +254,70 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 }
 
-/**
- * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution].
- *
- * Check [shouldRun] before running the stage; if it is false, skip the stage and drop the session
- * without calling [complete]. When the stage ran to a usable result, call [complete] so the predictor
- * learns from it. A [bounded] (quality) stage must be discarded if it exceeds [getProcessTimeoutMs];
- * an unbounded (mandatory) stage runs to completion. Timing enforcement lives at the call site (a
- * `Future.get` timeout).
- */
-class DraftSequenceExecutionSession internal constructor(
-    /** False when admission rejected the stage: skip it and pass the picture through unchanged. */
-    val shouldRun: Boolean = true,
-    /** Quality stages are bounded by [getProcessTimeoutMs]; mandatory stages run to completion. */
-    val bounded: Boolean = false,
-    private val processTimeoutMs: Long = 0L,
-    private val onComplete: (PostExecutionMetrics) -> Unit = {},
-) {
-    // Measured on the creating thread — correct for a stage that runs start-to-finish there (saving).
-    // A node offloads its work to an executor thread and re-measures it there via runMeasured.
-    private val stopwatch = ExecutionStopwatch()
-    private var workerMeasurement: PostExecutionMetrics? = null
+private class DraftNodeChainLifecycle {
+    private enum class State { ACTIVE, DEINITIALIZE_REQUESTED, DEINITIALIZED }
 
-    /**
-     * Max time the stage may run before the mandatory [Encoding, Saving] tail must start, i.e.
-     * (budget - UB([Encoding, Saving])). Intended as the call site's `Future.get` timeout.
-     */
-    fun getProcessTimeoutMs(): Long = processTimeoutMs
+    private val lock = Any()
+    private var accessor: DraftNodeChainAccessor? = null
+    private var pendingTask: CompletableFuture<Void>? = null
+    private var state = State.ACTIVE
 
-    /**
-     * Runs [work] on the calling thread and measures it there. CPU counters are thread-scoped, so a
-     * stage that executes on its own worker thread (a node on its executor) must be measured on that
-     * thread — call this from inside the worker task, not the thread that created the session.
-     */
-    fun <T> runMeasured(work: Callable<T>): T {
-        val stopwatch = ExecutionStopwatch()
-        try {
-            return work.call()
-        } finally {
-            workerMeasurement = stopwatch.stop()
+    fun reset(accessor: DraftNodeChainAccessor) {
+        synchronized(lock) {
+            this.accessor = accessor
+            pendingTask = null
+            state = State.ACTIVE
         }
     }
 
-    /** Feeds the stage measurement to [onComplete] and returns it. Call at most once, after the run. */
-    fun complete(): PostExecutionMetrics {
-        val postExecutionMetrics = workerMeasurement ?: stopwatch.stop()
-        onComplete(postExecutionMetrics)
-        return postExecutionMetrics
+    fun waitFor(taskFinished: CompletableFuture<Void>) {
+        val shouldDeinitialize = synchronized(lock) {
+            if (state == State.DEINITIALIZED) {
+                return
+            }
+            pendingTask = taskFinished
+            state == State.DEINITIALIZE_REQUESTED
+        }
+        if (shouldDeinitialize) {
+            deinitializeAfter(taskFinished)
+        }
+    }
+
+    fun deinitializeWhenIdle() {
+        val taskFinished = synchronized(lock) {
+            when (state) {
+                State.ACTIVE -> {
+                    state = State.DEINITIALIZE_REQUESTED
+                    pendingTask
+                }
+                State.DEINITIALIZE_REQUESTED, State.DEINITIALIZED -> return
+            }
+        }
+        deinitializeAfter(taskFinished)
+    }
+
+    private fun deinitializeAfter(taskFinished: CompletableFuture<Void>?) {
+        if (taskFinished?.isDone == false) {
+            taskFinished.whenComplete { _, _ -> deinitializeNow() }
+        } else {
+            deinitializeNow()
+        }
+    }
+
+    private fun deinitializeNow() {
+        val accessor = synchronized(lock) {
+            if (state == State.DEINITIALIZED) {
+                return
+            }
+            state = State.DEINITIALIZED
+            accessor
+        } ?: return
+
+        try {
+            accessor.deinitializeNodeChain()
+        } catch (t: Throwable) {
+            CLog.e(TAG, "deinitializeDraftNodeChain error", t)
+        }
     }
 }
 
-/** Measures duration + GC + CPU from construction until [stop]; construct and [stop] on one thread. */
-private class ExecutionStopwatch {
-    private val startedAtMs = SystemClock.uptimeMillis()
-    private val gcTracker = GcTracker()
-    private val cpuProcessingTracker = CpuProcessingTracker()
-
-    fun stop(): PostExecutionMetrics = PostExecutionMetrics(
-        gcSnapshot = gcTracker.delta(),
-        cpuProcessingSnapshot = cpuProcessingTracker.delta(),
-        durationMs = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L),
-    )
-}

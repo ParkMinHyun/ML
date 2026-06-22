@@ -25,6 +25,7 @@ import androidx.annotation.Nullable;
 import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
 import com.samsung.android.camera.core2.processor.request.ProcessRequest;
@@ -81,6 +82,11 @@ public class SavingSingleDraftImageTask extends SavingDraftImageTask {
             originalBuffer.rewind();
             draftJpegNodeChainAccessor.createNodeChain(camCapability);
             draftJpegNodeChainAccessor.configureNodeChain(originalBuffer.getImageInfo(), camCapability, extraBundle, nodeChainConfiguration);
+
+            final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
+            if (null != draftSequenceExecutionProfiler) {
+                draftSequenceExecutionProfiler.setDraftNodeChainAccessor(draftJpegNodeChainAccessor);
+            }
             final ImageBuffer resultBuffer = draftJpegNodeChainAccessor.getNodeChain().processFull(ImageBuffer.class, originalBuffer, extraBundle);
 
             if (!isValidResultBuffer(resultBuffer)){
@@ -92,7 +98,7 @@ public class SavingSingleDraftImageTask extends SavingDraftImageTask {
             PLog.w(TAG, "processDraftImageInternal fail : " + e);
             return getOriginalJpegBuffer();
         } finally {
-            draftJpegNodeChainAccessor.deinitializeNodeChain();
+            deinitializeDraftNodeChain();
             PLog.i(TAG, "processDraftImageInternal(ppSequenceId:%d, sequenceId:%d) X", ppSequenceId, sequenceId);
         }
     }

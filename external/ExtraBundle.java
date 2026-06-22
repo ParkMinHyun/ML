@@ -109,6 +109,7 @@ public class ExtraBundle {
     // metrics
     public static final Key<CaptureMetrics> DATA_CAPTURE_METRICS = new Key<>("data.captureMetrics", CaptureMetrics.class);
     public static final Key<DraftSequenceExecutionProfiler> DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER = new Key<>("data.draftSequenceExectionProfiler", DraftSequenceExecutionProfiler.class);
+    public static final Key<Boolean> DATA_DRAFT_SEQUENCE_ERROR_PROFILER = new Key<>("data.draftSequenceErrorProfiler", Boolean.class);
 
     //should not be changed during processing, Except Dual Bokeh Lite, always Jpeg
     public static final Key<ImageBuffer> DATA_ORIGINAL_DRAFT = new Key<>("data.originalDraft", ImageBuffer.class, ImageBuffer::release);

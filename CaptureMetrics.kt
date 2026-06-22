@@ -17,23 +17,11 @@ data class CaptureMetrics @JvmOverloads constructor(
 data class DraftSequenceMetrics @JvmOverloads constructor(
     val nodeExecutionMetricsList: MutableList<NodeExecutionMetrics> = mutableListOf(),
     val nodeExecutionPredictionList: MutableList<ExecutionPrediction> = mutableListOf(),
-    var savingExecutionMetrics: SavingExecutionMetrics? = null,
-    var savingExecutionPrediction: ExecutionPrediction? = null,
     var isTimeout: Boolean? = false,
 )
 
 data class NodeExecutionMetrics(
     val nodeId: NodeId,
-    val inputImageSize: Size,
-    val outputImageSize: Size,
-    val preExecutionMetrics: PreExecutionMetrics,
-    var postExecutionMetrics: PostExecutionMetrics = PostExecutionMetrics(),
-)
-
-data class SavingExecutionMetrics(
-    val isPendingRequest: Boolean,
-    val resultImageSize: Size,
-    val resultImageFormat: Int,
     val preExecutionMetrics: PreExecutionMetrics,
     var postExecutionMetrics: PostExecutionMetrics = PostExecutionMetrics(),
 )

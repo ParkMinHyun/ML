@@ -20,9 +20,6 @@ abstract class CaptureMetricsDao {
     @Insert
     protected abstract suspend fun insertExecutionPredictions(entities: List<ExecutionPredictionEntity>)
 
-    @Insert
-    protected abstract suspend fun insertSavingExecutionMetrics(entity: SavingExecutionMetricsEntity)
-
     @Transaction
     open suspend fun insertMetrics(metrics: CaptureMetrics): Int {
         val captureMetricsId = insertCaptureMetrics(metrics.toCaptureEntity()).toInt()
@@ -36,18 +33,10 @@ abstract class CaptureMetricsDao {
                 insertNodeExecutionMetrics(nodeExecutionMetricsEntities)
             }
 
-            val predictionEntities = buildList {
-                addAll(draft.nodeExecutionPredictionList.toNodePredictionEntities(captureMetricsId))
-                draft.savingExecutionPrediction?.let {
-                    add(it.toSavingPredictionEntity(captureMetricsId))
-                }
-            }
+            val predictionEntities = draft.nodeExecutionPredictionList
+                .toNodePredictionEntities(captureMetricsId)
             if (predictionEntities.isNotEmpty()) {
                 insertExecutionPredictions(predictionEntities)
-            }
-
-            draft.savingExecutionMetrics?.let { saving ->
-                insertSavingExecutionMetrics(saving.toEntity(captureMetricsId))
             }
         }
 

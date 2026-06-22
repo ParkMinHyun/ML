@@ -101,10 +101,10 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
                 if (FIRST_IMAGE_INDEX == originalBufferList.indexOf(buffer)) {
                     draftJpegNodeChainAccessor.createNodeChain(camCapability);
                     draftJpegNodeChainAccessor.configureNodeChain(buffer.getImageInfo(), camCapability, extraBundle, nodeChainConfiguration);
+                    draftSequenceExecutionProfiler.setDraftNodeChainAccessor(draftJpegNodeChainAccessor);
                 }
 
                 PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process E - " + draftJpegNodeChainAccessor.getConfiguredNodeIdList());
-                draftSequenceExecutionProfiler.setDraftPlan(draftJpegNodeChainAccessor.getConfiguredNodeIdList());
                 resultBuffer = draftJpegNodeChainAccessor.getNodeChain().processFull(ImageBuffer.class, buffer, extraBundle);
                 PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process X");
 
@@ -124,8 +124,7 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
             PLog.w(TAG, "processDraftImageInternal fail : " + e);
             return getOriginalJpegBuffer();
         } finally {
-            draftSequenceExecutionProfiler.profileSavingExecution();
-            draftJpegNodeChainAccessor.deinitializeNodeChain();
+            deinitializeDraftNodeChain();
             PLog.i(TAG, "processDraftImageInternal(ppSequenceId:%d, sequenceId:%d) X", ppSequenceId, sequenceId);
         }
     }

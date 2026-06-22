@@ -91,18 +91,6 @@ data class NodeExecutionMetricsEntity(
     @ColumnInfo(name = "budget_ms")
     val budgetMs: Long,
 
-    @ColumnInfo(name = "input_image_width")
-    val inputImageWidth: Int,
-
-    @ColumnInfo(name = "input_image_height")
-    val inputImageHeight: Int,
-
-    @ColumnInfo(name = "output_image_width")
-    val outputImageWidth: Int,
-
-    @ColumnInfo(name = "output_image_height")
-    val outputImageHeight: Int,
-
     @Embedded(prefix = "memory_")
     val memorySnapshot: MemorySnapshotEntity,
 
@@ -145,11 +133,7 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "capture_metrics_id")
     val captureMetricsId: Int,
 
-    /** [PredictionTarget] discriminator: which execution this prediction is for. */
-    @ColumnInfo(name = "target")
-    val target: String,
-
-    /** Node order within the draft sequence; [SAVING_ORDER] for the saving step. */
+    /** Node order within the draft sequence. */
     @ColumnInfo(name = "order")
     val order: Int,
 
@@ -164,64 +148,6 @@ data class ExecutionPredictionEntity(
         defaultValue = "0",
     )
     val admit: Boolean = false,
-) {
-    enum class PredictionTarget { NODE, SAVING }
-
-    companion object {
-        /** [order] sentinel for the saving prediction (saving has no node order). */
-        const val SAVING_ORDER: Int = -1
-    }
-}
-
-@Entity(
-    tableName = "saving_execution_metrics",
-    foreignKeys = [
-        ForeignKey(
-            entity = CaptureMetricsEntity::class,
-            parentColumns = ["capture_metrics_id"],
-            childColumns = ["capture_metrics_id"],
-            onDelete = ForeignKey.CASCADE,
-        )
-    ],
-    indices = [Index("capture_metrics_id")],
-)
-data class SavingExecutionMetricsEntity(
-    @PrimaryKey
-    @ColumnInfo(name = "capture_metrics_id")
-    val captureMetricsId: Int,
-
-    @ColumnInfo(name = "budget_ms")
-    val budgetMs: Long,
-
-    @ColumnInfo(name = "is_pending_request")
-    val isPendingRequest: Boolean,
-
-    @ColumnInfo(name = "result_image_width")
-    val resultImageWidth: Int,
-
-    @ColumnInfo(name = "result_image_height")
-    val resultImageHeight: Int,
-
-    @ColumnInfo(name = "result_image_format")
-    val resultImageFormat: Int,
-
-    @Embedded(prefix = "memory_")
-    val memorySnapshot: MemorySnapshotEntity,
-
-    @Embedded(prefix = "thermal_")
-    val thermalSnapshot: ThermalSnapshotEntity,
-
-    @Embedded(prefix = "storage_")
-    val storageSnapshot: StorageSnapshotEntity,
-
-    @Embedded(prefix = "gc_")
-    val gcSnapshot: GcSnapshotEntity?,
-
-    @Embedded(prefix = "cpu_processing_")
-    val cpuProcessingSnapshot: CpuProcessingSnapshotEntity?,
-
-    @ColumnInfo(name = "duration_ms")
-    var durationMs: Long,
 )
 
 data class MemorySnapshotEntity(

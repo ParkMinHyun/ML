@@ -23,7 +23,7 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * Admission against a dynamically-built remaining suffix, e.g. Bokeh entry ->
-     * [Bokeh, Filter, Encoding, Saving], Filter entry -> [Filter, Encoding, Saving]. Admits when the
+     * [Bokeh, Filter, FinalizeExecution], Filter entry -> [Filter, FinalizeExecution]. Admits when the
      * predicted suffix upper bound fits the remaining budget.
      */
     @Synchronized
@@ -43,31 +43,22 @@ class DraftSequenceExecutionPredictor {
     }
 
     @Synchronized
-    fun updateNodeExecution(nodeExecutionMetrics: NodeExecutionMetrics, outputImageFormat: Int) {
+    fun updateNodeExecution(
+        nodeExecutionMetrics: NodeExecutionMetrics,
+        resultImageSize: Size,
+        resultImageFormat: Int,
+        isPendingRequest: Boolean,
+    ) {
         val workloadKey = WorkloadKey.node(
             nodeExecutionMetrics.nodeId,
-            nodeExecutionMetrics.inputImageSize,
-            nodeExecutionMetrics.outputImageSize,
-            outputImageFormat,
+            resultImageSize,
+            resultImageFormat,
+            isPendingRequest,
         )
         updateModel(WorkloadSequenceKey(workloadKey), nodeExecutionMetrics.postExecutionMetrics.durationMs)
     }
 
-    @Synchronized
-    fun updateSavingExecution(savingExecutionMetrics: SavingExecutionMetrics) {
-        updateModel(
-            WorkloadSequenceKey(
-                WorkloadKey.saving(
-                    savingExecutionMetrics.resultImageSize,
-                    savingExecutionMetrics.resultImageFormat,
-                    savingExecutionMetrics.isPendingRequest,
-                ),
-            ),
-            savingExecutionMetrics.postExecutionMetrics.durationMs,
-        )
-    }
-
-    /** Records the observed duration from the start of a suffix to final saving completion. */
+    /** Records the observed duration from the start of a suffix to draft task completion. */
     @Synchronized
     fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long) {
         updateModel(sequenceKey, observedDurationMs)
@@ -194,7 +185,7 @@ enum class SizeBucket(val megaPixels: Int) {
  * Stable workload bucket shared by every predictor.
  *
  * New admission-capable stages should be added here once, then [WorkloadSequenceKey] will compose
- * them into plan suffixes automatically. No new `BokehFilterTail`-style group type is required.
+ * them into plan suffixes automatically. No new group type is required.
  */
 sealed interface WorkloadKey {
 
@@ -202,16 +193,17 @@ sealed interface WorkloadKey {
 
     data class Filter(val sizeBucket: SizeBucket) : WorkloadKey
 
-    data class Encoding(val sizeBucket: SizeBucket, val imageFormat: Int) : WorkloadKey
+    data class Watermark(val sizeBucket: SizeBucket) : WorkloadKey
 
-    data class Saving(
+    /** Mandatory tail from ImageCodec entry through saved draft task completion. */
+    data class FinalizeExecution(
         val sizeBucket: SizeBucket,
         val imageFormat: Int,
         val isPendingRequest: Boolean,
     ) : WorkloadKey
 
     companion object {
-        /** Bokeh and Filter are quality/admission stages; Encoding and Saving are mandatory tail. */
+        /** Bokeh and Filter are quality/admission stages; FinalizeExecution is the mandatory tail. */
         fun isAdmissionStageNode(nodeId: NodeId): Boolean {
             return when (nodeId) {
                 NodeId.NODE_SEC_V1_DUAL_BOKEH,
@@ -222,39 +214,37 @@ sealed interface WorkloadKey {
             }
         }
 
-        /** Only the predictable nodes (Bokeh / Filter / Encoding) have a workload key; others are a bug here. */
+        fun isFinalizeExecutionNode(nodeId: NodeId): Boolean {
+            return nodeId == NodeId.NODE_SEC_V2_IMAGE_CODEC
+        }
+
+        /** Only predictable nodes (Bokeh / Filter / ImageCodec finalize) have a workload key. */
         fun node(
             nodeId: NodeId,
-            inputImageSize: Size,
-            outputImageSize: Size,
-            outputImageFormat: Int,
+            resultImageSize: Size,
+            resultImageFormat: Int,
+            isPendingRequest: Boolean,
         ): WorkloadKey {
             return when (nodeId) {
                 NodeId.NODE_SEC_V1_DUAL_BOKEH,
                 NodeId.NODE_SEC_V1_1_DUAL_BOKEH,
-                NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(outputImageSize))
-                NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(inputImageSize))
-                NodeId.NODE_SEC_V2_IMAGE_CODEC -> Encoding(SizeBucket.of(outputImageSize), outputImageFormat)
+                NodeId.NODE_SEC_V2_DUAL_BOKEH -> Bokeh(SizeBucket.of(resultImageSize))
+                NodeId.NODE_SEC_FILTER -> Filter(SizeBucket.of(resultImageSize))
+                NodeId.NODE_WATERMARK -> Watermark(SizeBucket.of(resultImageSize))
+                NodeId.NODE_SEC_V2_IMAGE_CODEC -> finalizeExecution(resultImageSize, resultImageFormat, isPendingRequest)
                 else -> error("WorkloadKey.node: unsupported nodeId $nodeId")
             }
         }
 
-        fun encoding(resultImageSize: Size, resultImageFormat: Int): WorkloadKey {
-            return Encoding(SizeBucket.of(resultImageSize), resultImageFormat)
-        }
-
-        fun saving(resultImageSize: Size, resultImageFormat: Int, isPendingRequest: Boolean): WorkloadKey {
-            return Saving(SizeBucket.of(resultImageSize), resultImageFormat, isPendingRequest)
+        fun finalizeExecution(resultImageSize: Size, resultImageFormat: Int, isPendingRequest: Boolean): WorkloadKey {
+            return FinalizeExecution(SizeBucket.of(resultImageSize), resultImageFormat, isPendingRequest)
         }
     }
 }
 
 /**
- * Ordered key for the remaining suffix of a draft sequence, e.g. [Bokeh, Filter, Encoding, Saving].
+ * Ordered key for the remaining suffix of a draft sequence, e.g. [Bokeh, Filter, FinalizeExecution].
  * The model only stores suffixes actually predicted/observed, so key growth is linear in executed plans.
- *
- * ponytail: no defensive copy - every call site passes a freshly built list. Copy in the constructor
- * if a caller ever mutates a list after using it as a key.
  */
 data class WorkloadSequenceKey(val workloads: List<WorkloadKey>) {
     constructor(workloadKey: WorkloadKey) : this(listOf(workloadKey))
