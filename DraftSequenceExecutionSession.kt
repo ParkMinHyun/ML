@@ -21,14 +21,14 @@ class DraftSequenceExecutionSession private constructor(
     private val shouldRun: Boolean = true,
     private val processTimeoutMs: Long = 0L,
     private val onCancel: () -> Unit = {},
-    private val onTimedOutTask: (CompletableFuture<Void>) -> Unit = {},
+    private val onTimedOutTask: (CompletableFuture<*>) -> Unit = {},
     private val onComplete: (PostExecutionMetrics) -> Unit = {},
 ) {
     companion object {
         internal fun bounded(
             shouldRun: Boolean,
             processTimeoutMs: Long,
-            onTimedOutTask: (CompletableFuture<Void>) -> Unit,
+            onTimedOutTask: (CompletableFuture<*>) -> Unit,
             onComplete: (PostExecutionMetrics) -> Unit,
         ): DraftSequenceExecutionSession {
             return DraftSequenceExecutionSession(
@@ -81,33 +81,28 @@ class DraftSequenceExecutionSession private constructor(
         }
     }
 
-    @Throws(Exception::class)
     private fun <T> executeOnWorker(task: Callable<T>): T? {
-        val executorService = Executors.newSingleThreadExecutor()
-        val taskCompletion = CompletableFuture<T?>()
-        val taskFinished = CompletableFuture<Void>()
-        val future = executorService.submit<T?> {
+        val executor = Executors.newSingleThreadExecutor()
+        val result = CompletableFuture<T?>()
+        val future = executor.submit<T?> {
             try {
-                task.call().also(taskCompletion::complete)
+                task.call().also(result::complete)
             } catch (t: Throwable) {
-                taskCompletion.completeExceptionally(t)
+                result.completeExceptionally(t)
                 throw t
-            } finally {
-                taskFinished.complete(null)
             }
         }
         try {
             return future.get(processTimeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
-            taskCompletion.thenAccept(this::releaseTimedOutResult)
-            onTimedOutTask(taskFinished)
-            future.cancel(true)
-            throw e
-        } catch (e: Exception) {
-            future.cancel(true)
+            // The worker keeps running detached: release its late result, and hand its future to the
+            // node chain so it defers deinit until the worker actually finishes.
+            result.thenAccept(::releaseTimedOutResult)
+            onTimedOutTask(result)
             throw e
         } finally {
-            executorService.shutdownNow()
+            future.cancel(true)
+            executor.shutdownNow()
         }
     }
 

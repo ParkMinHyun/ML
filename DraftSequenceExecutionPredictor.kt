@@ -7,34 +7,36 @@ import kotlin.math.ceil
 import kotlin.math.roundToLong
 
 /**
- * EWMA cost model for draft-sequence admission.
+ * Thermal-bucketed EWMA cost model for draft-sequence admission.
  *
- * Every learned cost is keyed by a [WorkloadSequenceKey] mapping to an EWMA mean plus a positive-residual
- * quantile (point estimate + upper bound). A single stage is just a length-1 sequence, so one map serves
- * both the per-stage fallback and the per-suffix bound.
+ * Every learned cost is keyed by a [WorkloadSequenceKey]. Each entry keeps a global EWMA plus a per
+ * thermalStatus EWMA bucket, sharing one positive-residual quantile for the upper-bound margin. A single
+ * stage is just a length-1 sequence, so one map serves both the per-stage fallback and the per-suffix bound.
  *
- * [predictAdmission] uses the learned suffix bound once that exact suffix has enough samples, otherwise
- * it blends toward the conservative per-stage upper-bound sum. Suffix keys are plain ordered lists, so
- * adding a stage needs only a new [WorkloadKey] mapping - no new hand-written combination class.
+ * Prediction prefers the current thermalStatus bucket, falls back to the global EWMA, then to the
+ * cold-start policy below: [predictAdmission] uses the learned suffix bound once that exact suffix has
+ * enough samples, otherwise it blends toward the conservative per-stage upper-bound sum. Suffix keys are
+ * plain ordered lists, so adding a stage needs only a new [WorkloadKey] mapping - no new combination class.
  */
 class DraftSequenceExecutionPredictor {
 
-    private val models = mutableMapOf<WorkloadSequenceKey, EwmaModel>()
+    private val models = mutableMapOf<WorkloadSequenceKey, ThermalBucketedEwmaModel>()
 
     /**
      * Admission against a dynamically-built remaining suffix, e.g. Bokeh entry ->
      * [Bokeh, Filter, FinalizeExecution], Filter entry -> [Filter, FinalizeExecution]. Admits when the
-     * predicted suffix upper bound fits the remaining budget.
+     * predicted suffix upper bound fits the remaining budget. Predictions use the current thermalStatus.
      */
     @Synchronized
     fun predictAdmission(
         sequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): ExecutionPrediction {
+        val thermalStatus = preExecutionMetrics.thermalSnapshot.thermalStatus
         val fallback = sequenceKey.workloads.fold(WorkloadPrediction.ZERO) { acc, key ->
-            acc + predictWorkload(key)
+            acc + predictWorkload(key, thermalStatus)
         }
-        val prediction = predictWorkloadSequence(sequenceKey, fallback)
+        val prediction = predictWorkloadSequence(sequenceKey, thermalStatus, fallback)
         return ExecutionPrediction(
             admit = prediction.predictedUpperBoundMs <= preExecutionMetrics.budgetMs,
             predictedDurationMs = prediction.predictedDurationMs,
@@ -55,26 +57,31 @@ class DraftSequenceExecutionPredictor {
             resultImageFormat,
             isPendingRequest,
         )
-        updateModel(WorkloadSequenceKey(workloadKey), nodeExecutionMetrics.postExecutionMetrics.durationMs)
+        updateModel(
+            WorkloadSequenceKey(workloadKey),
+            nodeExecutionMetrics.postExecutionMetrics.durationMs,
+            nodeExecutionMetrics.preExecutionMetrics.thermalSnapshot.thermalStatus,
+        )
     }
 
     /** Records the observed duration from the start of a suffix to draft task completion. */
     @Synchronized
-    fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long) {
-        updateModel(sequenceKey, observedDurationMs)
+    fun updateWorkloadSequence(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long, thermalStatus: Int) {
+        updateModel(sequenceKey, observedDurationMs, thermalStatus)
     }
 
     /** Unseen stage predicts zero: an optimistic cold start that admission tightens as it learns. */
-    private fun predictWorkload(workloadKey: WorkloadKey): WorkloadPrediction {
-        return models[WorkloadSequenceKey(workloadKey)]?.prediction() ?: WorkloadPrediction.ZERO
+    private fun predictWorkload(workloadKey: WorkloadKey, thermalStatus: Int): WorkloadPrediction {
+        return models[WorkloadSequenceKey(workloadKey)]?.prediction(thermalStatus) ?: WorkloadPrediction.ZERO
     }
 
     private fun predictWorkloadSequence(
         sequenceKey: WorkloadSequenceKey,
+        thermalStatus: Int,
         fallback: WorkloadPrediction,
     ): WorkloadPrediction {
         val model = models[sequenceKey] ?: return fallback
-        val direct = model.prediction()
+        val direct = model.prediction(thermalStatus)
         if (model.count >= DIRECT_PREDICTION_MIN_SAMPLES) {
             return direct
         }
@@ -83,9 +90,9 @@ class DraftSequenceExecutionPredictor {
         return blend(fallback, direct, model.count.toDouble() / DIRECT_PREDICTION_MIN_SAMPLES)
     }
 
-    private fun updateModel(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long) {
-        models.getOrPut(sequenceKey) { EwmaModel() }
-            .update(observedDurationMs.coerceAtLeast(0L))
+    private fun updateModel(sequenceKey: WorkloadSequenceKey, observedDurationMs: Long, thermalStatus: Int) {
+        models.getOrPut(sequenceKey) { ThermalBucketedEwmaModel() }
+            .update(observedDurationMs.coerceAtLeast(0L), thermalStatus)
     }
 
     private fun blend(low: WorkloadPrediction, high: WorkloadPrediction, highWeight: Double): WorkloadPrediction {
@@ -111,20 +118,46 @@ class DraftSequenceExecutionPredictor {
         }
     }
 
-    /** EWMA mean plus a rolling positive-residual quantile, for one workload or one suffix. */
-    private class EwmaModel {
+    /**
+     * Point estimate for one workload (or suffix): a global EWMA plus per-thermalStatus EWMA buckets,
+     * sharing one rolling positive-residual quantile that supplies the upper-bound margin.
+     *
+     * The global EWMA adapts with a fixed alpha; each bucket adapts with an asymmetric alpha - faster
+     * ([BUCKET_ALPHA_UP]) when the stage overran its estimate or thermalStatus rose, slower
+     * ([BUCKET_ALPHA_DOWN]) otherwise - so cooling decays the estimate gently while heating reacts quickly.
+     */
+    private class ThermalBucketedEwmaModel {
         var count: Int = 0
             private set
-        private var ewmaMs: Double = 0.0
+        private var globalMs: Double = 0.0
+        private val bucketMs = mutableMapOf<Int, Double>()
         private val positiveResiduals = ArrayDeque<Double>()
+        private var previousThermalStatus = 0
 
-        fun update(observedMs: Long) {
+        /** Baseline point estimate (ms) for [thermalStatus]: its bucket if seen, else the global EWMA. */
+        private fun pointMs(thermalStatus: Int): Double = bucketMs[thermalStatus] ?: globalMs
+
+        fun prediction(thermalStatus: Int): WorkloadPrediction {
+            val pointMs = pointMs(thermalStatus)
+            val durationMs = pointMs.roundToNonNegativeLong()
+            val upperBoundMs = (pointMs + residualQuantile())
+                .roundToNonNegativeLong()
+                .coerceAtLeast(durationMs)
+            return WorkloadPrediction(durationMs, upperBoundMs)
+        }
+
+        fun update(observedMs: Long, thermalStatus: Int) {
             if (observedMs <= 0L) {
                 return
             }
-            val predictedMs = ewmaMs.roundToNonNegativeLong()
-            ewmaMs = if (count == 0) observedMs.toDouble() else EWMA_ALPHA * observedMs + (1.0 - EWMA_ALPHA) * ewmaMs
+            val observed = observedMs.toDouble()
+            val predictedMs = pointMs(thermalStatus).roundToNonNegativeLong()
+
+            updateBucket(observed, thermalStatus)
+            globalMs = if (count == 0) observed else GLOBAL_ALPHA * observed + (1.0 - GLOBAL_ALPHA) * globalMs
             count++
+            previousThermalStatus = thermalStatus
+
             if (predictedMs > 0L) {
                 positiveResiduals.addLast((observedMs - predictedMs).coerceAtLeast(0L).toDouble())
                 while (positiveResiduals.size > RESIDUAL_WINDOW_SIZE) {
@@ -133,12 +166,16 @@ class DraftSequenceExecutionPredictor {
             }
         }
 
-        fun prediction(): WorkloadPrediction {
-            val durationMs = ewmaMs.roundToNonNegativeLong()
-            val upperBoundMs = (ewmaMs + residualQuantile())
-                .roundToNonNegativeLong()
-                .coerceAtLeast(durationMs)
-            return WorkloadPrediction(durationMs, upperBoundMs)
+        /** Asymmetric-alpha EWMA for the current bucket, seeded from the global EWMA when first seen. */
+        private fun updateBucket(observed: Double, thermalStatus: Int) {
+            val predicted = bucketMs[thermalStatus] ?: globalMs
+            val alpha = when {
+                count == 0 -> 1.0
+                observed > predicted -> BUCKET_ALPHA_UP
+                thermalStatus > previousThermalStatus -> BUCKET_ALPHA_UP
+                else -> BUCKET_ALPHA_DOWN
+            }
+            bucketMs[thermalStatus] = alpha * observed + (1.0 - alpha) * predicted
         }
 
         private fun residualQuantile(): Double {
@@ -156,7 +193,9 @@ class DraftSequenceExecutionPredictor {
         @JvmStatic
         val instance = DraftSequenceExecutionPredictor()
 
-        private const val EWMA_ALPHA = 0.20
+        private const val GLOBAL_ALPHA = 0.25
+        private const val BUCKET_ALPHA_UP = 0.30
+        private const val BUCKET_ALPHA_DOWN = 0.20
         private const val RESIDUAL_WINDOW_SIZE = 96
         private const val RESIDUAL_QUANTILE = 0.95
         private const val DIRECT_PREDICTION_MIN_SAMPLES = 4

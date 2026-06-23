@@ -41,7 +41,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private var finalizeExecutionSession: DraftSequenceExecutionSession? = null
 
     fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
-        nodeChainLifecycle.reset(accessor)
+        nodeChainLifecycle.setAccessor(accessor)
         updateDraftPlan(accessor.configuredNodeIdList)
     }
 
@@ -128,7 +128,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val suffixKey = admissionSuffixKey(nodeId, resultImageSize, resultImageFormat)
         val prediction = predictor.predictAdmission(suffixKey, preExecutionMetrics)
         val timeoutMs = processTimeoutMs(preExecutionMetrics)
-        val suffixObservation = SuffixObservation(suffixKey)
+        val suffixObservation = SuffixObservation(suffixKey, preExecutionMetrics.thermalSnapshot.thermalStatus)
 
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionPredictionList += prediction
@@ -188,7 +188,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             completed
         }
         completedObservations.forEach { observation ->
-            predictor.updateWorkloadSequence(observation.sequenceKey, observation.durationMs())
+            predictor.updateWorkloadSequence(observation.sequenceKey, observation.durationMs(), observation.thermalStatus)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
@@ -246,6 +246,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      */
     private class SuffixObservation(
         val sequenceKey: WorkloadSequenceKey,
+        val thermalStatus: Int,
     ) {
         var remainingStages: Int = sequenceKey.workloads.size - 1
         private val startedAtMs = SystemClock.uptimeMillis()
@@ -254,69 +255,58 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 }
 
+/**
+ * Owns the draft node chain's deinit timing. Normally [deinitializeWhenIdle] deinitializes at once,
+ * but a stage that timed out leaves its worker running on the chain; [waitFor] records that worker so
+ * deinit is deferred until it actually finishes. Deinit runs exactly once.
+ *
+ * Single-use, one instance per draft sequence. [waitFor] (process thread, during node execution)
+ * always runs before [deinitializeWhenIdle] (process thread, at task end), so recording the worker is
+ * enough - there is no request/worker ordering to reconcile.
+ */
 private class DraftNodeChainLifecycle {
-    private enum class State { ACTIVE, DEINITIALIZE_REQUESTED, DEINITIALIZED }
-
     private val lock = Any()
     private var accessor: DraftNodeChainAccessor? = null
-    private var pendingTask: CompletableFuture<Void>? = null
-    private var state = State.ACTIVE
+    private var pendingWorker: CompletableFuture<*>? = null
+    private var deinitialized = false
 
-    fun reset(accessor: DraftNodeChainAccessor) {
+    fun setAccessor(accessor: DraftNodeChainAccessor) {
         synchronized(lock) {
             this.accessor = accessor
-            pendingTask = null
-            state = State.ACTIVE
         }
     }
 
-    fun waitFor(taskFinished: CompletableFuture<Void>) {
-        val shouldDeinitialize = synchronized(lock) {
-            if (state == State.DEINITIALIZED) {
-                return
-            }
-            pendingTask = taskFinished
-            state == State.DEINITIALIZE_REQUESTED
-        }
-        if (shouldDeinitialize) {
-            deinitializeAfter(taskFinished)
+    /** A timed-out stage's worker is still running on the chain; defer deinit until it finishes. */
+    fun waitFor(worker: CompletableFuture<*>) {
+        synchronized(lock) {
+            pendingWorker = worker
         }
     }
 
+    /** Deinitializes the chain exactly once, after the pending timed-out worker (if any) finishes. */
     fun deinitializeWhenIdle() {
-        val taskFinished = synchronized(lock) {
-            when (state) {
-                State.ACTIVE -> {
-                    state = State.DEINITIALIZE_REQUESTED
-                    pendingTask
-                }
-                State.DEINITIALIZE_REQUESTED, State.DEINITIALIZED -> return
-            }
-        }
-        deinitializeAfter(taskFinished)
-    }
-
-    private fun deinitializeAfter(taskFinished: CompletableFuture<Void>?) {
-        if (taskFinished?.isDone == false) {
-            taskFinished.whenComplete { _, _ -> deinitializeNow() }
-        } else {
-            deinitializeNow()
-        }
-    }
-
-    private fun deinitializeNow() {
-        val accessor = synchronized(lock) {
-            if (state == State.DEINITIALIZED) {
+        val (accessor, worker) = synchronized(lock) {
+            if (deinitialized) {
                 return
             }
-            state = State.DEINITIALIZED
-            accessor
-        } ?: return
+            deinitialized = true
+            Pair(accessor, pendingWorker)
+        }
+        if (accessor == null) {
+            return
+        }
 
-        try {
-            accessor.deinitializeNodeChain()
-        } catch (t: Throwable) {
-            CLog.e(TAG, "deinitializeDraftNodeChain error", t)
+        val deinit = {
+            try {
+                accessor.deinitializeNodeChain()
+            } catch (t: Throwable) {
+                CLog.e(TAG, "deinitializeDraftNodeChain error", t)
+            }
+        }
+        if (worker == null || worker.isDone) {
+            deinit()
+        } else {
+            worker.whenComplete { _, _ -> deinit() }
         }
     }
 }
