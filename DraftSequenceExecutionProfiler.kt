@@ -187,7 +187,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private fun rememberDecision(decision: SeqPawDecision) {
         synchronized(sequenceLock) {
-            sequenceSnapshots[decision.nodeSnapshot.sequenceKey] = decision.nodeSnapshot
             sequenceSnapshots[decision.sequenceSnapshot.sequenceKey] = decision.sequenceSnapshot
         }
     }

@@ -33,13 +33,10 @@ class DraftSequenceExecutionPredictor {
                 sequencePredictedDurationMs = sequencePrediction.predictedMs.roundToNonNegativeLong(),
                 sequencePredictedUpperBoundMs = sequencePrediction.upperBoundMs.roundToNonNegativeLong(),
             ),
-            nodeSnapshot = SequencePredictionSnapshot(
-                sequenceKey = nodeKey,
-                predictedMs = nodePrediction.predictedMs,
-            ),
             sequenceSnapshot = SequencePredictionSnapshot(
                 sequenceKey = sequenceKey,
                 predictedMs = sequencePrediction.predictedMs,
+                workloadPredictedMs = sequenceKey.workloads.associateWith(::predictedWorkloadDuration),
             ),
         )
     }
@@ -75,9 +72,9 @@ class DraftSequenceExecutionPredictor {
         predictionSnapshots: Collection<SequencePredictionSnapshot>,
     ) {
         val samples = predictionSnapshots.mapNotNull { snapshot ->
-            val actualMs = actualSequenceDuration(snapshot.sequenceKey, workloadDurations) ?: return@mapNotNull null
-            val score = score(snapshot.predictedMs, actualMs) ?: return@mapNotNull null
-            snapshot.sequenceKey to ScoreSample(score = score, sourcePredictedMs = snapshot.predictedMs)
+            val clampedActualMs = clampedActualDuration(snapshot, workloadDurations) ?: return@mapNotNull null
+            val score = score(snapshot.predictedMs, clampedActualMs) ?: return@mapNotNull null
+            snapshot.sequenceKey to ScoreSample(score = score)
         }
 
         if (samples.isEmpty()) {
@@ -100,6 +97,9 @@ class DraftSequenceExecutionPredictor {
         for (index in indices) {
             this[index] = this[index].decayed(SCORE_WEIGHT_DECAY)
         }
+        // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
+        // At alpha=0.2 a sample older than ~60 captures weighs < 1e-6 and no longer moves any quantile.
+        removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
     }
 
     private fun predictSequence(sequenceKey: WorkloadSequenceKey): SequencePrediction {
@@ -129,16 +129,7 @@ class DraftSequenceExecutionPredictor {
             return 0.0
         }
 
-        val score = calibratedScore(sequenceKey, predictedMs)
-        return sequenceKey.workloads.sumOf { workloadKey ->
-            val workloadPredictedMs = predictedWorkloadDuration(workloadKey)
-            if (workloadPredictedMs <= 0.0) {
-                0.0
-            } else {
-                val workloadWeight = workloadPredictedMs / predictedMs
-                workloadPredictedMs * exp(score * workloadWeight)
-            }
-        }
+        return predictedMs * exp(calibratedScore(sequenceKey))
     }
 
     private fun predictedDuration(sequenceKey: WorkloadSequenceKey): Double {
@@ -149,22 +140,27 @@ class DraftSequenceExecutionPredictor {
         return workloadModels[workloadKey]?.predictionMs() ?: 0.0
     }
 
-    private fun calibratedScore(sequenceKey: WorkloadSequenceKey, targetPredictedMs: Double): Double {
+    private fun calibratedScore(sequenceKey: WorkloadSequenceKey): Double {
         return calibratedScore(
-            targetPredictedMs = targetPredictedMs,
             sequenceSamples = sequenceScoreSamples[sequenceKey].orEmpty(),
             globalSamples = globalScoreSamples,
         )
     }
 
-    private fun actualSequenceDuration(
-        sequenceKey: WorkloadSequenceKey,
+    /**
+     * Containment-scoped actual: each node contributes max(its decision-time prediction, its actual), so a single
+     * node's overrun is reflected at the sequence's scale even when another node happened to run fast that capture.
+     * Returns null if any node in the sequence did not run (incomplete sequence cannot be scored).
+     */
+    private fun clampedActualDuration(
+        snapshot: SequencePredictionSnapshot,
         workloadDurations: Map<WorkloadKey, Long>,
     ): Double? {
         var total = 0.0
-        for (workloadKey in sequenceKey.workloads) {
-            val durationMs = workloadDurations[workloadKey] ?: return null
-            total += durationMs.toDouble()
+        for (workloadKey in snapshot.sequenceKey.workloads) {
+            val actualMs = workloadDurations[workloadKey] ?: return null
+            val predictedMs = snapshot.workloadPredictedMs[workloadKey] ?: 0.0
+            total += maxOf(predictedMs, actualMs.toDouble())
         }
         return total.takeIf { it > 0.0 }
     }
@@ -209,12 +205,12 @@ class DraftSequenceExecutionPredictor {
 
         private const val WORKLOAD_EWMA_ALPHA = 0.20
         private const val SCORE_WEIGHT_DECAY = 1.0 - WORKLOAD_EWMA_ALPHA
+        private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
     }
 }
 
 data class SeqPawDecision(
     val executionPrediction: ExecutionPrediction,
-    val nodeSnapshot: SequencePredictionSnapshot,
     val sequenceSnapshot: SequencePredictionSnapshot,
 )
 
@@ -226,25 +222,15 @@ data class SeqPawTimeoutDecision(
 data class SequencePredictionSnapshot(
     val sequenceKey: WorkloadSequenceKey,
     val predictedMs: Double,
+    /** Per-workload decision-time prediction, used to clamp node underruns so one node's spike is not diluted. */
+    val workloadPredictedMs: Map<WorkloadKey, Double>,
 )
 
 data class ScoreSample(
     val score: Double,
-    val sourcePredictedMs: Double,
     val weight: Double = 1.0,
 ) {
     fun decayed(factor: Double): ScoreSample = copy(weight = weight * factor)
-}
-
-fun ScoreSample.scaledForTarget(targetPredictedMs: Double): ScoreSample? {
-    if (sourcePredictedMs <= 0.0 || targetPredictedMs <= 0.0) {
-        return null
-    }
-
-    val smallerWeight = minOf(sourcePredictedMs, targetPredictedMs)
-    val largerWeight = maxOf(sourcePredictedMs, targetPredictedMs)
-    val relativeWeight = smallerWeight / largerWeight
-    return copy(score = score * relativeWeight)
 }
 
 
@@ -296,18 +282,16 @@ fun quantileScore(samples: List<ScoreSample>): Double {
 }
 
 fun calibratedScore(
-    targetPredictedMs: Double,
     sequenceSamples: List<ScoreSample>,
     globalSamples: List<ScoreSample>,
 ): Double {
-    if (targetPredictedMs <= 0.0) {
-        return 0.0
+    // Each sequence's bound comes from its OWN residual tail (defensible, no cross-sequence contamination).
+    // The pooled-global tail is only a cold-start prior for a sequence we have never observed yet.
+    return if (sequenceSamples.isNotEmpty()) {
+        quantileScore(sequenceSamples)
+    } else {
+        quantileScore(globalSamples)
     }
-
-    val weightedSamples = (globalSamples + sequenceSamples).mapNotNull { sample ->
-        sample.scaledForTarget(targetPredictedMs)
-    }
-    return quantileScore(weightedSamples)
 }
 
 private fun Double.roundToNonNegativeLong(): Long = when {
