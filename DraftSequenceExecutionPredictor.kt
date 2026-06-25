@@ -137,7 +137,19 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun predictedWorkloadDuration(workloadKey: WorkloadKey): Double {
-        return workloadModels[workloadKey]?.predictionMs() ?: 0.0
+        workloadModels[workloadKey]?.let { return it.predictionMs() }
+        // No model for this resolution yet: borrow the slowest same-workload model from other resolutions, so a new
+        // size still gets a real prediction (hence admission control + the global residual) instead of a blind bypass.
+        return workloadModels
+            .filterKeys { it.substitutesFor(workloadKey) }
+            .values.maxOfOrNull { it.predictionMs() } ?: 0.0
+    }
+
+    /** A model may stand in for an unseen resolution of the same workload (Encoding also matches format/pending). */
+    private fun WorkloadKey.substitutesFor(other: WorkloadKey): Boolean = when {
+        this is WorkloadKey.Encoding && other is WorkloadKey.Encoding ->
+            imageFormat == other.imageFormat && isPendingRequest == other.isPendingRequest
+        else -> this::class == other::class
     }
 
     private fun calibratedScore(sequenceKey: WorkloadSequenceKey): Double {
