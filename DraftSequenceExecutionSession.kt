@@ -13,44 +13,17 @@ import java.util.concurrent.TimeoutException
 private const val TAG = "DraftSequenceExecutionSession"
 
 /**
- * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution]. It owns the execution
- * policy for admission skip, worker timeout, deferred completion, and metric completion.
+ * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution]. It owns admission skip,
+ * optional worker timeout, delayed completion, and metric completion.
  */
-class DraftSequenceExecutionSession private constructor(
-    private val mode: ExecutionMode,
+class DraftSequenceExecutionSession internal constructor(
     private val shouldRun: Boolean = true,
-    private val processTimeoutMs: Long = 0L,
+    private val processTimeoutMs: Long? = null,
+    private val completeOnReturn: Boolean = true,
     private val onCancel: () -> Unit = {},
-    private val onTimedOutTask: (CompletableFuture<*>) -> Unit = {},
     private val onComplete: (PostExecutionMetrics) -> Unit = {},
+    private val onTimedOutTask: (CompletableFuture<*>) -> Unit = {},
 ) {
-    companion object {
-        internal fun bounded(
-            shouldRun: Boolean,
-            processTimeoutMs: Long,
-            onTimedOutTask: (CompletableFuture<*>) -> Unit,
-            onComplete: (PostExecutionMetrics) -> Unit,
-        ): DraftSequenceExecutionSession {
-            return DraftSequenceExecutionSession(
-                mode = ExecutionMode.BOUNDED_WORKER,
-                shouldRun = shouldRun,
-                processTimeoutMs = processTimeoutMs,
-                onTimedOutTask = onTimedOutTask,
-                onComplete = onComplete,
-            )
-        }
-
-        internal fun deferred(
-            onCancel: () -> Unit,
-            onComplete: (PostExecutionMetrics) -> Unit,
-        ): DraftSequenceExecutionSession {
-            return DraftSequenceExecutionSession(
-                mode = ExecutionMode.DEFERRED,
-                onCancel = onCancel,
-                onComplete = onComplete,
-            )
-        }
-    }
 
     private val startedAtMs = SystemClock.uptimeMillis()
     private val gcTracker = GcTracker()
@@ -65,13 +38,13 @@ class DraftSequenceExecutionSession private constructor(
         }
 
         return try {
-            val result = when (mode) {
-                ExecutionMode.BOUNDED_WORKER -> executeOnWorker(task)
-                ExecutionMode.DEFERRED -> task.call()
-            }
+            val result = processTimeoutMs?.let { timeoutMs ->
+                executeOnWorker(task, timeoutMs)
+            } ?: task.call()
+
             if (result == null) {
                 cancel()
-            } else if (mode.completeOnReturn) {
+            } else if (completeOnReturn) {
                 complete()
             }
             result
@@ -81,7 +54,7 @@ class DraftSequenceExecutionSession private constructor(
         }
     }
 
-    private fun <T> executeOnWorker(task: Callable<T>): T? {
+    private fun <T> executeOnWorker(task: Callable<T>, timeoutMs: Long): T? {
         val executor = Executors.newSingleThreadExecutor()
         val result = CompletableFuture<T?>()
         val future = executor.submit<T?> {
@@ -93,7 +66,7 @@ class DraftSequenceExecutionSession private constructor(
             }
         }
         try {
-            return future.get(processTimeoutMs, TimeUnit.MILLISECONDS)
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
             // The worker keeps running detached: release its late result, and hand its future to the
             // node chain so it defers deinit until the worker actually finishes.
@@ -119,7 +92,7 @@ class DraftSequenceExecutionSession private constructor(
         }
     }
 
-    /** Feeds the stage measurement to [onComplete] and returns it. */
+    /** Feeds the workload measurement to [onComplete] and returns it. */
     @Synchronized
     fun complete(): PostExecutionMetrics {
         val postExecutionMetrics = PostExecutionMetrics(
@@ -142,9 +115,4 @@ class DraftSequenceExecutionSession private constructor(
             onCancel()
         }
     }
-}
-
-private enum class ExecutionMode(val completeOnReturn: Boolean) {
-    BOUNDED_WORKER(completeOnReturn = true),
-    DEFERRED(completeOnReturn = false),
 }

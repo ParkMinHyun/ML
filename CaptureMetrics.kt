@@ -1,7 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
 import android.util.Size
-import com.samsung.android.camera.core2.node.NodeId
 
 data class CaptureMetrics @JvmOverloads constructor(
     val ppSequenceId: Int,
@@ -21,7 +20,7 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
 )
 
 data class NodeExecutionMetrics(
-    val nodeId: NodeId,
+    val nodeName: String,
     val preExecutionMetrics: PreExecutionMetrics,
     var postExecutionMetrics: PostExecutionMetrics = PostExecutionMetrics(),
 )
@@ -40,7 +39,9 @@ data class PostExecutionMetrics(
 )
 
 data class ExecutionPrediction @JvmOverloads constructor(
+    val nodePredictedDurationMs: Long,
+    val nodePredictedUpperBoundMs: Long,
+    val sequencePredictedDurationMs: Long,
+    val sequencePredictedUpperBoundMs: Long,
     val admit: Boolean = false,
-    val predictedDurationMs: Long,
-    val predictedUpperBoundMs: Long,
 )

@@ -212,19 +212,23 @@ public class SavingDraftImageTaskManager {
         final CaptureMetrics captureMetrics = extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
         ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
 
-        // Complete FinalizeExecution and record whether this capture overran its timeout.
+        // Complete Encoding and record whether this capture overran its timeout.
         final boolean isTimeout = draftSequenceExecutionProfiler.completeDraftSequenceExecution();
 
         // Insert until the first timeout of a streak; skip consecutive timeouts after that.
-        if (isTimeout && isLastTimeout) {
-            CLog.e(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout already recorded");
-            return;
+        if (isTimeout) {
+            isLastTimeout = true;
+            PLog.e(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout occurred");
+            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
+            CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
+            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
+        } else if (isLastTimeout) {
+            PLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout already recorded");
+        } else {
+            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
+            CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
+            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
         }
-
-        isLastTimeout = isTimeout;
-        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
-        CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
     }
 
     private void cancelDraftSequenceExecution(@NonNull ExtraBundle extraBundle) {

@@ -20,6 +20,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 /**
  * <div class="camera_en">
@@ -104,7 +105,7 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
                     draftSequenceExecutionProfiler.setDraftNodeChainAccessor(draftJpegNodeChainAccessor);
                 }
 
-                PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process E - " + draftJpegNodeChainAccessor.getConfiguredNodeIdList());
+                PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process E - " + getConfiguredNodeNames());
                 resultBuffer = draftJpegNodeChainAccessor.getNodeChain().processFull(ImageBuffer.class, buffer, extraBundle);
                 PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process X");
 
@@ -127,6 +128,12 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
             deinitializeDraftNodeChain();
             PLog.i(TAG, "processDraftImageInternal(ppSequenceId:%d, sequenceId:%d) X", ppSequenceId, sequenceId);
         }
+    }
+
+    private List<String> getConfiguredNodeNames() {
+        return draftJpegNodeChainAccessor.getConfiguredNodeList().stream()
+                .map(node -> node.getClass().getSimpleName())
+                .collect(Collectors.toList());
     }
 
     @GuardedBy("processLock")

@@ -85,8 +85,8 @@ data class NodeExecutionMetricsEntity(
     @ColumnInfo(name = "order")
     val order: Int,
 
-    @ColumnInfo(name = "node_id")
-    val nodeId: String,
+    @ColumnInfo(name = "node_name")
+    val nodeName: String,
 
     @ColumnInfo(name = "budget_ms")
     val budgetMs: Long,
@@ -137,11 +137,17 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "order")
     val order: Int,
 
-    @ColumnInfo(name = "predicted_duration_ms")
-    val predictedDurationMs: Long,
+    @ColumnInfo(name = "node_predicted_duration_ms")
+    val nodePredictedDurationMs: Long,
 
-    @ColumnInfo(name = "predicted_upper_bound_ms")
-    val predictedUpperBoundMs: Long,
+    @ColumnInfo(name = "node_predicted_upper_bound_ms")
+    val nodePredictedUpperBoundMs: Long,
+
+    @ColumnInfo(name = "sequence_predicted_duration_ms")
+    val sequencePredictedDurationMs: Long,
+
+    @ColumnInfo(name = "sequence_predicted_upper_bound_ms")
+    val sequencePredictedUpperBoundMs: Long,
 
     @ColumnInfo(
         name = "admit",

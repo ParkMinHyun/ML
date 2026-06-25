@@ -33,8 +33,16 @@ class CaptureMetricsExcelExporter(
             val rawCaptures = metricsList.mapIndexed { index, metrics ->
                 val draftMetrics = metrics.draftSequenceMetrics
 
-                val nodeRows = draftMetrics?.nodeExecutionMetricsList.orEmpty().mapIndexed { order, node ->
-                    NodeRow(node, draftMetrics?.nodeExecutionPredictionList?.getOrNull(order))
+                val nodeMetricsList = draftMetrics?.nodeExecutionMetricsList.orEmpty()
+                val predictions = draftMetrics?.nodeExecutionPredictionList.orEmpty()
+                val nodeRows = nodeMetricsList.mapIndexed { order, node ->
+                    NodeRow(
+                        node = node,
+                        prediction = predictions.getOrNull(order),
+                        sequenceActualDurationMs = nodeMetricsList.drop(order)
+                            .sumOf { it.postExecutionMetrics.durationMs }
+                            .takeIf { it > 0L },
+                    )
                 }
 
                 CaptureRow(
@@ -99,16 +107,16 @@ class CaptureMetricsExcelExporter(
         captures: List<EnrichedCaptureRow>,
         sheetNamePrefix: String,
     ) {
-        val nodeRowsByNodeId = captures
+        val nodeRowsByNodeName = captures
             .flatMap { enrichedCapture ->
                 enrichedCapture.row.nodeRows.map { nodeRow ->
-                    Triple(enrichedCapture.row.captureIndex, nodeRow.node.nodeId.name, nodeRow)
+                    Triple(enrichedCapture.row.captureIndex, nodeRow.node.nodeName, nodeRow)
                 }
             }
-            .groupBy { it.second } // group by nodeId
+            .groupBy { it.second } // group by nodeName
 
-        nodeRowsByNodeId.toSortedMap().forEach { (nodeId, rows) ->
-            val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeId")
+        nodeRowsByNodeName.toSortedMap().forEach { (nodeName, rows) ->
+            val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeName")
             val nodeColumns = buildNodeColumns()
             writeSheet(workbook, styles, sheetName, rows, nodeColumns)
         }
@@ -156,8 +164,8 @@ class CaptureMetricsExcelExporter(
     }
 
     /** Excel sheet names must be <=31 chars, unique, and exclude : \ / ? * [ ]. */
-    private fun uniqueSheetName(workbook: Workbook, rawNodeId: String): String {
-        val base = rawNodeId.replace(Regex("[:\\\\/?*\\[\\]]"), "_")
+    private fun uniqueSheetName(workbook: Workbook, rawNodeName: String): String {
+        val base = rawNodeName.replace(Regex("[:\\\\/?*\\[\\]]"), "_")
             .take(MAX_SHEET_NAME_LENGTH)
 
         if (workbook.getSheet(base) == null) {
@@ -188,14 +196,21 @@ class CaptureMetricsExcelExporter(
     private class NodeRow(
         val node: NodeExecutionMetrics,
         val prediction: ExecutionPrediction?,
+        val sequenceActualDurationMs: Long?,
     ) {
-        private val actualDurationMs: Long?
+        val nodeActualDurationMs: Long?
             get() = node.postExecutionMetrics.durationMs.takeIf { it > 0L }
 
-        fun predictionErrorMs(): Long? {
+        fun nodePredictionErrorMs(): Long? {
             val prediction = prediction ?: return null
-            val durationMs = actualDurationMs ?: return null
-            return durationMs - prediction.predictedDurationMs
+            val durationMs = nodeActualDurationMs ?: return null
+            return durationMs - prediction.nodePredictedDurationMs
+        }
+
+        fun sequencePredictionErrorMs(): Long? {
+            val prediction = prediction ?: return null
+            val durationMs = sequenceActualDurationMs ?: return null
+            return durationMs - prediction.sequencePredictedDurationMs
         }
     }
 
@@ -245,31 +260,33 @@ class CaptureMetricsExcelExporter(
             Column("timeoutCount") { it.timeoutCount?.let { idx -> "#$idx" } },
         )
 
-        private fun buildNodeColumns(): List<Column<Triple<Int, String, NodeRow>>> {
-            val columns = mutableListOf<Column<Triple<Int, String, NodeRow>>>(
-                Column("captureIndex") { it.first },
-                Column("nodeId") { it.second },
-                Column("budgetMs") { it.third.node.preExecutionMetrics.budgetMs },
-                Column("isLowMemory") { it.third.node.preExecutionMetrics.memorySnapshot.isLowMemory },
-                Column("ramAvailablePercent") { it.third.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
-                Column("javaHeapUsedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent },
-                Column("nativeHeapAllocatedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
-                Column("overheatLevel") { it.third.node.preExecutionMetrics.thermalSnapshot.overheatLevel },
-                Column("thermalStatus") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalStatus },
-                Column("thermalHeadroom") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
-                Column("storageUsedPercent") { it.third.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
-                Column("cpuTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
-                Column("wallTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
-                Column("runQueueWaitMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
-                Column("admit") { it.third.prediction?.admit },
-                Column("predictedDurationMs") { it.third.prediction?.predictedDurationMs },
-                Column("predictedUpperBoundMs") { it.third.prediction?.predictedUpperBoundMs },
-                Column("durationMs") { it.third.node.postExecutionMetrics.durationMs },
-                Column("predictionErrorMs") { it.third.predictionErrorMs() },
-            )
-            // ... (rest of the function is the same)
-            return columns
-        }
-
+        private fun buildNodeColumns(): List<Column<Triple<Int, String, NodeRow>>> = listOf(
+            Column("captureIndex") { it.first },
+            Column("nodeName") { it.second },
+            Column("budgetMs") { it.third.node.preExecutionMetrics.budgetMs },
+            Column("isLowMemory") { it.third.node.preExecutionMetrics.memorySnapshot.isLowMemory },
+            Column("ramAvailablePercent") { it.third.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
+            Column("javaHeapUsedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent },
+            Column("nativeHeapAllocatedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
+            Column("overheatLevel") { it.third.node.preExecutionMetrics.thermalSnapshot.overheatLevel },
+            Column("thermalStatus") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalStatus },
+            Column("thermalHeadroom") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
+            Column("storageUsedPercent") { it.third.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
+            Column("cpuTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
+            Column("wallTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
+            Column("runQueueWaitMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
+            Column("admit") { it.third.prediction?.admit },
+            Column("") { "" },
+            Column("nodePredictedDurationMs") { it.third.prediction?.nodePredictedDurationMs },
+            Column("nodePredictedUpperBoundMs") { it.third.prediction?.nodePredictedUpperBoundMs },
+            Column("nodeActualDurationMs") { it.third.nodeActualDurationMs },
+            Column("nodePredictionErrorMs") { it.third.nodePredictionErrorMs() },
+            Column("") { "" },
+            Column("sequencePredictedDurationMs") { it.third.prediction?.sequencePredictedDurationMs },
+            Column("sequencePredictedUpperBoundMs") { it.third.prediction?.sequencePredictedUpperBoundMs },
+            Column("sequenceActualDurationMs") { it.third.sequenceActualDurationMs },
+            Column("sequencePredictionErrorMs") { it.third.sequencePredictionErrorMs() },
+        )
     }
+
 }

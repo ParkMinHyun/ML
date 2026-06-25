@@ -1260,26 +1260,24 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
 
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = bundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
-        if (null != draftSequenceExecutionProfiler && isPredictable()) {
-            final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(mNodeId);
-            try {
-                return session.execute(picture, () -> executor.apply(picture, bundle));
-            } catch (TimeoutException e) {
-                CLog.w(getNodeTag(), "[mhyun2.park] processPictureWithProfiler - timeout, nodeId=" + mNodeId);
-                bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
-                return null;
-            } catch (Exception e) {
-                CLog.e(getNodeTag(), "[mhyun2.park] processPictureWithProfiler error", e);
-                bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
-                return null;
+        if (null != draftSequenceExecutionProfiler) {
+            final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(this);
+            if (null != session) {
+                try {
+                    return session.execute(picture, () -> executor.apply(picture, bundle));
+                } catch (TimeoutException e) {
+                    CLog.w(getNodeTag(), "[mhyun2.park] processPictureWithProfiler - timeout, nodeId=" + mNodeId);
+                    bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
+                    return null;
+                } catch (Exception e) {
+                    CLog.e(getNodeTag(), "[mhyun2.park] processPictureWithProfiler error", e);
+                    bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
+                    return null;
+                }
             }
         }
 
         return executor.apply(picture, bundle);
-    }
-
-    protected boolean isPredictable() {
-        return false;
     }
 
     /**
@@ -1523,11 +1521,6 @@ public abstract class Node implements PictureFormatProcessableInterface {
         }
         CLog.i(getNodeTag(), "isSupportedCamType : " + mSupportedCamType + ", cameraUsage :" + cameraUsage);
         return mSupportedCamType.contains(cameraUsage);
-    }
-
-    @NonNull
-    public NodeId getNodeId() {
-        return mNodeId;
     }
 
     /**

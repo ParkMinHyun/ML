@@ -1,7 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
 import android.util.Size
-import com.samsung.android.camera.core2.node.NodeId
 
 fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
     return CaptureMetricsEntity(
@@ -43,7 +42,7 @@ fun NodeExecutionMetrics.toEntity(
     return NodeExecutionMetricsEntity(
         captureMetricsId = captureMetricsId,
         order = order,
-        nodeId = nodeId.name,
+        nodeName = nodeName,
         budgetMs = preExecution.budgetMs,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
         thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
@@ -72,8 +71,10 @@ fun ExecutionPrediction.toEntity(
     return ExecutionPredictionEntity(
         captureMetricsId = captureMetricsId,
         order = order,
-        predictedDurationMs = predictedDurationMs,
-        predictedUpperBoundMs = predictedUpperBoundMs,
+        nodePredictedDurationMs = nodePredictedDurationMs,
+        nodePredictedUpperBoundMs = nodePredictedUpperBoundMs,
+        sequencePredictedDurationMs = sequencePredictedDurationMs,
+        sequencePredictedUpperBoundMs = sequencePredictedUpperBoundMs,
         admit = admit,
     )
 }
@@ -154,7 +155,7 @@ fun DraftSequenceMetricsEntity.toModel(
 
 fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
     return NodeExecutionMetrics(
-        nodeId = nodeId.toNodeId(),
+        nodeName = nodeName,
         preExecutionMetrics = toPreExecutionMetrics(),
         postExecutionMetrics = toPostExecutionMetrics(),
     )
@@ -162,9 +163,11 @@ fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
 
 fun ExecutionPredictionEntity.toModel(): ExecutionPrediction {
     return ExecutionPrediction(
-        predictedDurationMs = predictedDurationMs,
-        predictedUpperBoundMs = predictedUpperBoundMs,
         admit = admit,
+        nodePredictedDurationMs = nodePredictedDurationMs,
+        nodePredictedUpperBoundMs = nodePredictedUpperBoundMs,
+        sequencePredictedDurationMs = sequencePredictedDurationMs,
+        sequencePredictedUpperBoundMs = sequencePredictedUpperBoundMs,
     )
 }
 
@@ -223,9 +226,4 @@ fun StorageSnapshotEntity.toModel(): StorageSnapshot {
     return StorageSnapshot(
         storageUsedPercent = storageUsedPercent,
     )
-}
-
-/** Maps a persisted node-id name back to its [NodeId]; unknown names fall back to [NodeId.NODE_DUMMY]. */
-fun String.toNodeId(): NodeId {
-    return runCatching { NodeId.valueOf(this) }.getOrDefault(NodeId.NODE_DUMMY)
 }

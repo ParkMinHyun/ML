@@ -3,18 +3,22 @@ package com.samsung.android.camera.core2.ml
 import android.os.SystemClock
 import android.util.Size
 import com.samsung.android.camera.core2.maker.MakerFeature
-import com.samsung.android.camera.core2.node.NodeId
+import com.samsung.android.camera.core2.node.DynamicFunctionNode
+import com.samsung.android.camera.core2.node.Node
+import com.samsung.android.camera.core2.node.dualBokeh.samsung.SecDualBokehNodeBase
+import com.samsung.android.camera.core2.node.filter.SecFilterNode
+import com.samsung.android.camera.core2.node.imageCodec.samsung.SecImageCodecNodeBase
+import com.samsung.android.camera.core2.node.watermark.WatermarkNode
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor
 import com.samsung.android.camera.core2.util.CLog
 import java.util.concurrent.CompletableFuture
+import kotlin.math.abs
 
 private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
- * Drives one draft sequence's node lifecycle, recording both individual stage observations
- * ([WorkloadKey]) and remaining-suffix observations ([WorkloadSequenceKey]). The suffix observation
- * starts at an admission stage (Bokeh / Filter) entry and closes when finalize execution completes;
- * admission then uses the learned suffix bound instead of summing independent stage upper bounds.
+ * Drives one draft sequence's node lifecycle. Workload durations are collected during node execution,
+ * then SeqPAW-UB receives decision-time prediction snapshots and actual workload durations at capture end.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
@@ -30,41 +34,27 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private val sequenceLock = Any()
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
+    private val workloadDurations: MutableMap<WorkloadKey, Long> = mutableMapOf()
+    private val sequenceSnapshots: MutableMap<WorkloadSequenceKey, SequencePredictionSnapshot> = mutableMapOf()
 
-    /**
-     * Suffix observations in progress, opened at admission stages and awaiting finalization. Each
-     * tracks how many of its later stages still have to report before it can become a sample.
-     */
-    private val suffixObservations: MutableList<SuffixObservation> = mutableListOf()
-
-    private var plannedAdmissionStages: List<NodeId> = emptyList()
-    private var finalizeExecutionSession: DraftSequenceExecutionSession? = null
+    private var draftSequenceNodeList: List<Node> = emptyList()
+    private var pendingCompleteSession: DraftSequenceExecutionSession? = null
+    private var isCaptureUpdated = false
 
     fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
-        updateDraftPlan(accessor.configuredNodeIdList)
-    }
-
-    fun deinitializeDraftNodeChain() {
-        nodeChainLifecycle.deinitializeWhenIdle()
-    }
-
-    private fun updateDraftPlan(nodeIds: List<NodeId>) {
-        plannedAdmissionStages = nodeIds.filter(WorkloadKey::isAdmissionStageNode)
+        draftSequenceNodeList = accessor.configuredNodeList
     }
 
     /**
-     * Profiles one node execution.
+     * Profiles one predictable node execution.
      *
-     * For portrait mode with Filter enabled:
-     *   - Bokeh entry prediction uses UB([Bokeh, Filter, FinalizeExecution])
-     *   - Filter entry prediction uses UB([Filter, FinalizeExecution])
-     *   - Every admission stage is capped at (budget - UB([FinalizeExecution])) via its Future.get timeout
-     *
-     * Admission stages complete at node return. FinalizeExecution starts at ImageCodec and completes
-     * when SavingDraftImageTaskManager observes task finish, so it covers encode through saved draft.
+     * ADMIT workloads (Bokeh / Filter) are admitted by their remaining suffix UB.
+     * OBSERVE workloads (DynamicFunction / Watermark) always run but stay in prediction;
+     * COMPLETE workload is the mandatory tail.
      */
-    fun profileNodeExecution(nodeId: NodeId): DraftSequenceExecutionSession {
+    fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
+        val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
         val nowMs = SystemClock.uptimeMillis()
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
         val deviceState = deviceStateReader.read()
@@ -74,121 +64,94 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             thermalSnapshot = deviceState.thermalSnapshot,
             storageSnapshot = deviceState.storageSnapshot,
         )
-        val resultImageFormat = captureMetrics.resultImageFormat
         val nodeExecutionMetrics = NodeExecutionMetrics(
-            nodeId = nodeId,
+            nodeName = node.javaClass.simpleName,
             preExecutionMetrics = preExecutionMetrics,
         )
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
         }
 
-        return if (WorkloadKey.isFinalizeExecutionNode(nodeId)) {
-            createFinalizeExecutionSession(resultImageFormat, preExecutionMetrics, nodeExecutionMetrics)
-        } else {
-            createAdmissionExecutionSession(nodeId, resultImageFormat, preExecutionMetrics, nodeExecutionMetrics)
-        }
-    }
-
-    private fun createFinalizeExecutionSession(
-        resultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-        nodeExecutionMetrics: NodeExecutionMetrics,
-    ): DraftSequenceExecutionSession {
-        val prediction = predictor
-            .predictAdmission(WorkloadSequenceKey(mandatoryWorkloadKeys()), preExecutionMetrics)
-            .copy(admit = true)
-
-        synchronized(draftSequenceMetrics) {
-            draftSequenceMetrics.nodeExecutionPredictionList += prediction
-        }
-
-        return DraftSequenceExecutionSession.deferred(
-            onCancel = { finalizeExecutionSession = null },
-            onComplete = { postExecutionMetrics ->
-                recordCompletedStage(
-                    resultImageFormat,
-                    nodeExecutionMetrics,
-                    postExecutionMetrics,
-                    openedSuffix = null
-                )
-            },
-        ).also { session ->
-            finalizeExecutionSession = session
-        }
-    }
-
-    private fun createAdmissionExecutionSession(
-        nodeId: NodeId,
-        resultImageFormat: Int,
-        preExecutionMetrics: PreExecutionMetrics,
-        nodeExecutionMetrics: NodeExecutionMetrics,
-    ): DraftSequenceExecutionSession {
-        val resultImageSize = captureMetrics.resultImageSize
-        val suffixKey = admissionSuffixKey(nodeId, resultImageSize, resultImageFormat)
-        val prediction = predictor.predictAdmission(suffixKey, preExecutionMetrics)
-        val timeoutMs = processTimeoutMs(preExecutionMetrics)
-        val suffixObservation = SuffixObservation(suffixKey, preExecutionMetrics.thermalSnapshot.thermalStatus)
-
-        synchronized(draftSequenceMetrics) {
-            draftSequenceMetrics.nodeExecutionPredictionList += prediction
-        }
-
-        return DraftSequenceExecutionSession.bounded(
-            shouldRun = prediction.admit,
-            processTimeoutMs = timeoutMs,
-            onTimedOutTask = nodeChainLifecycle::waitFor,
-            onComplete = { postExecutionMetrics ->
-                recordCompletedStage(
-                    resultImageFormat,
-                    nodeExecutionMetrics,
-                    postExecutionMetrics,
-                    openedSuffix = suffixObservation
-                )
-            },
+        return createExecutionSession(
+            node = node,
+            workloadKey = workloadKey,
+            preExecutionMetrics = preExecutionMetrics,
+            nodeExecutionMetrics = nodeExecutionMetrics,
         )
     }
 
-    /**
-     * A stage finished: store its measurement, feed the per-stage model, and count the stage down on
-     * every suffix in progress. An admission stage additionally opens [openedSuffix] for its own suffix.
-     * A skipped/timed-out stage never reaches here, so it never decrements and leaves its enclosing
-     * suffixes incomplete.
-     */
-    private fun recordCompletedStage(
-        resultImageFormat: Int,
+    private fun createExecutionSession(
+        node: Node,
+        workloadKey: WorkloadKey,
+        preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
-        postExecutionMetrics: PostExecutionMetrics,
-        openedSuffix: SuffixObservation?,
-    ) {
-        nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
-        predictor.updateNodeExecution(nodeExecutionMetrics, captureMetrics.resultImageSize, resultImageFormat, isPendingRequest)
-        synchronized(sequenceLock) {
-            suffixObservations.forEach { it.remainingStages-- }
-            if (openedSuffix != null) {
-                suffixObservations += openedSuffix
+    ): DraftSequenceExecutionSession {
+        val sequenceKey = WorkloadSequenceKey(workloadsFrom(node, workloadKey))
+        val decision = predictor.predictAdmission(sequenceKey, preExecutionMetrics)
+        rememberDecision(decision)
+
+        val prediction = when (workloadKey.policy) {
+            WorkloadPolicy.ADMIT -> decision.executionPrediction
+            WorkloadPolicy.OBSERVE, WorkloadPolicy.COMPLETE -> decision.executionPrediction.copy(admit = true)
+        }
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.nodeExecutionPredictionList += prediction
+        }
+
+        val onComplete: (PostExecutionMetrics) -> Unit = { postExecutionMetrics ->
+            recordCompletedWorkload(
+                workloadKey,
+                nodeExecutionMetrics,
+                postExecutionMetrics,
+            )
+        }
+
+        return when (workloadKey.policy) {
+            WorkloadPolicy.ADMIT -> DraftSequenceExecutionSession(
+                shouldRun = prediction.admit,
+                processTimeoutMs = processTimeoutMs(node, workloadKey, preExecutionMetrics),
+                onTimedOutTask = nodeChainLifecycle::waitFor,
+                onComplete = onComplete,
+            )
+            WorkloadPolicy.OBSERVE -> DraftSequenceExecutionSession(
+                onComplete = onComplete,
+            )
+            WorkloadPolicy.COMPLETE -> DraftSequenceExecutionSession(
+                completeOnReturn = false,
+                onCancel = { pendingCompleteSession = null },
+                onComplete = onComplete,
+            ).also { session ->
+                pendingCompleteSession = session
             }
         }
     }
 
-    /**
-     * End of the draft task. Completes FinalizeExecution, feeds ready suffix models, and records
-     * whether the capture overran its timeout.
-     */
-    fun completeDraftSequenceExecution(): Boolean {
-        finalizeExecutionSession?.complete()
-        finalizeExecutionSession = null
-
-        val completedObservations = synchronized(sequenceLock) {
-            val (completed, dropped) = suffixObservations.partition { it.remainingStages == 0 }
-            suffixObservations.clear()
-            if (dropped.isNotEmpty()) {
-                CLog.i(TAG, "drop incomplete suffix observations - count=${dropped.size}")
-            }
-            completed
+    private fun recordCompletedWorkload(
+        workloadKey: WorkloadKey,
+        nodeExecutionMetrics: NodeExecutionMetrics,
+        postExecutionMetrics: PostExecutionMetrics,
+    ) {
+        nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
+        synchronized(sequenceLock) {
+            workloadDurations[workloadKey] = postExecutionMetrics.durationMs.coerceAtLeast(0L)
         }
-        completedObservations.forEach { observation ->
-            predictor.updateWorkloadSequence(observation.sequenceKey, observation.durationMs(), observation.thermalStatus)
+    }
+
+    /** Completes the COMPLETE workload, updates SeqPAW-UB, and records whether this capture timed out. */
+    fun completeDraftSequenceExecution(): Boolean {
+        pendingCompleteSession?.complete()
+        pendingCompleteSession = null
+
+        val captureUpdate = synchronized(sequenceLock) {
+            if (isCaptureUpdated) {
+                null
+            } else {
+                isCaptureUpdated = true
+                Pair(workloadDurations.toMap(), sequenceSnapshots.values.toList())
+            }
+        }
+        captureUpdate?.let { (completedWorkloadDurations, completedSnapshots) ->
+            predictor.updateCapture(completedWorkloadDurations, completedSnapshots)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
@@ -197,67 +160,139 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return isTimeout
     }
 
-    /** Drops any open FinalizeExecution/suffix sample without feeding the predictor. */
+    /** Cancels the pending COMPLETE workload without discarding collected samples. */
     fun cancelDraftSequenceExecution() {
-        finalizeExecutionSession?.cancel()
-        finalizeExecutionSession = null
+        pendingCompleteSession?.cancel()
+        pendingCompleteSession = null
+    }
+
+    private fun processTimeoutMs(
+        node: Node,
+        workloadKey: WorkloadKey,
+        preExecutionMetrics: PreExecutionMetrics,
+    ): Long {
+        // ADMIT watchdogs reserve only the mandatory COMPLETE workload.
+        // OBSERVE workloads are measured but not protected here.
+        val reserveWorkloads = workloadsFrom(node, workloadKey)
+            .drop(1)
+            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
+        if (reserveWorkloads.isEmpty()) {
+            return preExecutionMetrics.budgetMs.coerceAtLeast(0L)
+        }
+
+        val timeoutDecision = predictor.predictWatchdogTimeout(WorkloadSequenceKey(reserveWorkloads), preExecutionMetrics)
+        rememberDecision(timeoutDecision.decision)
+        return timeoutDecision.timeoutMs
+    }
+
+    private fun rememberDecision(decision: SeqPawDecision) {
         synchronized(sequenceLock) {
-            suffixObservations.clear()
+            sequenceSnapshots[decision.nodeSnapshot.sequenceKey] = decision.nodeSnapshot
+            sequenceSnapshots[decision.sequenceSnapshot.sequenceKey] = decision.sequenceSnapshot
         }
     }
 
-    private fun admissionSuffixKey(nodeId: NodeId, resultImageSize: Size, resultImageFormat: Int): WorkloadSequenceKey {
-        val followingIndex = plannedAdmissionStages.indexOf(nodeId)
-        val followingNodeIds = if (followingIndex < 0) {
-            emptyList()
+    private fun workloadsFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
+        val index = draftSequenceNodeList.indexOfFirst { plannedNode -> plannedNode === node }
+        return if (index >= 0) {
+            draftSequenceNodeList.drop(index).mapNotNull { plannedNode ->
+                workloadKeyFor(plannedNode, requireReadyToRun = false)
+            }
         } else {
-            plannedAdmissionStages.drop(followingIndex + 1)
+            listOf(workloadKey)
         }
-        val workloads = listOf(workloadKey(nodeId, resultImageSize, resultImageFormat)) +
-            followingNodeIds.map { workloadKey(it, resultImageSize, resultImageFormat) } +
-            mandatoryWorkloadKeys()
-        return WorkloadSequenceKey(workloads)
     }
 
-    private fun workloadKey(nodeId: NodeId, resultImageSize: Size, resultImageFormat: Int): WorkloadKey {
-        return WorkloadKey.node(nodeId, resultImageSize, resultImageFormat, isPendingRequest)
+    private fun workloadKeyFor(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
+        val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
+        return when (node) {
+            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
+                .takeIf { !requireReadyToRun || node.isMaxInputCount() }
+            is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
+            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
+            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket)
+            is SecImageCodecNodeBase -> WorkloadKey.Encoding(
+                sizeBucket,
+                captureMetrics.resultImageFormat,
+                isPendingRequest,
+            ).takeIf { node.isEncodeUsage }
+            else -> null
+        }
     }
 
-    private fun mandatoryWorkloadKeys(): List<WorkloadKey> {
-        return listOf(
-            WorkloadKey.finalizeExecution(captureMetrics.resultImageSize, captureMetrics.resultImageFormat, isPendingRequest),
-        )
+    fun deinitializeDraftNodeChain() {
+        nodeChainLifecycle.deinitializeWhenIdle()
+    }
+}
+
+/** Stable workload bucket shared by the workload EWMA and sequence calibrator. */
+sealed interface WorkloadKey {
+    val policy: WorkloadPolicy
+
+    data class Bokeh(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
     }
 
-    /**
-     * Wall-clock budget the current quality stage may run before FinalizeExecution must start. The call
-     * site uses this as its Future.get timeout so a slow quality stage cannot eat into the mandatory tail.
-     */
-    private fun processTimeoutMs(preExecutionMetrics: PreExecutionMetrics): Long {
-        val tailKey = WorkloadSequenceKey(mandatoryWorkloadKeys())
-        val tailUpperBoundMs = predictor.predictAdmission(tailKey, preExecutionMetrics).predictedUpperBoundMs
-        return (preExecutionMetrics.budgetMs - tailUpperBoundMs).coerceAtLeast(0L)
+    data class DynamicFunction(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
     }
 
-    /**
-     * One suffix observation: the wall-clock duration from the first admission stage through draft task
-     * completion. Only duration feeds the suffix model. [remainingStages] is how many stages after the
-     * first must still complete for this to be a valid sample.
-     */
-    private class SuffixObservation(
-        val sequenceKey: WorkloadSequenceKey,
-        val thermalStatus: Int,
-    ) {
-        var remainingStages: Int = sequenceKey.workloads.size - 1
-        private val startedAtMs = SystemClock.uptimeMillis()
+    data class Filter(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
+    }
 
-        fun durationMs(): Long = (SystemClock.uptimeMillis() - startedAtMs).coerceAtLeast(0L)
+    data class Watermark(val sizeBucket: SizeBucket) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
+    }
+
+    /** Mandatory tail from ImageCodec entry through saved draft task completion. */
+    data class Encoding(
+        val sizeBucket: SizeBucket,
+        val imageFormat: Int,
+        val isPendingRequest: Boolean,
+    ) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.COMPLETE
+    }
+}
+
+/** Ordered key for a decision suffix, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
+data class WorkloadSequenceKey(val workloads: List<WorkloadKey>) {
+
+    init {
+        require(workloads.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload." }
+    }
+
+    override fun toString(): String = workloads.joinToString(prefix = "[", postfix = "]")
+}
+
+
+enum class WorkloadPolicy {
+    ADMIT,
+    OBSERVE,
+    COMPLETE,
+}
+
+/** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */
+enum class SizeBucket(val megaPixels: Int) {
+    MP12(12),
+    MP24(24),
+    MP50(50),
+    MP108(108),
+    MP200(200);
+
+    companion object {
+        fun of(size: Size): SizeBucket {
+            val pixels = size.width.toLong().coerceAtLeast(0L) *
+                    size.height.toLong().coerceAtLeast(0L)
+            val megaPixels = pixels.toDouble() / 1_000_000.0
+            return entries.minByOrNull { abs(megaPixels - it.megaPixels) } ?: MP12
+        }
     }
 }
 
 /**
  * Owns the draft node chain's deinit timing. Normally [deinitializeWhenIdle] deinitializes at once,
- * but a stage that timed out leaves its worker running on the chain; [waitFor] records that worker so
+ * but a workload that timed out leaves its worker running on the chain; [waitFor] records that worker so
  * deinit is deferred until it actually finishes. Deinit runs exactly once.
  *
  * Single-use, one instance per draft sequence. [waitFor] (process thread, during node execution)
@@ -276,7 +311,7 @@ private class DraftNodeChainLifecycle {
         }
     }
 
-    /** A timed-out stage's worker is still running on the chain; defer deinit until it finishes. */
+    /** A timed-out workload's worker is still running on the chain; defer deinit until it finishes. */
     fun waitFor(worker: CompletableFuture<*>) {
         synchronized(lock) {
             pendingWorker = worker
@@ -310,4 +345,3 @@ private class DraftNodeChainLifecycle {
         }
     }
 }
-
