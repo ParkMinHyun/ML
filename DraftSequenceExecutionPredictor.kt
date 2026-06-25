@@ -109,18 +109,16 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun correctedUpperBound(sequenceKey: WorkloadSequenceKey): Double {
-        var correctedTailUpperBound = 0.0
-        for (index in sequenceKey.workloads.indices.reversed()) {
-            val suffixWorkloads = sequenceKey.workloads.drop(index)
-            val suffixKey = WorkloadSequenceKey(suffixWorkloads)
-            val rawUpperBound = rawUpperBound(suffixKey)
-            correctedTailUpperBound = if (index == sequenceKey.workloads.lastIndex) {
-                rawUpperBound
-            } else {
-                maxOf(rawUpperBound, predictedWorkloadDuration(sequenceKey.workloads[index]) + correctedTailUpperBound)
-            }
+        // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
+        // head EWMA plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1, the
+        // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
+        val workloads = sequenceKey.workloads
+        var corrected = 0.0
+        for (index in workloads.indices.reversed()) {
+            val suffixRawUpperBound = rawUpperBound(WorkloadSequenceKey(workloads.drop(index)))
+            corrected = maxOf(suffixRawUpperBound, predictedWorkloadDuration(workloads[index]) + corrected)
         }
-        return correctedTailUpperBound
+        return corrected
     }
 
     private fun rawUpperBound(sequenceKey: WorkloadSequenceKey): Double {
@@ -138,18 +136,11 @@ class DraftSequenceExecutionPredictor {
 
     private fun predictedWorkloadDuration(workloadKey: WorkloadKey): Double {
         workloadModels[workloadKey]?.let { return it.predictionMs() }
-        // No model for this resolution yet: borrow the slowest same-workload model from other resolutions, so a new
-        // size still gets a real prediction (hence admission control + the global residual) instead of a blind bypass.
+        // New variant not seen yet: borrow the slowest model of the same workload type as a conservative cold-start
+        // estimate, so it gets a real bound instead of a blind admit. Self-corrects once it has its own samples.
         return workloadModels
-            .filterKeys { it.substitutesFor(workloadKey) }
+            .filterKeys { it::class == workloadKey::class }
             .values.maxOfOrNull { it.predictionMs() } ?: 0.0
-    }
-
-    /** A model may stand in for an unseen resolution of the same workload (Encoding also matches format/pending). */
-    private fun WorkloadKey.substitutesFor(other: WorkloadKey): Boolean = when {
-        this is WorkloadKey.Encoding && other is WorkloadKey.Encoding ->
-            imageFormat == other.imageFormat && isPendingRequest == other.isPendingRequest
-        else -> this::class == other::class
     }
 
     private fun calibratedScore(sequenceKey: WorkloadSequenceKey): Double {

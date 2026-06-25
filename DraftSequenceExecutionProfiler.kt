@@ -87,8 +87,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         nodeExecutionMetrics: NodeExecutionMetrics,
     ): DraftSequenceExecutionSession {
         val sequenceKey = WorkloadSequenceKey(workloadsFrom(node, workloadKey))
-        val decision = predictor.predictAdmission(sequenceKey, preExecutionMetrics)
-        rememberDecision(decision)
+        val decision = predictor.predictAdmission(sequenceKey, preExecutionMetrics).also(::rememberDecision)
 
         val prediction = when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> decision.executionPrediction
@@ -181,7 +180,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
 
         val timeoutDecision = predictor.predictWatchdogTimeout(WorkloadSequenceKey(reserveWorkloads), preExecutionMetrics)
-        rememberDecision(timeoutDecision.decision)
+            .also { rememberDecision(it.decision) }
         return timeoutDecision.timeoutMs
     }
 
