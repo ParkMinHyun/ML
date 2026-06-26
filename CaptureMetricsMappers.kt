@@ -18,6 +18,8 @@ fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
 fun DraftSequenceMetrics.toEntity(captureMetricsId: Int): DraftSequenceMetricsEntity {
     return DraftSequenceMetricsEntity(
         captureMetricsId = captureMetricsId,
+        isPendingRequest = isPendingRequest,
+        hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
     )
 }
@@ -43,6 +45,7 @@ fun NodeExecutionMetrics.toEntity(
         captureMetricsId = captureMetricsId,
         order = order,
         nodeName = nodeName,
+        workloadKey = workloadKey,
         budgetMs = preExecution.budgetMs,
         memorySnapshot = preExecution.memorySnapshot.toEntity(),
         thermalSnapshot = preExecution.thermalSnapshot.toEntity(),
@@ -50,6 +53,8 @@ fun NodeExecutionMetrics.toEntity(
         gcSnapshot = postExecution.gcSnapshot?.toEntity(),
         cpuProcessingSnapshot = postExecution.cpuProcessingSnapshot?.toEntity(),
         durationMs = postExecution.durationMs,
+        watchdogTimeoutMs = watchdogTimeoutMs,
+        watchdogTimedOut = watchdogTimedOut,
     )
 }
 
@@ -149,6 +154,8 @@ fun DraftSequenceMetricsEntity.toModel(
     return DraftSequenceMetrics(
         nodeExecutionMetricsList = nodeExecutionMetricsList,
         nodeExecutionPredictionList = nodeExecutionPredictionList,
+        isPendingRequest = isPendingRequest,
+        hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
     )
 }
@@ -158,6 +165,9 @@ fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
         nodeName = nodeName,
         preExecutionMetrics = toPreExecutionMetrics(),
         postExecutionMetrics = toPostExecutionMetrics(),
+        workloadKey = workloadKey,
+        watchdogTimeoutMs = watchdogTimeoutMs,
+        watchdogTimedOut = watchdogTimedOut,
     )
 }
 

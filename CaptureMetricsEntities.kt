@@ -55,6 +55,12 @@ data class DraftSequenceMetricsEntity(
     @ColumnInfo(name = "capture_metrics_id")
     val captureMetricsId: Int,
 
+    @ColumnInfo(name = "is_pending_request")
+    val isPendingRequest: Boolean?,
+
+    @ColumnInfo(name = "has_watchdog_timeout")
+    val hasWatchdogTimeout: Boolean?,
+
     @ColumnInfo(name = "is_timeout")
     val isTimeout: Boolean?,
 )
@@ -88,6 +94,9 @@ data class NodeExecutionMetricsEntity(
     @ColumnInfo(name = "node_name")
     val nodeName: String,
 
+    @ColumnInfo(name = "workload_key")
+    val workloadKey: String?,
+
     @ColumnInfo(name = "budget_ms")
     val budgetMs: Long,
 
@@ -108,6 +117,12 @@ data class NodeExecutionMetricsEntity(
 
     @ColumnInfo(name = "duration_ms")
     var durationMs: Long,
+
+    @ColumnInfo(name = "watchdog_timeout_ms")
+    var watchdogTimeoutMs: Long?,
+
+    @ColumnInfo(name = "watchdog_timed_out")
+    var watchdogTimedOut: Boolean?,
 )
 
 @Entity(

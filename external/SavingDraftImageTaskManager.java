@@ -181,7 +181,7 @@ public class SavingDraftImageTaskManager {
         }
 
         try {
-            if (waitForSavingDraftImageTaskMapDrain) {
+            if (waitForSavingDraftImageTaskMapDrain && !watchdogTimedOut) {
                 cancelDraftSequenceExecution(extraBundle);
                 CLog.w(TAG, "[mhyun2.park] onTaskFinished : wait for savingDraftImageTaskMap drain - ppSequenceId=%d, remainingTaskCount=%d", ppSequenceId, savingDraftImageTaskMap.size() - 1);
                 return;
@@ -259,6 +259,8 @@ public class SavingDraftImageTaskManager {
         } catch (InterruptedException e) {
             PLog.e(TAG, "shutDownThreadPool - failed : getting interrupt during wait for shutdown, try to shutdown forcefully");
             savingDraftImageThreadPool.shutdownNow();
+        } finally {
+            isLastTimeout = false;
         }
     }
 }

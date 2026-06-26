@@ -18,7 +18,7 @@ private const val TAG = "DraftSequenceExecutionSession"
  */
 class DraftSequenceExecutionSession internal constructor(
     private val shouldRun: Boolean = true,
-    private val processTimeoutMs: Long? = null,
+    private val watchdogTimeoutMs: Long? = null,
     private val completeOnReturn: Boolean = true,
     private val onCancel: () -> Unit = {},
     private val onComplete: (PostExecutionMetrics) -> Unit = {},
@@ -38,7 +38,7 @@ class DraftSequenceExecutionSession internal constructor(
         }
 
         return try {
-            val result = processTimeoutMs?.let { timeoutMs ->
+            val result = watchdogTimeoutMs?.let { timeoutMs ->
                 executeOnWorker(task, timeoutMs)
             } ?: task.call()
 

@@ -15,7 +15,10 @@ class CaptureMetricsExcelExporter(
     private val repository: CaptureMetricsRepository,
 ) {
 
-    private class EnrichedCaptureRow(val row: CaptureRow, val timeoutCount: Int?, val groupId: Int)
+    private class EnrichedCaptureRow(
+        val row: CaptureRow,
+        val sessionSummary: SessionSummary,
+    )
 
     suspend fun export(): File {
         val outputDir = context.getExternalFilesDir(DIR_NAME)
@@ -34,12 +37,12 @@ class CaptureMetricsExcelExporter(
                 val draftMetrics = metrics.draftSequenceMetrics
 
                 val nodeMetricsList = draftMetrics?.nodeExecutionMetricsList.orEmpty()
-                val predictions = draftMetrics?.nodeExecutionPredictionList.orEmpty()
-                val nodeRows = nodeMetricsList.mapIndexed { order, node ->
+                val predictionList = draftMetrics?.nodeExecutionPredictionList.orEmpty()
+                val nodeRows = nodeMetricsList.mapIndexed { index, node ->
                     NodeRow(
                         node = node,
-                        prediction = predictions.getOrNull(order),
-                        sequenceActualDurationMs = nodeMetricsList.drop(order)
+                        prediction = predictionList.getOrNull(index),
+                        sequenceActualDurationMs = nodeMetricsList.drop(index)
                             .sumOf { it.postExecutionMetrics.durationMs }
                             .takeIf { it > 0L },
                     )
@@ -54,7 +57,7 @@ class CaptureMetricsExcelExporter(
 
             val enrichedNormalCaptures = processCaptures(rawCaptures)
 
-            // Write main sheets
+            // Write main sheet
             writeSheet(workbook, styles, "Capture", enrichedNormalCaptures, buildCaptureColumns())
 
             // Write sub-sheets for each category
@@ -91,11 +94,35 @@ class CaptureMetricsExcelExporter(
         }
 
         val enriched = mutableListOf<EnrichedCaptureRow>()
-        for (group in sortedGroups) {
-            val timeoutIndexValue = if (group.last().metrics.draftSequenceMetrics?.isTimeout == true) group.size else null
-            val groupId = group.first().captureIndex
+        sortedGroups.forEachIndexed { sessionId, group ->
+            var bokehAdmitCount = 0
+            var bokehTotalCount = 0
+            var filterAdmitCount = 0
+            var filterTotalCount = 0
+            val sessionTimeoutShotCount = group.indexOfFirst {
+                it.metrics.draftSequenceMetrics?.isTimeout == true
+            }.takeIf { it >= 0 }?.let { it + 1 }
+
             group.forEach { groupMember ->
-                enriched.add(EnrichedCaptureRow(groupMember, timeoutIndexValue, groupId))
+                val bokehRows = groupMember.nodeRows.filter { it.isBokehWorkload && it.prediction != null }
+                val filterRows = groupMember.nodeRows.filter { it.isFilterWorkload && it.prediction != null }
+                bokehAdmitCount += bokehRows.count { it.prediction?.admit == true }
+                bokehTotalCount += bokehRows.size
+                filterAdmitCount += filterRows.count { it.prediction?.admit == true }
+                filterTotalCount += filterRows.size
+
+                val sessionSummary = SessionSummary(
+                    sessionId = sessionId,
+                    sessionShotCount = group.size,
+                    sessionTimeoutShotCount = sessionTimeoutShotCount,
+                    sessionBokehAdmitCount = bokehAdmitCount,
+                    sessionBokehTotalCount = bokehTotalCount,
+                    sessionBokehAdmitRate = SessionSummary.admitRate(bokehAdmitCount, bokehTotalCount),
+                    sessionFilterAdmitCount = filterAdmitCount,
+                    sessionFilterTotalCount = filterTotalCount,
+                    sessionFilterAdmitRate = SessionSummary.admitRate(filterAdmitCount, filterTotalCount),
+                )
+                enriched.add(EnrichedCaptureRow(groupMember, sessionSummary))
             }
         }
         return enriched
@@ -107,18 +134,21 @@ class CaptureMetricsExcelExporter(
         captures: List<EnrichedCaptureRow>,
         sheetNamePrefix: String,
     ) {
-        val nodeRowsByNodeName = captures
-            .flatMap { enrichedCapture ->
-                enrichedCapture.row.nodeRows.map { nodeRow ->
-                    Triple(enrichedCapture.row.captureIndex, nodeRow.node.nodeName, nodeRow)
-                }
-            }
-            .groupBy { it.second } // group by nodeName
+        val nodeRowsByNodeName = buildNodeSheetRows(captures.map { it.row })
+            .groupBy { it.nodeRow.node.nodeName }
 
         nodeRowsByNodeName.toSortedMap().forEach { (nodeName, rows) ->
             val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeName")
             val nodeColumns = buildNodeColumns()
             writeSheet(workbook, styles, sheetName, rows, nodeColumns)
+        }
+    }
+
+    private fun buildNodeSheetRows(captures: List<CaptureRow>): List<NodeSheetRow> {
+        return captures.flatMap { capture ->
+            capture.nodeRows.mapIndexed { index, nodeRow ->
+                NodeSheetRow(capture, index + 1, nodeRow)
+            }
         }
     }
 
@@ -147,7 +177,7 @@ class CaptureMetricsExcelExporter(
 
             if (item is EnrichedCaptureRow && item.row.metrics.draftSequenceMetrics?.isTimeout == true && rowIndex < items.lastIndex) {
                 val nextItem = items.getOrNull(rowIndex + 1) as? EnrichedCaptureRow
-                if (nextItem != null && item.groupId != nextItem.groupId) {
+                if (nextItem != null && item.sessionSummary.sessionId != nextItem.sessionSummary.sessionId) {
                     sheet.createRow(sheet.lastRowNum + 1)
                 }
             }
@@ -193,6 +223,33 @@ class CaptureMetricsExcelExporter(
         val nodeRows: List<NodeRow>,
     )
 
+    private class SessionSummary(
+        val sessionId: Int,
+        val sessionShotCount: Int,
+        val sessionTimeoutShotCount: Int?,
+        val sessionBokehAdmitCount: Int,
+        val sessionBokehTotalCount: Int,
+        val sessionBokehAdmitRate: Double?,
+        val sessionFilterAdmitCount: Int,
+        val sessionFilterTotalCount: Int,
+        val sessionFilterAdmitRate: Double?,
+    ) {
+        companion object {
+            fun admitRate(admitCount: Int, totalCount: Int): Double? {
+                if (totalCount <= 0) {
+                    return null
+                }
+                return admitCount.toDouble() / totalCount.toDouble()
+            }
+        }
+    }
+
+    private class NodeSheetRow(
+        val capture: CaptureRow,
+        val nodeOrder: Int,
+        val nodeRow: NodeRow,
+    )
+
     private class NodeRow(
         val node: NodeExecutionMetrics,
         val prediction: ExecutionPrediction?,
@@ -201,16 +258,34 @@ class CaptureMetricsExcelExporter(
         val nodeActualDurationMs: Long?
             get() = node.postExecutionMetrics.durationMs.takeIf { it > 0L }
 
-        fun nodePredictionErrorMs(): Long? {
+        val isBokehWorkload: Boolean
+            get() = node.workloadKey?.startsWith(ADMIT_BOKEH_PREFIX) == true
+
+        val isFilterWorkload: Boolean
+            get() = node.workloadKey?.startsWith(ADMIT_FILTER_PREFIX) == true
+
+        fun nodePredictionResidualMs(): Long? {
             val prediction = prediction ?: return null
-            val durationMs = nodeActualDurationMs ?: return null
-            return durationMs - prediction.nodePredictedDurationMs
+            val actualDurationMs = nodeActualDurationMs ?: return null
+            return actualDurationMs - prediction.nodePredictedDurationMs
         }
 
-        fun sequencePredictionErrorMs(): Long? {
+        fun nodeUpperBoundSlackMs(): Long? {
             val prediction = prediction ?: return null
-            val durationMs = sequenceActualDurationMs ?: return null
-            return durationMs - prediction.sequencePredictedDurationMs
+            val actualDurationMs = nodeActualDurationMs ?: return null
+            return prediction.nodePredictedUpperBoundMs - actualDurationMs
+        }
+
+        fun sequencePredictionResidualMs(): Long? {
+            val prediction = prediction ?: return null
+            val actualDurationMs = sequenceActualDurationMs ?: return null
+            return actualDurationMs - prediction.sequencePredictedDurationMs
+        }
+
+        fun sequenceUpperBoundSlackMs(): Long? {
+            val prediction = prediction ?: return null
+            val actualDurationMs = sequenceActualDurationMs ?: return null
+            return prediction.sequencePredictedUpperBoundMs - actualDurationMs
         }
     }
 
@@ -223,6 +298,9 @@ class CaptureMetricsExcelExporter(
         private val percentStyle: CellStyle = workbook.createCellStyle().apply {
             dataFormat = this@Styles.dataFormat.getFormat("0.0\"%\"")
         }
+        private val rateStyle: CellStyle = workbook.createCellStyle().apply {
+            dataFormat = this@Styles.dataFormat.getFormat("0.0%")
+        }
 
         fun styleFor(columnTitle: String, value: Any?): CellStyle? {
             if (value !is Number) {
@@ -231,6 +309,7 @@ class CaptureMetricsExcelExporter(
             return when {
                 columnTitle.endsWith("Ms", ignoreCase = true) -> msStyle
                 columnTitle.endsWith("Percent", ignoreCase = true) -> percentStyle
+                columnTitle.endsWith("Rate", ignoreCase = true) -> rateStyle
                 else -> null
             }
         }
@@ -240,52 +319,80 @@ class CaptureMetricsExcelExporter(
         private const val DIR_NAME = "metrics"
         private val FILE_NAME = "${Build.MODEL}_metrics.xlsx"
         private const val MAX_SHEET_NAME_LENGTH = 31
+        private const val ADMIT_BOKEH_PREFIX = "BOKEH("
+        private const val ADMIT_FILTER_PREFIX = "FILTER("
 
         private fun buildCaptureColumns(): List<Column<EnrichedCaptureRow>> = listOf(
             Column("captureIndex") { it.row.captureIndex },
             Column("ppSequenceId") { it.row.metrics.ppSequenceId },
             Column("dsMode") { DynamicShotMode.getDsModeName(it.row.metrics.dsMode) },
             Column("dsExtraInfo") { it.row.metrics.dsExtraInfo },
+            Column("isPendingRequest") { it.row.metrics.draftSequenceMetrics?.isPendingRequest },
             Column("resultImageFormat") { it.row.metrics.resultImageFormat },
             Column("resultImageWidth") { it.row.metrics.resultImageSize.width },
             Column("resultImageHeight") { it.row.metrics.resultImageSize.height },
             Column("resultImageFileName") { it.row.metrics.resultImageFileName },
-            Column("isTimeout") { it.row.metrics.draftSequenceMetrics?.isTimeout },
-            Column("overheatLevel") { it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel },
-            Column("thermalStatus") { it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalStatus },
-            Column("thermalHeadroom") { it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom },
-            Column("totalDurationMs") {
+            Column("draftSequenceNodeCount") { it.row.nodeRows.size.takeIf { nodeCount -> nodeCount > 0 } },
+            Column("draftSequenceDurationMs") {
                 it.row.nodeRows.sumOf { nodeRow -> nodeRow.node.postExecutionMetrics.durationMs }
+                    .takeIf { durationMs -> durationMs > 0L }
             },
-            Column("timeoutCount") { it.timeoutCount?.let { idx -> "#$idx" } },
+            Column("firstNodeOverheatLevel") {
+                it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
+            },
+            Column("firstNodeThermalStatus") {
+                it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalStatus
+            },
+            Column("firstNodeThermalHeadroom") {
+                it.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("hasWatchdogTimeout") { it.row.metrics.draftSequenceMetrics?.hasWatchdogTimeout },
+            Column("isTimeout") { it.row.metrics.draftSequenceMetrics?.isTimeout },
+            Column("") { "" },
+            Column("sessionId") { it.sessionSummary.sessionId },
+            Column("totalShotCount") { "#" +it.sessionSummary.sessionShotCount },
+            Column("timeoutShotCount") { "#" + it.sessionSummary.sessionTimeoutShotCount },
+            Column("bokehAdmitCount") { it.sessionSummary.sessionBokehAdmitCount },
+            Column("bokehTotalCount") { it.sessionSummary.sessionBokehTotalCount },
+            Column("bokehAdmitRate") { it.sessionSummary.sessionBokehAdmitRate },
+            Column("filterAdmitCount") { it.sessionSummary.sessionFilterAdmitCount },
+            Column("filterTotalCount") { it.sessionSummary.sessionFilterTotalCount },
+            Column("filterAdmitRate") { it.sessionSummary.sessionFilterAdmitRate },
         )
 
-        private fun buildNodeColumns(): List<Column<Triple<Int, String, NodeRow>>> = listOf(
-            Column("captureIndex") { it.first },
-            Column("nodeName") { it.second },
-            Column("budgetMs") { it.third.node.preExecutionMetrics.budgetMs },
-            Column("isLowMemory") { it.third.node.preExecutionMetrics.memorySnapshot.isLowMemory },
-            Column("ramAvailablePercent") { it.third.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
-            Column("javaHeapUsedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent },
-            Column("nativeHeapAllocatedPercent") { it.third.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
-            Column("overheatLevel") { it.third.node.preExecutionMetrics.thermalSnapshot.overheatLevel },
-            Column("thermalStatus") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalStatus },
-            Column("thermalHeadroom") { it.third.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
-            Column("storageUsedPercent") { it.third.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
-            Column("cpuTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
-            Column("wallTimeMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
-            Column("runQueueWaitMs") { it.third.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
-            Column("admit") { it.third.prediction?.admit },
+        private fun buildNodeColumns(): List<Column<NodeSheetRow>> = listOf(
+            Column("captureIndex") { it.capture.captureIndex },
+            Column("nodeOrder") { it.nodeOrder },
+            Column("nodeName") { it.nodeRow.node.nodeName },
+            Column("workloadKey") { it.nodeRow.node.workloadKey },
+            Column("isLowMemory") { it.nodeRow.node.preExecutionMetrics.memorySnapshot.isLowMemory },
+            Column("ramAvailablePercent") { it.nodeRow.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent },
+            Column("javaHeapUsedPercent") { it.nodeRow.node.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent },
+            Column("nativeHeapAllocatedPercent") { it.nodeRow.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent },
+            Column("overheatLevel") { it.nodeRow.node.preExecutionMetrics.thermalSnapshot.overheatLevel },
+            Column("thermalStatus") { it.nodeRow.node.preExecutionMetrics.thermalSnapshot.thermalStatus },
+            Column("thermalHeadroom") { it.nodeRow.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom },
+            Column("storageUsedPercent") { it.nodeRow.node.preExecutionMetrics.storageSnapshot.storageUsedPercent },
+            Column("cpuTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
+            Column("wallTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
+            Column("runQueueWaitMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
             Column("") { "" },
-            Column("nodePredictedDurationMs") { it.third.prediction?.nodePredictedDurationMs },
-            Column("nodePredictedUpperBoundMs") { it.third.prediction?.nodePredictedUpperBoundMs },
-            Column("nodeActualDurationMs") { it.third.nodeActualDurationMs },
-            Column("nodePredictionErrorMs") { it.third.nodePredictionErrorMs() },
+            Column("budgetMs") { it.nodeRow.node.preExecutionMetrics.budgetMs },
+            Column("admit") { it.nodeRow.prediction?.admit },
+            Column("durationMs") { it.nodeRow.nodeActualDurationMs },
+            Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
+            Column("watchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },
             Column("") { "" },
-            Column("sequencePredictedDurationMs") { it.third.prediction?.sequencePredictedDurationMs },
-            Column("sequencePredictedUpperBoundMs") { it.third.prediction?.sequencePredictedUpperBoundMs },
-            Column("sequenceActualDurationMs") { it.third.sequenceActualDurationMs },
-            Column("sequencePredictionErrorMs") { it.third.sequencePredictionErrorMs() },
+            Column("nodePredictedDurationMs") { it.nodeRow.prediction?.nodePredictedDurationMs },
+            Column("nodePredictedUpperBoundMs") { it.nodeRow.prediction?.nodePredictedUpperBoundMs },
+            Column("nodePredictionResidualMs") { it.nodeRow.nodePredictionResidualMs() },
+            Column("nodePredictionUpperBoundSlackMs") { it.nodeRow.nodeUpperBoundSlackMs() },
+            Column("") { "" },
+            Column("sequencePredictedDurationMs") { it.nodeRow.prediction?.sequencePredictedDurationMs },
+            Column("sequencePredictedUpperBoundMs") { it.nodeRow.prediction?.sequencePredictedUpperBoundMs },
+            Column("sequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },
+            Column("sequencePredictionResidualMs") { it.nodeRow.sequencePredictionResidualMs() },
+            Column("sequenceUpperBoundSlackMs") { it.nodeRow.sequenceUpperBoundSlackMs() },
         )
     }
 
