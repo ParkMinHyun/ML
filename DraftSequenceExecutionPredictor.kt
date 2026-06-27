@@ -98,7 +98,7 @@ class DraftSequenceExecutionPredictor {
             this[index] = this[index].decayed(SCORE_WEIGHT_DECAY)
         }
         // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
-        // At alpha=0.2 a sample older than ~60 captures weighs < 1e-6 and no longer moves any quantile.
+        // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
         removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
     }
 
@@ -206,8 +206,11 @@ class DraftSequenceExecutionPredictor {
         @JvmStatic
         val instance = DraftSequenceExecutionPredictor()
 
-        private const val WORKLOAD_EWMA_ALPHA = 0.20
-        private const val SCORE_WEIGHT_DECAY = 1.0 - WORKLOAD_EWMA_ALPHA
+        // Decoupled: alpha only tracks the workload level (responsive enough for thermal-throttle ramps);
+        // decay sets the residual memory / safety quantile (effective ESS=(1+d)/(1-d) -> ~95th-pct bound at 0.9),
+        // which self-calibrates to each device's throttling magnitude. Do not re-couple decay to 1 - alpha.
+        private const val WORKLOAD_EWMA_ALPHA = 0.30
+        private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
     }
 }
