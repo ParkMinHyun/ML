@@ -37,7 +37,8 @@ public class SavingDraftImageTaskManager {
     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
     private boolean waitForSavingDraftImageTaskMapDrain = false;
-    private boolean isLastTimeout = false;
+    private boolean isWatchdogDrainInCurrentSession = false;
+    private boolean hasCaptureTimeoutInCurrentSession = false;
 
     /**
      * <div class="camera_en">
@@ -165,6 +166,8 @@ public class SavingDraftImageTaskManager {
         savingDraftImageTaskMap.clear();
         reservedSkipSaveDraftImageIdSet.clear();
         waitForSavingDraftImageTaskMapDrain = false;
+        isWatchdogDrainInCurrentSession = false;
+        hasCaptureTimeoutInCurrentSession = false;
     }
 
     private synchronized void onTaskFinished(int ppSequenceId) {
@@ -174,28 +177,33 @@ public class SavingDraftImageTaskManager {
         }
 
         final ExtraBundle extraBundle = savingDraftImageTask.extraBundle;
-        final boolean watchdogTimedOut = Boolean.TRUE.equals(extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER));
-        if (watchdogTimedOut) {
+        final boolean profilerError = Boolean.TRUE.equals(extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER));
+        if (profilerError) {
             waitForSavingDraftImageTaskMapDrain = true;
+            isWatchdogDrainInCurrentSession |= hasWatchdogTimeout(extraBundle);
             markRemainingTasksToSaveOriginalDraftImageOnly(ppSequenceId);
         }
 
         try {
-            if (waitForSavingDraftImageTaskMapDrain && !watchdogTimedOut) {
+            final boolean recordDrainedTaskMetrics = waitForSavingDraftImageTaskMapDrain &&
+                    isWatchdogDrainInCurrentSession && !profilerError;
+            if (waitForSavingDraftImageTaskMapDrain && !profilerError && !recordDrainedTaskMetrics) {
                 cancelDraftSequenceExecution(extraBundle);
                 CLog.w(TAG, "[mhyun2.park] onTaskFinished : wait for savingDraftImageTaskMap drain - ppSequenceId=%d, remainingTaskCount=%d", ppSequenceId, savingDraftImageTaskMap.size() - 1);
                 return;
             }
-            handleCompletedTask(savingDraftImageTask);
+            handleCompletedTask(savingDraftImageTask, recordDrainedTaskMetrics);
         } finally {
             savingDraftImageTaskMap.remove(ppSequenceId);
             if (savingDraftImageTaskMap.isEmpty()) {
                 waitForSavingDraftImageTaskMapDrain = false;
+                isWatchdogDrainInCurrentSession = false;
+                hasCaptureTimeoutInCurrentSession = false;
             }
         }
     }
 
-    private void handleCompletedTask(@NonNull SavingDraftImageTask savingDraftImageTask) {
+    private void handleCompletedTask(@NonNull SavingDraftImageTask savingDraftImageTask, boolean recordDrainedTaskMetrics) {
         final ExtraBundle extraBundle = savingDraftImageTask.extraBundle;
         final boolean skipSaveDraftImage = savingDraftImageTask.skipSaveDraftImage;
         final boolean isDraftProcessing = Optional.ofNullable(extraBundle.get(ExtraBundle.PROCESSOR_INFO_IS_DRAFT_PROCESSING)).orElse(false);
@@ -203,7 +211,7 @@ public class SavingDraftImageTaskManager {
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
         ConditionChecker.checkNotNull(draftSequenceExecutionProfiler, "draftSequenceExecutionProfiler");
 
-        if (skipSaveDraftImage || isDraftProcessing) {
+        if (skipSaveDraftImage || (isDraftProcessing && !recordDrainedTaskMetrics)) {
             draftSequenceExecutionProfiler.cancelDraftSequenceExecution();
             CLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetric [skipSaveDraftImage: %s, isDraftProcessing: %s]", skipSaveDraftImage, isDraftProcessing);
             return;
@@ -212,23 +220,37 @@ public class SavingDraftImageTaskManager {
         final CaptureMetrics captureMetrics = extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
         ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
 
+        final boolean hasWatchdogTimeout = hasWatchdogTimeout(captureMetrics);
+        if (hasCaptureTimeoutInCurrentSession && !hasWatchdogTimeout) {
+            draftSequenceExecutionProfiler.cancelDraftSequenceExecution();
+            PLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - capture timeout already recorded in current session");
+            return;
+        }
+
         // Complete Encoding and record whether this capture overran its timeout.
         final boolean isTimeout = draftSequenceExecutionProfiler.completeDraftSequenceExecution();
 
-        // Insert until the first timeout of a streak; skip consecutive timeouts after that.
         if (isTimeout) {
-            isLastTimeout = true;
-            PLog.e(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout occurred");
-            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
-            CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
-        } else if (isLastTimeout) {
-            PLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - timeout already recorded");
-        } else {
-            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
-            CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-            CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
+            hasCaptureTimeoutInCurrentSession = true;
+            PLog.e(TAG, "[mhyun2.park] onTaskFinished : capture timeout occurred");
         }
+        insertCaptureMetrics(captureMetrics);
+    }
+
+    private void insertCaptureMetrics(@NonNull CaptureMetrics captureMetrics) {
+        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
+        CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
+        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
+    }
+
+    private boolean hasWatchdogTimeout(@NonNull ExtraBundle extraBundle) {
+        final CaptureMetrics captureMetrics = extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
+        return captureMetrics != null && hasWatchdogTimeout(captureMetrics);
+    }
+
+    private boolean hasWatchdogTimeout(@NonNull CaptureMetrics captureMetrics) {
+        return captureMetrics.getDraftSequenceMetrics() != null &&
+                Boolean.TRUE.equals(captureMetrics.getDraftSequenceMetrics().getHasWatchdogTimeout());
     }
 
     private void cancelDraftSequenceExecution(@NonNull ExtraBundle extraBundle) {
@@ -260,7 +282,8 @@ public class SavingDraftImageTaskManager {
             PLog.e(TAG, "shutDownThreadPool - failed : getting interrupt during wait for shutdown, try to shutdown forcefully");
             savingDraftImageThreadPool.shutdownNow();
         } finally {
-            isLastTimeout = false;
+            isWatchdogDrainInCurrentSession = false;
+            hasCaptureTimeoutInCurrentSession = false;
         }
     }
 }
