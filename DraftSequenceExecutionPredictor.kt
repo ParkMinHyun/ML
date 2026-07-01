@@ -5,7 +5,7 @@ import kotlin.math.ln
 import kotlin.math.roundToLong
 
 /**
- * SeqPAW-UB: Sequence-aware, phase-aware, adaptive upper bound.
+ * Sequence-aware, phase-aware, adaptive upper bound.
  *
  * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated at
  * decision-sequence level from positive residual ratios captured before workload EWMA updates.
@@ -20,11 +20,11 @@ class DraftSequenceExecutionPredictor {
     fun predictAdmission(
         sequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
-    ): SeqPawDecision {
+    ): AdmissionDecision {
         val nodeKey = WorkloadSequenceKey(listOf(sequenceKey.workloads.first()))
         val nodePrediction = predictSequence(nodeKey)
         val sequencePrediction = predictSequence(sequenceKey)
-        return SeqPawDecision(
+        return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
                 admit = sequencePrediction.isColdStart ||
                         sequencePrediction.upperBoundMs <= preExecutionMetrics.budgetMs,
@@ -45,12 +45,12 @@ class DraftSequenceExecutionPredictor {
     fun predictWatchdogTimeout(
         sequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
-    ): SeqPawTimeoutDecision {
+    ): WatchdogTimeoutDecision {
         val decision = predictAdmission(sequenceKey, preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
             .coerceAtLeast(0L)
 
-        return SeqPawTimeoutDecision(timeoutMs, decision)
+        return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
     @Synchronized
@@ -215,14 +215,14 @@ class DraftSequenceExecutionPredictor {
     }
 }
 
-data class SeqPawDecision(
+data class AdmissionDecision(
     val executionPrediction: ExecutionPrediction,
     val sequenceSnapshot: SequencePredictionSnapshot,
 )
 
-data class SeqPawTimeoutDecision(
+data class WatchdogTimeoutDecision(
     val timeoutMs: Long,
-    val decision: SeqPawDecision,
+    val decision: AdmissionDecision,
 )
 
 data class SequencePredictionSnapshot(

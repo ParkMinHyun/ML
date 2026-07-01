@@ -18,7 +18,7 @@ private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
  * Drives one draft sequence's node lifecycle. Workload durations are collected during node execution,
- * then SeqPAW-UB receives decision-time prediction snapshots and actual workload durations at capture end.
+ * then Predictor's UB receives decision-time prediction snapshots and actual workload durations at capture end.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
@@ -148,7 +148,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    /** Completes the COMPLETE workload, updates SeqPAW-UB, and records whether this capture timed out. */
+    /** Completes the COMPLETE workload, updates Predictor's UB, and records whether this capture timed out. */
     fun completeDraftSequenceExecution(): Boolean {
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
@@ -196,7 +196,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return timeoutDecision.timeoutMs
     }
 
-    private fun rememberDecision(decision: SeqPawDecision) {
+    private fun rememberDecision(decision: AdmissionDecision) {
         synchronized(sequenceLock) {
             sequenceSnapshots[decision.sequenceSnapshot.sequenceKey] = decision.sequenceSnapshot
         }
