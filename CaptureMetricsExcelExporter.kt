@@ -57,6 +57,10 @@ class CaptureMetricsExcelExporter(
 
             val enrichedNormalCaptures = processCaptures(rawCaptures)
 
+            writeSheet(workbook, styles, "DecisionQuality", buildDecisionQualitySummaries(enrichedNormalCaptures), buildDecisionQualityColumns())
+            writeSheet(workbook, styles, "PolicyOutcome", buildPolicyOutcomeSummaries(enrichedNormalCaptures), buildPolicyOutcomeColumns())
+            writeSheet(workbook, styles, "MetricNotes", buildMetricNotes(), buildMetricNoteColumns())
+
             // Write main sheet
             writeSheet(workbook, styles, "Capture", enrichedNormalCaptures, buildCaptureColumns())
 
@@ -152,6 +156,54 @@ class CaptureMetricsExcelExporter(
         }
     }
 
+    private fun buildDecisionQualitySummaries(captures: List<EnrichedCaptureRow>): List<DecisionQualitySummary> {
+        return captureGroups(captures.map { it.row }).flatMap { group ->
+            listOf(
+                DecisionQualitySummary.from(group.name, ADMISSION_STAGE_BOKEH, group.captures),
+                DecisionQualitySummary.from(group.name, ADMISSION_STAGE_FILTER, group.captures),
+            )
+        }
+    }
+
+    private fun buildPolicyOutcomeSummaries(captures: List<EnrichedCaptureRow>): List<PolicyOutcomeSummary> {
+        return captureGroups(captures.map { it.row }).map { group ->
+            PolicyOutcomeSummary.from(group.name, group.captures)
+        }
+    }
+
+    private fun captureGroups(captures: List<CaptureRow>): List<CaptureGroup> {
+        if (captures.isEmpty()) {
+            return listOf(CaptureGroup("All", captures))
+        }
+
+        val groups = mutableListOf(CaptureGroup("All", captures))
+        captures.groupBy { it.firstNodeLowMemoryLabel() }
+            .toSortedMap()
+            .forEach { (name, groupCaptures) ->
+                groups += CaptureGroup(name, groupCaptures)
+            }
+        return groups
+    }
+
+    private fun buildMetricNotes(): List<MetricNote> = listOf(
+        MetricNote(
+            metric = "DecisionQuality admit metrics",
+            note = "Admit success, unsafe admit, and UB miss are evaluated only when the admitted suffix is observed online. A timeout or watchdog after admit is counted as unsafe.",
+        ),
+        MetricNote(
+            metric = "Bokeh admit correctness",
+            note = "Bokeh suffix correctness requires the full Bokeh-to-tail suffix. If Bokeh is admitted but a later optional stage is skipped, online logs do not contain that counterfactual stage time.",
+        ),
+        MetricNote(
+            metric = "Skip correctness",
+            note = "Correct Skip, Unnecessary Skip, overall decision accuracy, and balanced decision accuracy require full-execution offline replay or shadow execution.",
+        ),
+        MetricNote(
+            metric = "PolicyOutcome",
+            note = "Sequential outcomes are mutually exclusive per capture and are the right place to discuss Filter preservation and observed Filter loss after Bokeh admit.",
+        ),
+    )
+
     private fun <T> writeSheet(
         workbook: Workbook,
         styles: Styles,
@@ -221,7 +273,57 @@ class CaptureMetricsExcelExporter(
         val captureIndex: Int,
         val metrics: CaptureMetrics,
         val nodeRows: List<NodeRow>,
-    )
+    ) {
+        val bokehDecisionRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.isBokehWorkload && it.prediction != null }
+
+        val filterDecisionRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
+
+        val hasTimeoutFailure: Boolean
+            get() = metrics.draftSequenceMetrics?.isTimeout == true
+
+        val hasWatchdogFailure: Boolean
+            get() = metrics.draftSequenceMetrics?.hasWatchdogTimeout == true ||
+                    nodeRows.any { it.node.watchdogTimedOut == true }
+
+        val hasTimeoutOrWatchdogFailure: Boolean
+            get() = hasTimeoutFailure || hasWatchdogFailure
+
+        val isFilterPreserved: Boolean
+            get() = filterDecisionRow?.wasAdmitted == true
+
+        fun firstNodeLowMemoryLabel(): String {
+            val isLowMemory = nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
+                ?: return "Memory Not Recorded"
+            return "LowMemory=$isLowMemory"
+        }
+
+        fun policyOutcome(): PolicyOutcome {
+            if (hasTimeoutFailure) {
+                return PolicyOutcome.TIMEOUT_FAILURE
+            }
+            if (hasWatchdogFailure) {
+                return PolicyOutcome.WATCHDOG_FAILURE
+            }
+
+            val bokehDecision = bokehDecisionRow
+            val filterDecision = filterDecisionRow
+            val bokehCompleted = bokehDecision?.wasCompleted == true
+            val filterCompleted = filterDecision?.wasCompleted == true
+            val bokehSkipped = bokehDecision?.wasSkipped == true
+            val filterSkipped = filterDecision?.wasSkipped == true
+
+            return when {
+                bokehCompleted && filterCompleted -> PolicyOutcome.FULL_FEATURE_SUCCESS
+                bokehSkipped && filterCompleted -> PolicyOutcome.SELECTIVE_BOKEH_SKIP_SUCCESS
+                bokehDecision?.wasAdmitted == true && filterDecision != null && !filterCompleted ->
+                    PolicyOutcome.OBSERVED_FILTER_LOSS_AFTER_BOKEH_ADMIT
+                bokehSkipped && filterSkipped -> PolicyOutcome.TAIL_ONLY_SAFE
+                else -> PolicyOutcome.OTHER
+            }
+        }
+    }
 
     private class SessionSummary(
         val sessionId: Int,
@@ -248,7 +350,70 @@ class CaptureMetricsExcelExporter(
         val capture: CaptureRow,
         val nodeOrder: Int,
         val nodeRow: NodeRow,
-    )
+    ) {
+        fun admissionStage(): String? = nodeRow.admissionStage()
+
+        fun observedActualFeasible(): Boolean? {
+            if (!isFullyObservedSuffix()) {
+                return null
+            }
+            val actualDurationMs = nodeRow.sequenceActualDurationMs ?: return null
+            return actualDurationMs <= nodeRow.node.preExecutionMetrics.budgetMs
+        }
+
+        fun sequenceUpperBoundMiss(): Boolean? {
+            if (!isFullyObservedSuffix()) {
+                return null
+            }
+            val prediction = nodeRow.prediction ?: return null
+            val actualDurationMs = nodeRow.sequenceActualDurationMs ?: return null
+            return actualDurationMs > prediction.sequencePredictedUpperBoundMs
+        }
+
+        fun decisionOutcome(): DecisionOutcome? {
+            val prediction = nodeRow.prediction ?: return null
+            if (!nodeRow.isAdmissionWorkload) {
+                return null
+            }
+            if (!prediction.admit) {
+                return DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
+            }
+            if (capture.hasTimeoutOrWatchdogFailure || nodeRow.node.watchdogTimedOut == true) {
+                return DecisionOutcome.UNSAFE_ADMIT
+            }
+
+            val actualFeasible = observedActualFeasible() ?: return DecisionOutcome.ADMIT_OUTCOME_NOT_FULLY_OBSERVED
+            return if (actualFeasible) {
+                DecisionOutcome.CORRECT_ADMIT
+            } else {
+                DecisionOutcome.UNSAFE_ADMIT
+            }
+        }
+
+        fun decisionOutcomeLabel(): String? = decisionOutcome()?.label
+
+        fun observationStatus(): String? {
+            if (!nodeRow.isAdmissionWorkload || nodeRow.prediction == null) {
+                return null
+            }
+            return when (decisionOutcome()) {
+                DecisionOutcome.CORRECT_ADMIT,
+                DecisionOutcome.UNSAFE_ADMIT -> "Online observed"
+                DecisionOutcome.ADMIT_OUTCOME_NOT_FULLY_OBSERVED -> "Admit suffix not fully observed"
+                DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE -> "Offline oracle required"
+                null -> null
+            }
+        }
+
+        private fun isFullyObservedSuffix(): Boolean {
+            if (!nodeRow.isAdmissionWorkload || nodeRow.prediction == null) {
+                return false
+            }
+
+            val suffixRows = capture.nodeRows.drop(nodeOrder - 1)
+            return suffixRows.isNotEmpty() && suffixRows.all { it.nodeActualDurationMs != null }
+        }
+    }
 
     private class NodeRow(
         val node: NodeExecutionMetrics,
@@ -263,6 +428,26 @@ class CaptureMetricsExcelExporter(
 
         val isFilterWorkload: Boolean
             get() = node.workloadKey?.startsWith(ADMIT_FILTER_PREFIX) == true
+
+        val isAdmissionWorkload: Boolean
+            get() = isBokehWorkload || isFilterWorkload
+
+        val wasAdmitted: Boolean?
+            get() = prediction?.admit
+
+        val wasSkipped: Boolean
+            get() = prediction?.admit == false
+
+        val wasCompleted: Boolean
+            get() = prediction?.admit == true && nodeActualDurationMs != null
+
+        fun admissionStage(): String? {
+            return when {
+                isBokehWorkload -> ADMISSION_STAGE_BOKEH
+                isFilterWorkload -> ADMISSION_STAGE_FILTER
+                else -> null
+            }
+        }
 
         fun nodePredictionResidualMs(): Long? {
             val prediction = prediction ?: return null
@@ -287,6 +472,185 @@ class CaptureMetricsExcelExporter(
             val actualDurationMs = sequenceActualDurationMs ?: return null
             return prediction.sequencePredictedUpperBoundMs - actualDurationMs
         }
+    }
+
+    private class CaptureGroup(
+        val name: String,
+        val captures: List<CaptureRow>,
+    )
+
+    private class DecisionQualitySummary(
+        val group: String,
+        val decision: String,
+        val decisionCount: Int,
+        val admitDecisionCount: Int,
+        val skipDecisionCount: Int,
+        val observedAdmitDecisionCount: Int,
+        val correctAdmitCount: Int,
+        val unsafeAdmitCount: Int,
+        val admitOutcomeNotFullyObservedCount: Int,
+        val admitSuccessRate: Double?,
+        val unsafeAdmitRate: Double?,
+        val ubEvaluatedCount: Int,
+        val ubMissCount: Int,
+        val ubMissRate: Double?,
+        val skipCorrectnessStatus: String,
+    ) {
+        companion object {
+            fun from(group: String, decision: String, captures: List<CaptureRow>): DecisionQualitySummary {
+                val decisionRows = captures.flatMap { capture ->
+                    capture.nodeRows.mapIndexed { index, nodeRow ->
+                        NodeSheetRow(capture, index + 1, nodeRow)
+                    }
+                }.filter {
+                    it.admissionStage() == decision
+                }
+
+                val correctAdmitCount = decisionRows.count {
+                    it.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT
+                }
+                val unsafeAdmitCount = decisionRows.count {
+                    it.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT
+                }
+                val observedAdmitDecisionCount = correctAdmitCount + unsafeAdmitCount
+                val admitOutcomeNotFullyObservedCount = decisionRows.count {
+                    it.decisionOutcome() == DecisionOutcome.ADMIT_OUTCOME_NOT_FULLY_OBSERVED
+                }
+                val ubEvaluatedCount = decisionRows.count {
+                    it.sequenceUpperBoundMiss() != null
+                }
+                val ubMissCount = decisionRows.count {
+                    it.sequenceUpperBoundMiss() == true
+                }
+
+                return DecisionQualitySummary(
+                    group = group,
+                    decision = decision,
+                    decisionCount = decisionRows.size,
+                    admitDecisionCount = decisionRows.count { it.nodeRow.prediction?.admit == true },
+                    skipDecisionCount = decisionRows.count { it.nodeRow.prediction?.admit == false },
+                    observedAdmitDecisionCount = observedAdmitDecisionCount,
+                    correctAdmitCount = correctAdmitCount,
+                    unsafeAdmitCount = unsafeAdmitCount,
+                    admitOutcomeNotFullyObservedCount = admitOutcomeNotFullyObservedCount,
+                    admitSuccessRate = rate(correctAdmitCount, observedAdmitDecisionCount),
+                    unsafeAdmitRate = rate(unsafeAdmitCount, observedAdmitDecisionCount),
+                    ubEvaluatedCount = ubEvaluatedCount,
+                    ubMissCount = ubMissCount,
+                    ubMissRate = rate(ubMissCount, ubEvaluatedCount),
+                    skipCorrectnessStatus = "Requires offline oracle",
+                )
+            }
+        }
+    }
+
+    private class PolicyOutcomeSummary(
+        val group: String,
+        val captureCount: Int,
+        val timeoutCount: Int,
+        val timeoutRate: Double?,
+        val watchdogTriggerCount: Int,
+        val watchdogTriggerRate: Double?,
+        val filterPreservedCount: Int,
+        val filterPreservationRate: Double?,
+        val bokehExecutedCount: Int,
+        val bokehExecutionRate: Double?,
+        val bothSkippedCount: Int,
+        val bothSkippedRate: Double?,
+        val fullFeatureSuccessCount: Int,
+        val fullFeatureSuccessRate: Double?,
+        val selectiveBokehSkipSuccessCount: Int,
+        val selectiveBokehSkipSuccessRate: Double?,
+        val observedFilterLossAfterBokehAdmitCount: Int,
+        val observedFilterLossAfterBokehAdmitRate: Double?,
+        val tailOnlySafeCount: Int,
+        val tailOnlySafeRate: Double?,
+        val timeoutFailureCount: Int,
+        val timeoutFailureRate: Double?,
+        val watchdogFailureCount: Int,
+        val watchdogFailureRate: Double?,
+        val otherCount: Int,
+        val otherRate: Double?,
+    ) {
+        companion object {
+            fun from(group: String, captures: List<CaptureRow>): PolicyOutcomeSummary {
+                val total = captures.size
+                val timeoutCount = captures.count { it.metrics.draftSequenceMetrics?.isTimeout == true }
+                val watchdogTriggerCount = captures.count {
+                    it.metrics.draftSequenceMetrics?.hasWatchdogTimeout == true ||
+                            it.nodeRows.any { nodeRow -> nodeRow.node.watchdogTimedOut == true }
+                }
+                val filterPreservedCount = captures.count { it.isFilterPreserved }
+                val bokehExecutedCount = captures.count {
+                    it.bokehDecisionRow?.wasAdmitted == true
+                }
+                val bothSkippedCount = captures.count {
+                    it.bokehDecisionRow?.wasSkipped == true && it.filterDecisionRow?.wasSkipped == true
+                }
+                val outcomeCounts = captures.groupingBy { it.policyOutcome() }.eachCount()
+                val fullFeatureSuccessCount = outcomeCounts[PolicyOutcome.FULL_FEATURE_SUCCESS].orZero()
+                val selectiveBokehSkipSuccessCount = outcomeCounts[PolicyOutcome.SELECTIVE_BOKEH_SKIP_SUCCESS].orZero()
+                val observedFilterLossAfterBokehAdmitCount =
+                    outcomeCounts[PolicyOutcome.OBSERVED_FILTER_LOSS_AFTER_BOKEH_ADMIT].orZero()
+                val tailOnlySafeCount = outcomeCounts[PolicyOutcome.TAIL_ONLY_SAFE].orZero()
+                val timeoutFailureCount = outcomeCounts[PolicyOutcome.TIMEOUT_FAILURE].orZero()
+                val watchdogFailureCount = outcomeCounts[PolicyOutcome.WATCHDOG_FAILURE].orZero()
+                val otherCount = outcomeCounts[PolicyOutcome.OTHER].orZero()
+
+                return PolicyOutcomeSummary(
+                    group = group,
+                    captureCount = total,
+                    timeoutCount = timeoutCount,
+                    timeoutRate = rate(timeoutCount, total),
+                    watchdogTriggerCount = watchdogTriggerCount,
+                    watchdogTriggerRate = rate(watchdogTriggerCount, total),
+                    filterPreservedCount = filterPreservedCount,
+                    filterPreservationRate = rate(filterPreservedCount, total),
+                    bokehExecutedCount = bokehExecutedCount,
+                    bokehExecutionRate = rate(bokehExecutedCount, total),
+                    bothSkippedCount = bothSkippedCount,
+                    bothSkippedRate = rate(bothSkippedCount, total),
+                    fullFeatureSuccessCount = fullFeatureSuccessCount,
+                    fullFeatureSuccessRate = rate(fullFeatureSuccessCount, total),
+                    selectiveBokehSkipSuccessCount = selectiveBokehSkipSuccessCount,
+                    selectiveBokehSkipSuccessRate = rate(selectiveBokehSkipSuccessCount, total),
+                    observedFilterLossAfterBokehAdmitCount = observedFilterLossAfterBokehAdmitCount,
+                    observedFilterLossAfterBokehAdmitRate = rate(observedFilterLossAfterBokehAdmitCount, total),
+                    tailOnlySafeCount = tailOnlySafeCount,
+                    tailOnlySafeRate = rate(tailOnlySafeCount, total),
+                    timeoutFailureCount = timeoutFailureCount,
+                    timeoutFailureRate = rate(timeoutFailureCount, total),
+                    watchdogFailureCount = watchdogFailureCount,
+                    watchdogFailureRate = rate(watchdogFailureCount, total),
+                    otherCount = otherCount,
+                    otherRate = rate(otherCount, total),
+                )
+            }
+
+            private fun Int?.orZero(): Int = this ?: 0
+        }
+    }
+
+    private class MetricNote(
+        val metric: String,
+        val note: String,
+    )
+
+    private enum class DecisionOutcome(val label: String) {
+        CORRECT_ADMIT("Correct Admit"),
+        UNSAFE_ADMIT("Unsafe Admit"),
+        ADMIT_OUTCOME_NOT_FULLY_OBSERVED("Admit Outcome Not Fully Observed"),
+        SKIP_REQUIRES_OFFLINE_ORACLE("Skip Requires Offline Oracle"),
+    }
+
+    private enum class PolicyOutcome(val label: String) {
+        FULL_FEATURE_SUCCESS("Full Feature Success"),
+        SELECTIVE_BOKEH_SKIP_SUCCESS("Selective Bokeh Skip Success"),
+        OBSERVED_FILTER_LOSS_AFTER_BOKEH_ADMIT("Observed Filter Loss after Bokeh Admit"),
+        TAIL_ONLY_SAFE("Tail-only Safe"),
+        TIMEOUT_FAILURE("Timeout Failure"),
+        WATCHDOG_FAILURE("Watchdog Failure"),
+        OTHER("Other"),
     }
 
     /** Cell number formats keyed by column-title suffix. */
@@ -321,6 +685,15 @@ class CaptureMetricsExcelExporter(
         private const val MAX_SHEET_NAME_LENGTH = 31
         private const val ADMIT_BOKEH_PREFIX = "BOKEH("
         private const val ADMIT_FILTER_PREFIX = "FILTER("
+        private const val ADMISSION_STAGE_BOKEH = "Bokeh"
+        private const val ADMISSION_STAGE_FILTER = "Filter"
+
+        private fun rate(numerator: Int, denominator: Int): Double? {
+            if (denominator <= 0) {
+                return null
+            }
+            return numerator.toDouble() / denominator.toDouble()
+        }
 
         private fun buildCaptureColumns(): List<Column<EnrichedCaptureRow>> = listOf(
             Column("captureIndex") { it.row.captureIndex },
@@ -348,6 +721,13 @@ class CaptureMetricsExcelExporter(
             },
             Column("hasWatchdogTimeout") { it.row.metrics.draftSequenceMetrics?.hasWatchdogTimeout },
             Column("isTimeout") { it.row.metrics.draftSequenceMetrics?.isTimeout },
+            Column("hasTimeoutOrWatchdogFailure") { it.row.hasTimeoutOrWatchdogFailure },
+            Column("bokehAdmitted") { it.row.bokehDecisionRow?.wasAdmitted },
+            Column("bokehCompleted") { it.row.bokehDecisionRow?.wasCompleted },
+            Column("filterAdmitted") { it.row.filterDecisionRow?.wasAdmitted },
+            Column("filterCompleted") { it.row.filterDecisionRow?.wasCompleted },
+            Column("filterPreserved") { it.row.isFilterPreserved },
+            Column("sequentialPolicyOutcome") { it.row.policyOutcome().label },
             Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
@@ -382,6 +762,10 @@ class CaptureMetricsExcelExporter(
             Column("durationMs") { it.nodeRow.nodeActualDurationMs },
             Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
             Column("watchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },
+            Column("admissionStage") { it.admissionStage() },
+            Column("decisionOutcome") { it.decisionOutcomeLabel() },
+            Column("decisionObservationStatus") { it.observationStatus() },
+            Column("observedActualFeasible") { it.observedActualFeasible() },
             Column("") { "" },
             Column("nodePredictedDurationMs") { it.nodeRow.prediction?.nodePredictedDurationMs },
             Column("nodePredictedUpperBoundMs") { it.nodeRow.prediction?.nodePredictedUpperBoundMs },
@@ -393,6 +777,59 @@ class CaptureMetricsExcelExporter(
             Column("sequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },
             Column("sequencePredictionResidualMs") { it.nodeRow.sequencePredictionResidualMs() },
             Column("sequenceUpperBoundSlackMs") { it.nodeRow.sequenceUpperBoundSlackMs() },
+            Column("sequenceUpperBoundMiss") { it.sequenceUpperBoundMiss() },
+        )
+
+        private fun buildDecisionQualityColumns(): List<Column<DecisionQualitySummary>> = listOf(
+            Column("group") { it.group },
+            Column("decision") { it.decision },
+            Column("decisionCount") { it.decisionCount },
+            Column("admitDecisionCount") { it.admitDecisionCount },
+            Column("skipDecisionCount") { it.skipDecisionCount },
+            Column("observedAdmitDecisionCount") { it.observedAdmitDecisionCount },
+            Column("correctAdmitCount") { it.correctAdmitCount },
+            Column("unsafeAdmitCount") { it.unsafeAdmitCount },
+            Column("admitOutcomeNotFullyObservedCount") { it.admitOutcomeNotFullyObservedCount },
+            Column("admitSuccessRate") { it.admitSuccessRate },
+            Column("unsafeAdmitRate") { it.unsafeAdmitRate },
+            Column("ubEvaluatedCount") { it.ubEvaluatedCount },
+            Column("ubMissCount") { it.ubMissCount },
+            Column("ubMissRate") { it.ubMissRate },
+            Column("skipCorrectnessStatus") { it.skipCorrectnessStatus },
+        )
+
+        private fun buildPolicyOutcomeColumns(): List<Column<PolicyOutcomeSummary>> = listOf(
+            Column("group") { it.group },
+            Column("captureCount") { it.captureCount },
+            Column("timeoutCount") { it.timeoutCount },
+            Column("timeoutRate") { it.timeoutRate },
+            Column("watchdogTriggerCount") { it.watchdogTriggerCount },
+            Column("watchdogTriggerRate") { it.watchdogTriggerRate },
+            Column("filterPreservedCount") { it.filterPreservedCount },
+            Column("filterPreservationRate") { it.filterPreservationRate },
+            Column("bokehExecutedCount") { it.bokehExecutedCount },
+            Column("bokehExecutionRate") { it.bokehExecutionRate },
+            Column("bothSkippedCount") { it.bothSkippedCount },
+            Column("bothSkippedRate") { it.bothSkippedRate },
+            Column("fullFeatureSuccessCount") { it.fullFeatureSuccessCount },
+            Column("fullFeatureSuccessRate") { it.fullFeatureSuccessRate },
+            Column("selectiveBokehSkipSuccessCount") { it.selectiveBokehSkipSuccessCount },
+            Column("selectiveBokehSkipSuccessRate") { it.selectiveBokehSkipSuccessRate },
+            Column("observedFilterLossAfterBokehAdmitCount") { it.observedFilterLossAfterBokehAdmitCount },
+            Column("observedFilterLossAfterBokehAdmitRate") { it.observedFilterLossAfterBokehAdmitRate },
+            Column("tailOnlySafeCount") { it.tailOnlySafeCount },
+            Column("tailOnlySafeRate") { it.tailOnlySafeRate },
+            Column("timeoutFailureCount") { it.timeoutFailureCount },
+            Column("timeoutFailureRate") { it.timeoutFailureRate },
+            Column("watchdogFailureCount") { it.watchdogFailureCount },
+            Column("watchdogFailureRate") { it.watchdogFailureRate },
+            Column("otherCount") { it.otherCount },
+            Column("otherRate") { it.otherRate },
+        )
+
+        private fun buildMetricNoteColumns(): List<Column<MetricNote>> = listOf(
+            Column("metric") { it.metric },
+            Column("note") { it.note },
         )
     }
 

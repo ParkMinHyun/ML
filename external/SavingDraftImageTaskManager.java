@@ -220,10 +220,10 @@ public class SavingDraftImageTaskManager {
         final CaptureMetrics captureMetrics = extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
         ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
 
-        final boolean hasWatchdogTimeout = hasWatchdogTimeout(captureMetrics);
-        if (hasCaptureTimeoutInCurrentSession && !hasWatchdogTimeout) {
+        if (hasCaptureTimeoutInCurrentSession) {
             draftSequenceExecutionProfiler.cancelDraftSequenceExecution();
-            PLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - capture timeout already recorded in current session");
+            PLog.w(TAG, "[mhyun2.park] onTaskFinished : skip insert captureMetrics - capture timeout already recorded in current session, ppSequenceId=%d",
+                    captureMetrics.getPpSequenceId());
             return;
         }
 
@@ -238,9 +238,10 @@ public class SavingDraftImageTaskManager {
     }
 
     private void insertCaptureMetrics(@NonNull CaptureMetrics captureMetrics) {
-        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E");
+        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E - ppSequenceId=%d", captureMetrics.getPpSequenceId());
         CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - " + captureMetrics.getDraftSequenceMetrics());
+        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - %s",
+                captureMetrics.getPpSequenceId(), captureMetrics.getDraftSequenceMetrics());
     }
 
     private boolean hasWatchdogTimeout(@NonNull ExtraBundle extraBundle) {
