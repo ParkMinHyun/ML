@@ -105,11 +105,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         return when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> {
-                val watchdogTimeoutMs = watchdogTimeoutMs(workloadSequenceKey, preExecutionMetrics)
-                metricsRecorder.onWatchdogArmed(nodeExecutionMetrics, watchdogTimeoutMs)
+                val watchdogDecision = predictor.predictWatchdogTimeout(workloadSequenceKey, preExecutionMetrics)
+                watchdogDecision.decision?.let(modelUpdate::remember)
+                metricsRecorder.onWatchdogArmed(nodeExecutionMetrics, watchdogDecision.timeoutMs)
                 DraftSequenceExecutionSession.forAdmitWorkload(
                     shouldRun = prediction.admit,
-                    watchdogTimeoutMs = watchdogTimeoutMs,
+                    watchdogTimeoutMs = watchdogDecision.timeoutMs,
                     onTimedOutTask = { worker ->
                         nodeChainLifecycle.waitFor(worker)
                         metricsRecorder.onWatchdogTimedOut(nodeExecutionMetrics)
@@ -158,24 +159,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun cancelDraftSequenceExecution() {
         pendingCompleteSession?.cancel()
         pendingCompleteSession = null
-    }
-
-    private fun watchdogTimeoutMs(
-        workloadSequenceKey: WorkloadSequenceKey,
-        preExecutionMetrics: PreExecutionMetrics,
-    ): Long {
-        // ADMIT watchdogs reserve only the mandatory COMPLETE workload.
-        // OBSERVE workloads are measured but not protected here.
-        val reserveWorkloadKeys = workloadSequenceKey.workloadKeys
-            .drop(1)
-            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
-        if (reserveWorkloadKeys.isEmpty()) {
-            return preExecutionMetrics.budgetMs.coerceAtLeast(0L)
-        }
-
-        val timeoutDecision = predictor.predictWatchdogTimeout(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
-        modelUpdate.remember(timeoutDecision.decision)
-        return timeoutDecision.timeoutMs
     }
 
     private fun plannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {

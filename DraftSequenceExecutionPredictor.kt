@@ -50,13 +50,26 @@ class DraftSequenceExecutionPredictor {
         )
     }
 
+    /**
+     * Watchdog budget for the ADMIT workload at the head of [workloadSequenceKey]: the time left after reserving
+     * the sequence's mandatory COMPLETE tail. OBSERVE workloads are measured but not reserved for.
+     * [WatchdogTimeoutDecision.decision] is null when the sequence has no mandatory tail - the whole budget is
+     * granted and there is nothing to calibrate.
+     */
     @Synchronized
     fun predictWatchdogTimeout(
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
+        val reserveWorkloadKeys = workloadSequenceKey.workloadKeys
+            .drop(1)
+            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
+        if (reserveWorkloadKeys.isEmpty()) {
+            return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
+        }
+
         // The watchdog reservation is not queue-gated; this internal decision's admit bit is unused.
-        val decision = predictAdmission(workloadSequenceKey, queuePressureGroup = null, preExecutionMetrics)
+        val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), queuePressureGroup = null, preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
             .coerceAtLeast(0L)
 
@@ -304,7 +317,8 @@ data class AdmissionDecision(
 
 data class WatchdogTimeoutDecision(
     val timeoutMs: Long,
-    val decision: AdmissionDecision,
+    /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
+    val decision: AdmissionDecision?,
 )
 
 internal data class ScoreSample(
