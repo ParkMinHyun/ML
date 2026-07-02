@@ -1,6 +1,5 @@
 package com.samsung.android.camera.core2.ml
 
-import com.samsung.android.camera.core2.node.MultiFrameNodeBase
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToLong
@@ -13,16 +12,15 @@ import kotlin.math.roundToLong
  */
 class DraftSequenceExecutionPredictor {
 
-    private val workloadKeyModelMap = mutableMapOf<WorkloadKey, WorkloadEwmaModel>()
+    private val workloadTrendMap = mutableMapOf<WorkloadKey, WorkloadTrend>()
     private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
-    private val workloadSequenceShapeScoreMap = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
+    private val workloadSequenceShapeScoreMap = mutableMapOf<List<Class<out WorkloadKey>>, MutableList<ScoreSample>>()
 
-    private val queuePressureBudgetTrendMap = mutableMapOf<Class<out MultiFrameNodeBase>, BudgetTrend>()
+    private val queueBudgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
 
     @Synchronized
     fun predictAdmission(
         workloadSequenceKey: WorkloadSequenceKey,
-        queuePressureGroup: Class<out MultiFrameNodeBase>?,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
         // Memoized per decision: predictedWorkloadDuration scans the sibling models, and the suffix walk in
@@ -30,8 +28,9 @@ class DraftSequenceExecutionPredictor {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::predictedWorkloadDuration)
         val sequencePredictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = correctedSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
+        val isQueuePressureGated = workloadSequenceKey.isQueuePressureGated
         val admit = admitUnderBudgetPolicy(
-            queuePressureGroup,
+            isQueuePressureGated,
             sequencePredictedMs,
             sequenceUpperBoundMs,
             preExecutionMetrics.budgetMs,
@@ -42,7 +41,7 @@ class DraftSequenceExecutionPredictor {
                 sequencePredictedDurationMs = sequencePredictedMs.roundToNonNegativeLong(),
                 sequencePredictedUpperBoundMs = sequenceUpperBoundMs.roundToNonNegativeLong(),
                 workloadSequenceKey = workloadSequenceKey.toReplayString(),
-                queuePressureGroup = queuePressureGroup?.simpleName,
+                queuePressureGroup = "MULTI_FRAME".takeIf { isQueuePressureGated },
             ),
             workloadSequenceKey = workloadSequenceKey,
             sequencePredictedMs = sequencePredictedMs,
@@ -68,8 +67,9 @@ class DraftSequenceExecutionPredictor {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
-        // The watchdog reservation is not queue-gated; this internal decision's admit bit is unused.
-        val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), queuePressureGroup = null, preExecutionMetrics)
+        // The reserve tail is COMPLETE-only, so this internal decision is naturally not queue-pressure gated;
+        // its admit bit is unused.
+        val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
             .coerceAtLeast(0L)
 
@@ -77,15 +77,12 @@ class DraftSequenceExecutionPredictor {
     }
 
     @Synchronized
-    fun observeQueuePressureBudget(
-        queuePressureGroup: Class<out MultiFrameNodeBase>,
-        budgetMs: Long,
-    ) {
-        queuePressureBudgetTrendMap.getOrPut(queuePressureGroup) { BudgetTrend(WORKLOAD_EWMA_ALPHA) }.observe(budgetMs)
+    fun observeQueuePressureBudget(budgetMs: Long) {
+        queueBudgetTrend.observe(budgetMs)
     }
 
     private fun admitUnderBudgetPolicy(
-        queuePressureGroup: Class<out MultiFrameNodeBase>?,
+        isQueuePressureGated: Boolean,
         sequencePredictedMs: Double,
         sequenceUpperBoundMs: Double,
         budgetMs: Long,
@@ -93,7 +90,7 @@ class DraftSequenceExecutionPredictor {
         return when {
             // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
             sequencePredictedMs <= 0.0 -> true
-            queuePressureGroup != null -> admitsUnderQueue(queuePressureGroup, sequenceUpperBoundMs, budgetMs)
+            isQueuePressureGated -> admitsUnderQueue(sequenceUpperBoundMs, budgetMs)
             else -> sequenceUpperBoundMs <= budgetMs
         }
     }
@@ -101,12 +98,11 @@ class DraftSequenceExecutionPredictor {
     /**
      * ADMIT gate. Deadline safety alone (UB <= budget) only reacts once the queue is at the cliff, so a heavy head
      * (e.g. 24MP) can build a backlog the mandatory tail can no longer undo. This additionally holds the queue
-     * stable: while this group's budget is shrinking shot over shot (trend < 0 = falling behind the shutter rate),
+     * stable: while the queue's budget is shrinking shot over shot (trend < 0 = falling behind the shutter rate),
      * it keeps [ADMIT_RUNWAY_SHOTS] shots of headroom before a shot stops fitting. No device-specific millisecond
      * threshold: the trigger is derived from the measured budget trend and the learned upper bound.
      */
     private fun admitsUnderQueue(
-        queuePressureGroup: Class<out MultiFrameNodeBase>,
         upperBoundMs: Double,
         budgetMs: Long,
     ): Boolean {
@@ -114,7 +110,7 @@ class DraftSequenceExecutionPredictor {
         if (slackMs < 0.0) {
             return false
         }
-        val trendMs = queuePressureBudgetTrendMap[queuePressureGroup]?.trendMs ?: return true
+        val trendMs = queueBudgetTrend.trendMs ?: return true
         if (trendMs >= 0.0) {
             return true
         }
@@ -131,7 +127,7 @@ class DraftSequenceExecutionPredictor {
         addScoreSamples(validWorkloadDurations, admissionDecisions)
 
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            workloadKeyModelMap.getOrPut(workloadKey) { WorkloadEwmaModel() }.update(durationMs.toDouble())
+            workloadTrendMap.getOrPut(workloadKey) { WorkloadTrend() }.update(durationMs.toDouble())
         }
     }
 
@@ -211,7 +207,7 @@ class DraftSequenceExecutionPredictor {
         // keeps the following MP12 conservative. max() lets cross-size only raise the estimate, never lower it;
         // the sibling with ratio 1.0 is the workload's own model. Predict-time only: the scaled value is never fed
         // back into any model, so buckets never learn from each other.
-        return workloadKeyModelMap.entries
+        return workloadTrendMap.entries
             .filter { it.key.javaClass == workloadKey.javaClass }
             .maxOfOrNull { (siblingKey, model) ->
                 model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket)
@@ -245,7 +241,8 @@ class DraftSequenceExecutionPredictor {
         return total.takeIf { it > 0.0 }
     }
 
-    private class WorkloadEwmaModel {
+    /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
+    private class WorkloadTrend {
         private var sampleCount: Int = 0
         private var levelMs: Double? = null
 
@@ -267,6 +264,7 @@ class DraftSequenceExecutionPredictor {
         }
     }
 
+    /** Shot-over-shot budget delta, EWMA-tracked - negative means the queue is falling behind the shutter rate. */
     private class BudgetTrend(private val alpha: Double) {
         private var lastBudgetMs: Long? = null
         var trendMs: Double? = null
@@ -320,6 +318,10 @@ data class WatchdogTimeoutDecision(
     /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
     val decision: AdmissionDecision?,
 )
+
+/** Workload-type sequence with the size axis erased - the calibration fallback key for cold sequences. */
+private val WorkloadSequenceKey.shape: List<Class<out WorkloadKey>>
+    get() = workloadKeys.map { it.javaClass }
 
 internal data class ScoreSample(
     val score: Double,

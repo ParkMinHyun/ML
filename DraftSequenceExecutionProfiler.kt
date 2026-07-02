@@ -3,7 +3,6 @@ package com.samsung.android.camera.core2.ml
 import android.os.SystemClock
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.DynamicFunctionNode
-import com.samsung.android.camera.core2.node.MultiFrameNodeBase
 import com.samsung.android.camera.core2.node.Node
 import com.samsung.android.camera.core2.node.dualBokeh.samsung.SecDualBokehNodeBase
 import com.samsung.android.camera.core2.node.filter.SecFilterNode
@@ -25,17 +24,16 @@ private const val TAG = "DraftSequenceExecutionProfiler"
  * - [nodeChainLifecycle] owns the draft node chain's deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
-    private val deviceStateReader: DeviceStateReader,
     private val captureMetrics: CaptureMetrics,
     private val isPendingRequest: Boolean,
-    draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
+    private val deviceStateReader: DeviceStateReader,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
+    draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
 ) {
 
     private val modelUpdate = ModelUpdateBuffer()
     private val metricsRecorder = MetricsRecorder(captureMetrics, draftSequenceMetrics, isPendingRequest)
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
-    private val observedQueuePressureGroups = mutableSetOf<Class<out MultiFrameNodeBase>>()
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
@@ -64,7 +62,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return createExecutionSession(
             workloadKey = workloadKey,
             workloadSequenceKey = workloadSequenceKey,
-            queuePressureGroup = queuePressureGroupFor(node),
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
         )
@@ -85,12 +82,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private fun createExecutionSession(
         workloadKey: WorkloadKey,
         workloadSequenceKey: WorkloadSequenceKey,
-        queuePressureGroup: Class<out MultiFrameNodeBase>?,
         preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
     ): DraftSequenceExecutionSession {
-        observeQueuePressureBudgetOnce(queuePressureGroup, preExecutionMetrics)
-        val decision = predictor.predictAdmission(workloadSequenceKey, queuePressureGroup, preExecutionMetrics)
+        if (workloadKey.isQueuePressureGated) {
+            // ponytail: no per-capture dedupe - Bokeh is the only queue-pressure workload and yields one
+            // session per capture; bring back a per-capture observed flag if a second one ever appears.
+            predictor.observeQueuePressureBudget(preExecutionMetrics.budgetMs)
+        }
+        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
             .also(modelUpdate::remember)
         val prediction = when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> decision.executionPrediction
@@ -125,18 +125,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             ).also { session ->
                 pendingCompleteSession = session
             }
-        }
-    }
-
-    private fun observeQueuePressureBudgetOnce(
-        queuePressureGroup: Class<out MultiFrameNodeBase>?,
-        preExecutionMetrics: PreExecutionMetrics,
-    ) {
-        if (queuePressureGroup == null) {
-            return
-        }
-        if (observedQueuePressureGroups.add(queuePressureGroup)) {
-            predictor.observeQueuePressureBudget(queuePressureGroup, preExecutionMetrics.budgetMs)
         }
     }
 
@@ -188,9 +176,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             else -> null
         }
     }
-
-    private fun queuePressureGroupFor(node: Node): Class<out MultiFrameNodeBase>? =
-        if (node is MultiFrameNodeBase) MultiFrameNodeBase::class.java else null
 
     fun deinitializeDraftNodeChain() {
         nodeChainLifecycle.deinitializeWhenIdle()

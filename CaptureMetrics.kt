@@ -53,6 +53,6 @@ data class ExecutionPrediction @JvmOverloads constructor(
      * offline replay must read the sequence from this field instead of reconstructing it from executed-node rows.
      */
     val workloadSequenceKey: String? = null,
-    /** Queue-pressure group (simple class name) of the deciding node; null when the decision is not queue-gated. */
+    /** "MULTI_FRAME" when the deciding workload is queue-pressure gated (e.g. Bokeh); null otherwise. */
     val queuePressureGroup: String? = null,
 )
