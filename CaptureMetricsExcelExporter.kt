@@ -449,18 +449,6 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        fun nodePredictionResidualMs(): Long? {
-            val prediction = prediction ?: return null
-            val actualDurationMs = nodeActualDurationMs ?: return null
-            return actualDurationMs - prediction.nodePredictedDurationMs
-        }
-
-        fun nodeUpperBoundSlackMs(): Long? {
-            val prediction = prediction ?: return null
-            val actualDurationMs = nodeActualDurationMs ?: return null
-            return prediction.nodePredictedUpperBoundMs - actualDurationMs
-        }
-
         fun sequencePredictionResidualMs(): Long? {
             val prediction = prediction ?: return null
             val actualDurationMs = sequenceActualDurationMs ?: return null
@@ -767,11 +755,8 @@ class CaptureMetricsExcelExporter(
             Column("decisionObservationStatus") { it.observationStatus() },
             Column("observedActualFeasible") { it.observedActualFeasible() },
             Column("") { "" },
-            Column("nodePredictedDurationMs") { it.nodeRow.prediction?.nodePredictedDurationMs },
-            Column("nodePredictedUpperBoundMs") { it.nodeRow.prediction?.nodePredictedUpperBoundMs },
-            Column("nodePredictionResidualMs") { it.nodeRow.nodePredictionResidualMs() },
-            Column("nodePredictionUpperBoundSlackMs") { it.nodeRow.nodeUpperBoundSlackMs() },
-            Column("") { "" },
+            Column("workloadSequenceKey") { it.nodeRow.prediction?.workloadSequenceKey },
+            Column("queuePressureGroup") { it.nodeRow.prediction?.queuePressureGroup },
             Column("sequencePredictedDurationMs") { it.nodeRow.prediction?.sequencePredictedDurationMs },
             Column("sequencePredictedUpperBoundMs") { it.nodeRow.prediction?.sequencePredictedUpperBoundMs },
             Column("sequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },

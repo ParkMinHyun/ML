@@ -152,11 +152,12 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "order")
     val order: Int,
 
-    @ColumnInfo(name = "node_predicted_duration_ms")
-    val nodePredictedDurationMs: Long,
+    /** Decision-time planned workload-key suffix in replay-string format. */
+    @ColumnInfo(name = "workload_sequence_key")
+    val workloadSequenceKey: String?,
 
-    @ColumnInfo(name = "node_predicted_upper_bound_ms")
-    val nodePredictedUpperBoundMs: Long,
+    @ColumnInfo(name = "queue_pressure_group")
+    val queuePressureGroup: String?,
 
     @ColumnInfo(name = "sequence_predicted_duration_ms")
     val sequencePredictedDurationMs: Long,

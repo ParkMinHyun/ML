@@ -14,47 +14,49 @@ import kotlin.math.roundToLong
 class DraftSequenceExecutionPredictor {
 
     private val workloadKeyModelMap = mutableMapOf<WorkloadKey, WorkloadEwmaModel>()
-    private val workloadKeySequenceScoreMap = mutableMapOf<WorkloadKeySequence, MutableList<ScoreSample>>()
-    private val workloadKeySequenceShapeScoreMap = mutableMapOf<WorkloadKeySequenceShape, MutableList<ScoreSample>>()
+    private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
+    private val workloadSequenceShapeScoreMap = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
 
-    private val taskQueueBudgetTrendMap = mutableMapOf<Class<out MultiFrameNodeBase>, BudgetTrend>()
+    private val queuePressureBudgetTrendMap = mutableMapOf<Class<out MultiFrameNodeBase>, BudgetTrend>()
 
     @Synchronized
     fun predictAdmission(
-        workloadKeySequence: WorkloadKeySequence,
+        workloadSequenceKey: WorkloadSequenceKey,
+        queuePressureGroup: Class<out MultiFrameNodeBase>?,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        val headWorkloadKey = workloadKeySequence.workloadKeys.first()
-        val headWorkloadKeySequence = WorkloadKeySequence(listOf(headWorkloadKey))
-        val headWorkloadPrediction = predictSequence(headWorkloadKeySequence)
-        val workloadSequencePrediction = predictSequence(workloadKeySequence)
+        // Memoized per decision: predictedWorkloadDuration scans the sibling models, and the suffix walk in
+        // correctedSequenceUpperBound would otherwise rescan them O(n^2) times per decision.
+        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::predictedWorkloadDuration)
+        val sequencePredictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
+        val sequenceUpperBoundMs = correctedSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
         val admit = admitUnderBudgetPolicy(
-            headWorkloadKey,
-            workloadSequencePrediction,
+            queuePressureGroup,
+            sequencePredictedMs,
+            sequenceUpperBoundMs,
             preExecutionMetrics.budgetMs,
         )
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
                 admit = admit,
-                nodePredictedDurationMs = headWorkloadPrediction.predictedMs.roundToNonNegativeLong(),
-                nodePredictedUpperBoundMs = headWorkloadPrediction.upperBoundMs.roundToNonNegativeLong(),
-                sequencePredictedDurationMs = workloadSequencePrediction.predictedMs.roundToNonNegativeLong(),
-                sequencePredictedUpperBoundMs = workloadSequencePrediction.upperBoundMs.roundToNonNegativeLong(),
+                sequencePredictedDurationMs = sequencePredictedMs.roundToNonNegativeLong(),
+                sequencePredictedUpperBoundMs = sequenceUpperBoundMs.roundToNonNegativeLong(),
+                workloadSequenceKey = workloadSequenceKey.toReplayString(),
+                queuePressureGroup = queuePressureGroup?.simpleName,
             ),
-            sequenceSnapshot = SequencePredictionSnapshot(
-                workloadKeySequence = workloadKeySequence,
-                predictedMs = workloadSequencePrediction.predictedMs,
-                workloadPredictedMs = workloadKeySequence.workloadKeys.associateWith(::predictedWorkloadDuration),
-            ),
+            workloadSequenceKey = workloadSequenceKey,
+            sequencePredictedMs = sequencePredictedMs,
+            workloadPredictedMs = workloadPredictedMs,
         )
     }
 
     @Synchronized
     fun predictWatchdogTimeout(
-        workloadKeySequence: WorkloadKeySequence,
+        workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val decision = predictAdmission(workloadKeySequence, preExecutionMetrics)
+        // The watchdog reservation is not queue-gated; this internal decision's admit bit is unused.
+        val decision = predictAdmission(workloadSequenceKey, queuePressureGroup = null, preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
             .coerceAtLeast(0L)
 
@@ -66,22 +68,21 @@ class DraftSequenceExecutionPredictor {
         queuePressureGroup: Class<out MultiFrameNodeBase>,
         budgetMs: Long,
     ) {
-        taskQueueBudgetTrendMap.getOrPut(queuePressureGroup) { BudgetTrend(WORKLOAD_EWMA_ALPHA) }.observe(budgetMs)
+        queuePressureBudgetTrendMap.getOrPut(queuePressureGroup) { BudgetTrend(WORKLOAD_EWMA_ALPHA) }.observe(budgetMs)
     }
 
     private fun admitUnderBudgetPolicy(
-        headWorkloadKey: WorkloadKey,
-        workloadSequencePrediction: SequencePrediction,
+        queuePressureGroup: Class<out MultiFrameNodeBase>?,
+        sequencePredictedMs: Double,
+        sequenceUpperBoundMs: Double,
         budgetMs: Long,
     ): Boolean {
-        if (workloadSequencePrediction.isColdStart) {
-            return true
+        return when {
+            // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
+            sequencePredictedMs <= 0.0 -> true
+            queuePressureGroup != null -> admitsUnderQueue(queuePressureGroup, sequenceUpperBoundMs, budgetMs)
+            else -> sequenceUpperBoundMs <= budgetMs
         }
-        val queuePressureGroup = headWorkloadKey.queuePressureGroup
-        if (queuePressureGroup != null) {
-            return admitsUnderQueue(queuePressureGroup, workloadSequencePrediction.upperBoundMs, budgetMs)
-        }
-        return workloadSequencePrediction.upperBoundMs <= budgetMs
     }
 
     /**
@@ -100,7 +101,7 @@ class DraftSequenceExecutionPredictor {
         if (slackMs < 0.0) {
             return false
         }
-        val trendMs = taskQueueBudgetTrendMap[queuePressureGroup]?.trendMs ?: return true
+        val trendMs = queuePressureBudgetTrendMap[queuePressureGroup]?.trendMs ?: return true
         if (trendMs >= 0.0) {
             return true
         }
@@ -110,11 +111,11 @@ class DraftSequenceExecutionPredictor {
     @Synchronized
     fun updateCapture(
         workloadDurations: Map<WorkloadKey, Long>,
-        predictionSnapshots: Collection<SequencePredictionSnapshot>,
+        admissionDecisions: Collection<AdmissionDecision>,
     ) {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
 
-        addScoreSamples(validWorkloadDurations, predictionSnapshots)
+        addScoreSamples(validWorkloadDurations, admissionDecisions)
 
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
             workloadKeyModelMap.getOrPut(workloadKey) { WorkloadEwmaModel() }.update(durationMs.toDouble())
@@ -123,12 +124,12 @@ class DraftSequenceExecutionPredictor {
 
     private fun addScoreSamples(
         workloadDurations: Map<WorkloadKey, Long>,
-        predictionSnapshots: Collection<SequencePredictionSnapshot>,
+        admissionDecisions: Collection<AdmissionDecision>,
     ) {
-        val samples = predictionSnapshots.mapNotNull { snapshot ->
-            val clampedActualMs = clampedActualDuration(snapshot, workloadDurations) ?: return@mapNotNull null
-            val score = score(snapshot.predictedMs, clampedActualMs) ?: return@mapNotNull null
-            snapshot.workloadKeySequence to ScoreSample(score = score)
+        val samples = admissionDecisions.mapNotNull { decision ->
+            val clampedActualMs = clampedSequenceActualDuration(decision, workloadDurations) ?: return@mapNotNull null
+            val score = score(decision.sequencePredictedMs, clampedActualMs) ?: return@mapNotNull null
+            decision.workloadSequenceKey to ScoreSample(score = score)
         }
 
         if (samples.isEmpty()) {
@@ -136,15 +137,15 @@ class DraftSequenceExecutionPredictor {
         }
 
         decayScoreSamples()
-        samples.forEach { (workloadKeySequence, sample) ->
-            workloadKeySequenceScoreMap.getOrPut(workloadKeySequence) { mutableListOf() } += sample
-            workloadKeySequenceShapeScoreMap.getOrPut(workloadKeySequence.shape) { mutableListOf() } += sample
+        samples.forEach { (workloadSequenceKey, sample) ->
+            workloadSequenceKeyScoreMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
+            workloadSequenceShapeScoreMap.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
         }
     }
 
     private fun decayScoreSamples() {
-        workloadKeySequenceScoreMap.values.forEach { it.decayWeights() }
-        workloadKeySequenceShapeScoreMap.values.forEach { it.decayWeights() }
+        workloadSequenceKeyScoreMap.values.forEach { it.decayWeights() }
+        workloadSequenceShapeScoreMap.values.forEach { it.decayWeights() }
     }
 
     private fun MutableList<ScoreSample>.decayWeights() {
@@ -156,36 +157,39 @@ class DraftSequenceExecutionPredictor {
         removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
     }
 
-    private fun predictSequence(workloadKeySequence: WorkloadKeySequence): SequencePrediction {
-        val predictedMs = predictedDuration(workloadKeySequence)
-        val upperBoundMs = correctedUpperBound(workloadKeySequence)
-        return SequencePrediction(predictedMs, upperBoundMs)
-    }
-
-    private fun correctedUpperBound(workloadKeySequence: WorkloadKeySequence): Double {
+    private fun correctedSequenceUpperBound(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
         // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
         // head EWMA plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1, the
         // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
-        val workloadKeys = workloadKeySequence.workloadKeys
+        val workloadKeys = workloadSequenceKey.workloadKeys
         var corrected = 0.0
         for (index in workloadKeys.indices.reversed()) {
-            val suffixRawUpperBound = rawUpperBound(WorkloadKeySequence(workloadKeys.drop(index)))
-            corrected = maxOf(suffixRawUpperBound, predictedWorkloadDuration(workloadKeys[index]) + corrected)
+            val suffixRawUpperBound = rawSequenceUpperBound(WorkloadSequenceKey(workloadKeys.drop(index)), workloadPredictedMs)
+            corrected = maxOf(suffixRawUpperBound, workloadPredictedMs.getValue(workloadKeys[index]) + corrected)
         }
         return corrected
     }
 
-    private fun rawUpperBound(workloadKeySequence: WorkloadKeySequence): Double {
-        val predictedMs = predictedDuration(workloadKeySequence)
+    private fun rawSequenceUpperBound(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
+        val predictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
         if (predictedMs <= 0.0) {
             return 0.0
         }
 
-        return predictedMs * exp(calibratedScore(workloadKeySequence))
+        return predictedMs * exp(calibratedSequenceScore(workloadSequenceKey))
     }
 
-    private fun predictedDuration(workloadKeySequence: WorkloadKeySequence): Double {
-        return workloadKeySequence.workloadKeys.sumOf(::predictedWorkloadDuration)
+    private fun predictedSequenceDuration(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
+        return workloadSequenceKey.workloadKeys.sumOf { workloadPredictedMs.getValue(it) }
     }
 
     private fun predictedWorkloadDuration(workloadKey: WorkloadKey): Double {
@@ -194,45 +198,38 @@ class DraftSequenceExecutionPredictor {
         // keeps the following MP12 conservative. max() lets cross-size only raise the estimate, never lower it;
         // the sibling with ratio 1.0 is the workload's own model. Predict-time only: the scaled value is never fed
         // back into any model, so buckets never learn from each other.
-        return workloadKeyModelMap
-            .filterKeys { it.javaClass == workloadKey.javaClass }
+        return workloadKeyModelMap.entries
+            .filter { it.key.javaClass == workloadKey.javaClass }
             .maxOfOrNull { (siblingKey, model) ->
                 model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket)
             }
             ?: 0.0
     }
 
-    private fun calibratedScore(workloadKeySequence: WorkloadKeySequence): Double {
+    private fun calibratedSequenceScore(workloadSequenceKey: WorkloadSequenceKey): Double {
         return calibratedScore(
-            sequenceSamples = workloadKeySequenceScoreMap[workloadKeySequence].orEmpty(),
-            compatibleSamples = workloadKeySequenceShapeScoreMap[workloadKeySequence.shape].orEmpty(),
+            sequenceSamples = workloadSequenceKeyScoreMap[workloadSequenceKey].orEmpty(),
+            compatibleSamples = workloadSequenceShapeScoreMap[workloadSequenceKey.shape].orEmpty(),
         )
     }
 
     /**
-     * Containment-scoped actual: each node contributes max(its decision-time prediction, its actual), so a single
-     * node's overrun is reflected at the sequence's scale even when another node happened to run fast that capture.
-     * Returns null if any node in the sequence did not run (incomplete sequence cannot be scored).
+     * Containment-scoped actual: each workload contributes max(its decision-time prediction, its actual), so a
+     * single workload's overrun is reflected at the sequence's scale even when another workload happened to run
+     * fast that capture. Returns null if any workload in the sequence did not run (incomplete sequence cannot be
+     * scored).
      */
-    private fun clampedActualDuration(
-        snapshot: SequencePredictionSnapshot,
+    private fun clampedSequenceActualDuration(
+        decision: AdmissionDecision,
         workloadDurations: Map<WorkloadKey, Long>,
     ): Double? {
         var total = 0.0
-        for (workloadKey in snapshot.workloadKeySequence.workloadKeys) {
+        for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
             val actualMs = workloadDurations[workloadKey] ?: return null
-            val predictedMs = snapshot.workloadPredictedMs[workloadKey] ?: 0.0
+            val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
             total += maxOf(predictedMs, actualMs.toDouble())
         }
         return total.takeIf { it > 0.0 }
-    }
-
-    private data class SequencePrediction(
-        val predictedMs: Double,
-        val upperBoundMs: Double,
-    ) {
-        val isColdStart: Boolean
-            get() = predictedMs <= 0.0
     }
 
     private class WorkloadEwmaModel {
@@ -246,17 +243,14 @@ class DraftSequenceExecutionPredictor {
                 return
             }
 
+            sampleCount++
             val currentLevelMs = levelMs
-            if (currentLevelMs == null) {
-                levelMs = actualMs
-                sampleCount = 1
-                return
+            levelMs = if (currentLevelMs == null) {
+                actualMs
+            } else {
+                val effectiveAlpha = maxOf(WORKLOAD_EWMA_ALPHA, 1.0 / sampleCount)
+                currentLevelMs + effectiveAlpha * (actualMs - currentLevelMs)
             }
-
-            val nextSampleCount = sampleCount + 1
-            val effectiveAlpha = maxOf(WORKLOAD_EWMA_ALPHA, 1.0 / nextSampleCount.toDouble())
-            levelMs = currentLevelMs + effectiveAlpha * (actualMs - currentLevelMs)
-            sampleCount = nextSampleCount
         }
     }
 
@@ -292,21 +286,25 @@ class DraftSequenceExecutionPredictor {
     }
 }
 
+/**
+ * One admission decision. [executionPrediction] is the persisted decision record (rounded, replay-ready);
+ * the remaining fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.updateCapture]
+ * consumes once at capture end. They stay outside [ExecutionPrediction] on purpose: residual scoring needs the
+ * unrounded values, and neither a Double duplicate nor a per-workload map belongs in the metrics store.
+ */
 data class AdmissionDecision(
     val executionPrediction: ExecutionPrediction,
-    val sequenceSnapshot: SequencePredictionSnapshot,
+    /** Sequence this decision was made for; capture-end score samples are keyed by it. */
+    val workloadSequenceKey: WorkloadSequenceKey,
+    /** Decision-time sequence prediction, kept unrounded for capture-end residual scoring. */
+    val sequencePredictedMs: Double,
+    /** Per-workload decision-time prediction, used to clamp workload underruns so one workload's spike is not diluted. */
+    val workloadPredictedMs: Map<WorkloadKey, Double>,
 )
 
 data class WatchdogTimeoutDecision(
     val timeoutMs: Long,
     val decision: AdmissionDecision,
-)
-
-data class SequencePredictionSnapshot(
-    val workloadKeySequence: WorkloadKeySequence,
-    val predictedMs: Double,
-    /** Per-workload decision-time prediction, used to clamp node underruns so one node's spike is not diluted. */
-    val workloadPredictedMs: Map<WorkloadKey, Double>,
 )
 
 data class ScoreSample(
@@ -326,12 +324,8 @@ fun score(predictedMs: Double, actualMs: Double): Double? {
 
 fun effectiveSampleSize(weights: List<Double>): Double {
     val sumW = weights.sum()
-    if (sumW <= 0.0) {
-        return 0.0
-    }
-
     val sumW2 = weights.sumOf { it * it }
-    if (sumW2 <= 0.0) {
+    if (sumW <= 0.0 || sumW2 <= 0.0) {
         return 0.0
     }
 

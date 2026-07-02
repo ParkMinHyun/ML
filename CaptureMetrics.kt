@@ -44,9 +44,15 @@ data class PostExecutionMetrics(
 )
 
 data class ExecutionPrediction @JvmOverloads constructor(
-    val nodePredictedDurationMs: Long,
-    val nodePredictedUpperBoundMs: Long,
     val sequencePredictedDurationMs: Long,
     val sequencePredictedUpperBoundMs: Long,
     val admit: Boolean = false,
+    /**
+     * Decision-time planned workload-key suffix in replay-string format. This is the predictor input for this
+     * decision: planned workloads that were later skipped or never profiled appear here and nowhere else, so
+     * offline replay must read the sequence from this field instead of reconstructing it from executed-node rows.
+     */
+    val workloadSequenceKey: String? = null,
+    /** Queue-pressure group (simple class name) of the deciding node; null when the decision is not queue-gated. */
+    val queuePressureGroup: String? = null,
 )

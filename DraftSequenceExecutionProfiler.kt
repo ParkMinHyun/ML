@@ -19,7 +19,7 @@ private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
  * Drives one draft sequence's node lifecycle. Workload durations are collected during node execution,
- * then Predictor's UB receives decision-time prediction snapshots and actual workload durations at capture end.
+ * then Predictor's UB receives the remembered admission decisions and actual workload durations at capture end.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
@@ -34,10 +34,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    private val sequenceLock = Any()
+    private val captureLock = Any()
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
     private val workloadDurations: MutableMap<WorkloadKey, Long> = mutableMapOf()
-    private val sequenceSnapshots: MutableMap<WorkloadKeySequence, SequencePredictionSnapshot> = mutableMapOf()
+    private val workloadSequenceKeyDecisions: MutableMap<WorkloadSequenceKey, AdmissionDecision> = mutableMapOf()
     private val observedQueuePressureGroups = mutableSetOf<Class<out MultiFrameNodeBase>>()
 
     private var draftSequenceNodeList: List<Node> = emptyList()
@@ -58,7 +58,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
-        val workloadKeySequence = WorkloadKeySequence(workloadKeysFrom(node, workloadKey))
+        val workloadSequenceKey = WorkloadSequenceKey(plannedWorkloadKeysFrom(node, workloadKey))
+        val queuePressureGroup = queuePressureGroupFor(node)
         val nowMs = SystemClock.uptimeMillis()
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
         val deviceState = deviceStateReader.read()
@@ -78,23 +79,24 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
 
         return createExecutionSession(
-            node = node,
             workloadKey = workloadKey,
-            workloadKeySequence = workloadKeySequence,
+            workloadSequenceKey = workloadSequenceKey,
+            queuePressureGroup = queuePressureGroup,
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
         )
     }
 
     private fun createExecutionSession(
-        node: Node,
         workloadKey: WorkloadKey,
-        workloadKeySequence: WorkloadKeySequence,
+        workloadSequenceKey: WorkloadSequenceKey,
+        queuePressureGroup: Class<out MultiFrameNodeBase>?,
         preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
     ): DraftSequenceExecutionSession {
-        observeQueuePressureBudgetOnce(workloadKey, preExecutionMetrics)
-        val decision = predictor.predictAdmission(workloadKeySequence, preExecutionMetrics).also(::rememberDecision)
+        observeQueuePressureBudgetOnce(queuePressureGroup, preExecutionMetrics)
+        val decision = predictor.predictAdmission(workloadSequenceKey, queuePressureGroup, preExecutionMetrics)
+            .also(::rememberDecision)
         val prediction = when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> decision.executionPrediction
             WorkloadPolicy.OBSERVE, WorkloadPolicy.COMPLETE -> decision.executionPrediction.copy(admit = true)
@@ -113,7 +115,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         return when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> {
-                val watchdogTimeoutMs = watchdogTimeoutMs(node, workloadKey, preExecutionMetrics)
+                val watchdogTimeoutMs = watchdogTimeoutMs(workloadSequenceKey, preExecutionMetrics)
                 nodeExecutionMetrics.watchdogTimeoutMs = watchdogTimeoutMs
                 nodeExecutionMetrics.watchdogTimedOut = false
                 DraftSequenceExecutionSession(
@@ -141,10 +143,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun observeQueuePressureBudgetOnce(
-        workloadKey: WorkloadKey,
+        queuePressureGroup: Class<out MultiFrameNodeBase>?,
         preExecutionMetrics: PreExecutionMetrics,
     ) {
-        val queuePressureGroup = workloadKey.queuePressureGroup ?: return
+        if (queuePressureGroup == null) {
+            return
+        }
         if (observedQueuePressureGroups.add(queuePressureGroup)) {
             predictor.observeQueuePressureBudget(queuePressureGroup, preExecutionMetrics.budgetMs)
         }
@@ -156,7 +160,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         postExecutionMetrics: PostExecutionMetrics,
     ) {
         nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
-        synchronized(sequenceLock) {
+        synchronized(captureLock) {
             workloadDurations[workloadKey] = postExecutionMetrics.durationMs.coerceAtLeast(0L)
         }
     }
@@ -166,16 +170,16 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
 
-        val captureUpdate = synchronized(sequenceLock) {
+        val captureUpdate = synchronized(captureLock) {
             if (isCaptureUpdated) {
                 null
             } else {
                 isCaptureUpdated = true
-                Pair(workloadDurations.toMap(), sequenceSnapshots.values.toList())
+                Pair(workloadDurations.toMap(), workloadSequenceKeyDecisions.values.toList())
             }
         }
-        captureUpdate?.let { (completedWorkloadDurations, completedSnapshots) ->
-            predictor.updateCapture(completedWorkloadDurations, completedSnapshots)
+        captureUpdate?.let { (completedWorkloadDurations, completedDecisions) ->
+            predictor.updateCapture(completedWorkloadDurations, completedDecisions)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
@@ -191,31 +195,30 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun watchdogTimeoutMs(
-        node: Node,
-        workloadKey: WorkloadKey,
+        workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): Long {
         // ADMIT watchdogs reserve only the mandatory COMPLETE workload.
         // OBSERVE workloads are measured but not protected here.
-        val reserveWorkloadKeys = workloadKeysFrom(node, workloadKey)
+        val reserveWorkloadKeys = workloadSequenceKey.workloadKeys
             .drop(1)
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
         if (reserveWorkloadKeys.isEmpty()) {
             return preExecutionMetrics.budgetMs.coerceAtLeast(0L)
         }
 
-        val reserveWorkloadKeySequence = WorkloadKeySequence(reserveWorkloadKeys)
-        val timeoutDecision = predictor.predictWatchdogTimeout(reserveWorkloadKeySequence, preExecutionMetrics).also { rememberDecision(it.decision) }
+        val timeoutDecision = predictor.predictWatchdogTimeout(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
+        rememberDecision(timeoutDecision.decision)
         return timeoutDecision.timeoutMs
     }
 
     private fun rememberDecision(decision: AdmissionDecision) {
-        synchronized(sequenceLock) {
-            sequenceSnapshots[decision.sequenceSnapshot.workloadKeySequence] = decision.sequenceSnapshot
+        synchronized(captureLock) {
+            workloadSequenceKeyDecisions[decision.workloadSequenceKey] = decision
         }
     }
 
-    private fun workloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
+    private fun plannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
         val index = draftSequenceNodeList.indexOfFirst { plannedNode -> plannedNode === node }
         return if (index >= 0) {
             draftSequenceNodeList.drop(index).mapNotNull { plannedNode ->
@@ -228,66 +231,54 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private fun workloadKeyFor(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
         val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
-        val queuePressureGroup = queuePressureGroupFor(node)
         return when (node) {
-            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket, queuePressureGroup)
+            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }
-            is SecFilterNode -> WorkloadKey.Filter(sizeBucket, queuePressureGroup)
-            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket, queuePressureGroup)
-            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket, queuePressureGroup)
+            is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
+            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
+            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket)
             is SecImageCodecNodeBase -> WorkloadKey.Encoding(
                 sizeBucket,
                 captureMetrics.resultImageFormat,
                 isPendingRequest,
-                queuePressureGroup,
             ).takeIf { node.isEncodeUsage }
             else -> null
         }
     }
 
-    private fun queuePressureGroupFor(node: Node): Class<out MultiFrameNodeBase>? {
-        if (node is MultiFrameNodeBase) {
-            return MultiFrameNodeBase::class.java
-        }
-        return null
-    }
+    private fun queuePressureGroupFor(node: Node): Class<out MultiFrameNodeBase>? =
+        if (node is MultiFrameNodeBase) MultiFrameNodeBase::class.java else null
 
     fun deinitializeDraftNodeChain() {
         nodeChainLifecycle.deinitializeWhenIdle()
     }
 }
 
-/** Stable workload bucket shared by the workload EWMA and sequence calibrator. */
+/**
+ * Stable workload bucket shared by the workload EWMA and sequence calibrator.
+ *
+ * Naming: a *node* is the physical pipeline unit that executes; a *workload* is one node execution's classified
+ * work, identified by a [WorkloadKey]; a *sequence* is the planned workload suffix from a decision point through
+ * the mandatory tail, identified by a [WorkloadSequenceKey]; the *draft sequence* is one capture's whole
+ * node-chain run.
+ */
 sealed interface WorkloadKey {
     val policy: WorkloadPolicy
     val sizeBucket: SizeBucket
-    val queuePressureGroup: Class<out MultiFrameNodeBase>?
 
-    data class Bokeh(
-        override val sizeBucket: SizeBucket,
-        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
-    ) : WorkloadKey {
+    data class Bokeh(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
     }
 
-    data class DynamicFunction(
-        override val sizeBucket: SizeBucket,
-        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
-    ) : WorkloadKey {
+    data class DynamicFunction(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
     }
 
-    data class Filter(
-        override val sizeBucket: SizeBucket,
-        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
-    ) : WorkloadKey {
+    data class Filter(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
     }
 
-    data class Watermark(
-        override val sizeBucket: SizeBucket,
-        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
-    ) : WorkloadKey {
+    data class Watermark(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
     }
 
@@ -296,30 +287,33 @@ sealed interface WorkloadKey {
         override val sizeBucket: SizeBucket,
         val imageFormat: Int,
         val isPendingRequest: Boolean,
-        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
     ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.COMPLETE
     }
 }
 
-/** Ordered workload-key suffix for a decision, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
-data class WorkloadKeySequence(val workloadKeys: List<WorkloadKey>) {
-    val shape: WorkloadKeySequenceShape = WorkloadKeySequenceShape(workloadKeys.map { it.javaClass.simpleName })
+/** Key identifying the ordered workload suffix of a decision, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
+data class WorkloadSequenceKey(val workloadKeys: List<WorkloadKey>) {
+    val shape: WorkloadSequenceShape = WorkloadSequenceShape(workloadKeys.map { it.javaClass.simpleName })
 
     init {
-        require(workloadKeys.isNotEmpty()) { "WorkloadKeySequence must contain at least one workload key." }
+        require(workloadKeys.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload key." }
     }
 }
 
-data class WorkloadKeySequenceShape(val workloadNames: List<String>)
+/** Sequence of workload type names only (size and queue axes erased) - the calibration fallback key. */
+data class WorkloadSequenceShape(val workloadTypeNames: List<String>)
 
-private fun WorkloadKey.toReplayString(): String = when (this) {
+fun WorkloadKey.toReplayString(): String = when (this) {
     is WorkloadKey.Bokeh -> "BOKEH(sizeBucket=$sizeBucket)"
     is WorkloadKey.DynamicFunction -> "DYNAMIC_FUNCTION(sizeBucket=$sizeBucket)"
     is WorkloadKey.Filter -> "FILTER(sizeBucket=$sizeBucket)"
     is WorkloadKey.Watermark -> "WATERMARK(sizeBucket=$sizeBucket)"
     is WorkloadKey.Encoding -> "ENCODING(sizeBucket=$sizeBucket,imageFormat=$imageFormat,isPendingRequest=$isPendingRequest)"
 }
+
+/** Decision-time sequence in replay format, e.g. "BOKEH(...)>FILTER(...)>ENCODING(...)". */
+fun WorkloadSequenceKey.toReplayString(): String = workloadKeys.joinToString(">") { it.toReplayString() }
 
 enum class WorkloadPolicy {
     ADMIT,
