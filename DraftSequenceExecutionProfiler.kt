@@ -1,7 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
 import android.os.SystemClock
-import android.util.Size
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.DynamicFunctionNode
 import com.samsung.android.camera.core2.node.MultiFrameNodeBase
@@ -13,36 +12,33 @@ import com.samsung.android.camera.core2.node.watermark.WatermarkNode
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor
 import com.samsung.android.camera.core2.util.CLog
 import java.util.concurrent.CompletableFuture
-import kotlin.math.abs
 
 private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
- * Drives one draft sequence's node lifecycle. Workload durations are collected during node execution,
- * then Predictor's UB receives the remembered admission decisions and actual workload durations at capture end.
+ * Drives one draft sequence's node lifecycle: classifies each executing node into a [WorkloadKey], asks the
+ * Predictor for an admission decision, and feeds the observed outcome back at capture end.
+ *
+ * State is grouped by destination:
+ * - [modelUpdate] buffers what the Predictor learns from (durations + decisions), drained exactly once.
+ * - [metricsRecorder] is the sole writer of the [CaptureMetrics] observability store.
+ * - [nodeChainLifecycle] owns the draft node chain's deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
     private val captureMetrics: CaptureMetrics,
     private val isPendingRequest: Boolean,
-    private val draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
+    draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
 ) {
 
-    init {
-        draftSequenceMetrics.isPendingRequest = isPendingRequest
-        captureMetrics.draftSequenceMetrics = draftSequenceMetrics
-    }
-
-    private val captureLock = Any()
+    private val modelUpdate = ModelUpdateBuffer()
+    private val metricsRecorder = MetricsRecorder(captureMetrics, draftSequenceMetrics, isPendingRequest)
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
-    private val workloadDurations: MutableMap<WorkloadKey, Long> = mutableMapOf()
-    private val workloadSequenceKeyDecisions: MutableMap<WorkloadSequenceKey, AdmissionDecision> = mutableMapOf()
     private val observedQueuePressureGroups = mutableSetOf<Class<out MultiFrameNodeBase>>()
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
-    private var isCaptureUpdated = false
 
     fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -59,31 +55,30 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
         val workloadSequenceKey = WorkloadSequenceKey(plannedWorkloadKeysFrom(node, workloadKey))
-        val queuePressureGroup = queuePressureGroupFor(node)
+        val preExecutionMetrics = readPreExecutionMetrics()
+        val nodeExecutionMetrics = metricsRecorder.onNodeExecutionStart(
+            nodeName = node.javaClass.simpleName,
+            workloadKey = workloadKey,
+            preExecutionMetrics = preExecutionMetrics,
+        )
+        return createExecutionSession(
+            workloadKey = workloadKey,
+            workloadSequenceKey = workloadSequenceKey,
+            queuePressureGroup = queuePressureGroupFor(node),
+            preExecutionMetrics = preExecutionMetrics,
+            nodeExecutionMetrics = nodeExecutionMetrics,
+        )
+    }
+
+    private fun readPreExecutionMetrics(): PreExecutionMetrics {
         val nowMs = SystemClock.uptimeMillis()
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
         val deviceState = deviceStateReader.read()
-        val preExecutionMetrics = PreExecutionMetrics(
+        return PreExecutionMetrics(
             budgetMs = timeoutTimestampMs - nowMs,
             memorySnapshot = deviceState.memorySnapshot,
             thermalSnapshot = deviceState.thermalSnapshot,
             storageSnapshot = deviceState.storageSnapshot,
-        )
-        val nodeExecutionMetrics = NodeExecutionMetrics(
-            nodeName = node.javaClass.simpleName,
-            preExecutionMetrics = preExecutionMetrics,
-            workloadKey = workloadKey.toReplayString(),
-        )
-        synchronized(draftSequenceMetrics) {
-            draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
-        }
-
-        return createExecutionSession(
-            workloadKey = workloadKey,
-            workloadSequenceKey = workloadSequenceKey,
-            queuePressureGroup = queuePressureGroup,
-            preExecutionMetrics = preExecutionMetrics,
-            nodeExecutionMetrics = nodeExecutionMetrics,
         )
     }
 
@@ -96,44 +91,34 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     ): DraftSequenceExecutionSession {
         observeQueuePressureBudgetOnce(queuePressureGroup, preExecutionMetrics)
         val decision = predictor.predictAdmission(workloadSequenceKey, queuePressureGroup, preExecutionMetrics)
-            .also(::rememberDecision)
+            .also(modelUpdate::remember)
         val prediction = when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> decision.executionPrediction
             WorkloadPolicy.OBSERVE, WorkloadPolicy.COMPLETE -> decision.executionPrediction.copy(admit = true)
         }
-        synchronized(draftSequenceMetrics) {
-            draftSequenceMetrics.nodeExecutionPredictionList += prediction
-        }
+        metricsRecorder.onPrediction(prediction)
 
         val onComplete: (PostExecutionMetrics) -> Unit = { postExecutionMetrics ->
-            recordCompletedWorkload(
-                workloadKey,
-                nodeExecutionMetrics,
-                postExecutionMetrics,
-            )
+            metricsRecorder.onWorkloadCompleted(nodeExecutionMetrics, postExecutionMetrics)
+            modelUpdate.recordWorkloadDuration(workloadKey, postExecutionMetrics.durationMs)
         }
 
         return when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> {
                 val watchdogTimeoutMs = watchdogTimeoutMs(workloadSequenceKey, preExecutionMetrics)
-                nodeExecutionMetrics.watchdogTimeoutMs = watchdogTimeoutMs
-                nodeExecutionMetrics.watchdogTimedOut = false
-                DraftSequenceExecutionSession(
+                metricsRecorder.onWatchdogArmed(nodeExecutionMetrics, watchdogTimeoutMs)
+                DraftSequenceExecutionSession.forAdmitWorkload(
                     shouldRun = prediction.admit,
                     watchdogTimeoutMs = watchdogTimeoutMs,
                     onTimedOutTask = { worker ->
                         nodeChainLifecycle.waitFor(worker)
-                        nodeExecutionMetrics.watchdogTimedOut = true
-                        draftSequenceMetrics.hasWatchdogTimeout = true
+                        metricsRecorder.onWatchdogTimedOut(nodeExecutionMetrics)
                     },
                     onComplete = onComplete,
                 )
             }
-            WorkloadPolicy.OBSERVE -> DraftSequenceExecutionSession(
-                onComplete = onComplete,
-            )
-            WorkloadPolicy.COMPLETE -> DraftSequenceExecutionSession(
-                completeOnReturn = false,
+            WorkloadPolicy.OBSERVE -> DraftSequenceExecutionSession.forObserveWorkload(onComplete)
+            WorkloadPolicy.COMPLETE -> DraftSequenceExecutionSession.forCompleteWorkload(
                 onCancel = { pendingCompleteSession = null },
                 onComplete = onComplete,
             ).also { session ->
@@ -154,37 +139,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    private fun recordCompletedWorkload(
-        workloadKey: WorkloadKey,
-        nodeExecutionMetrics: NodeExecutionMetrics,
-        postExecutionMetrics: PostExecutionMetrics,
-    ) {
-        nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
-        synchronized(captureLock) {
-            workloadDurations[workloadKey] = postExecutionMetrics.durationMs.coerceAtLeast(0L)
-        }
-    }
-
     /** Completes the COMPLETE workload, updates Predictor's UB, and records whether this capture timed out. */
     fun completeDraftSequenceExecution(): Boolean {
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
 
-        val captureUpdate = synchronized(captureLock) {
-            if (isCaptureUpdated) {
-                null
-            } else {
-                isCaptureUpdated = true
-                Pair(workloadDurations.toMap(), workloadSequenceKeyDecisions.values.toList())
-            }
-        }
-        captureUpdate?.let { (completedWorkloadDurations, completedDecisions) ->
-            predictor.updateCapture(completedWorkloadDurations, completedDecisions)
+        modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
+            predictor.updateCapture(workloadDurations, admissionDecisions)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
-        draftSequenceMetrics.isTimeout = isTimeout
+        metricsRecorder.onCaptureEnd(isTimeout)
         return isTimeout
     }
 
@@ -208,14 +174,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
 
         val timeoutDecision = predictor.predictWatchdogTimeout(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
-        rememberDecision(timeoutDecision.decision)
+        modelUpdate.remember(timeoutDecision.decision)
         return timeoutDecision.timeoutMs
-    }
-
-    private fun rememberDecision(decision: AdmissionDecision) {
-        synchronized(captureLock) {
-            workloadSequenceKeyDecisions[decision.workloadSequenceKey] = decision
-        }
     }
 
     private fun plannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
@@ -255,90 +215,93 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 }
 
 /**
- * Stable workload bucket shared by the workload EWMA and sequence calibrator.
- *
- * Naming: a *node* is the physical pipeline unit that executes; a *workload* is one node execution's classified
- * work, identified by a [WorkloadKey]; a *sequence* is the planned workload suffix from a decision point through
- * the mandatory tail, identified by a [WorkloadSequenceKey]; the *draft sequence* is one capture's whole
- * node-chain run.
+ * What one capture teaches the Predictor: actual workload durations plus the admission decisions that produced
+ * them, buffered during node execution and drained exactly once at capture end. Cancelling the draft sequence
+ * does not clear it - a later complete still drains the samples collected so far.
  */
-sealed interface WorkloadKey {
-    val policy: WorkloadPolicy
-    val sizeBucket: SizeBucket
+private class ModelUpdateBuffer {
+    private val lock = Any()
+    private val workloadDurations = mutableMapOf<WorkloadKey, Long>()
+    private val decisions = mutableMapOf<WorkloadSequenceKey, AdmissionDecision>()
+    private var drained = false
 
-    data class Bokeh(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
+    fun recordWorkloadDuration(workloadKey: WorkloadKey, durationMs: Long) {
+        synchronized(lock) {
+            workloadDurations[workloadKey] = durationMs.coerceAtLeast(0L)
+        }
     }
 
-    data class DynamicFunction(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
+    fun remember(decision: AdmissionDecision) {
+        synchronized(lock) {
+            decisions[decision.workloadSequenceKey] = decision
+        }
     }
 
-    data class Filter(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
-    }
-
-    data class Watermark(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
-    }
-
-    /** Mandatory tail from ImageCodec entry through saved draft task completion. */
-    data class Encoding(
-        override val sizeBucket: SizeBucket,
-        val imageFormat: Int,
-        val isPendingRequest: Boolean,
-    ) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.COMPLETE
+    /** Returns the buffered durations and decisions on the first call, null afterwards. */
+    fun drainOnce(): Pair<Map<WorkloadKey, Long>, List<AdmissionDecision>>? {
+        synchronized(lock) {
+            if (drained) {
+                return null
+            }
+            drained = true
+            return Pair(workloadDurations.toMap(), decisions.values.toList())
+        }
     }
 }
 
-/** Key identifying the ordered workload suffix of a decision, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
-data class WorkloadSequenceKey(val workloadKeys: List<WorkloadKey>) {
-    val shape: WorkloadSequenceShape = WorkloadSequenceShape(workloadKeys.map { it.javaClass.simpleName })
+/**
+ * Sole writer of the [CaptureMetrics]/[DraftSequenceMetrics] observability store; nothing model-facing reads
+ * from it. Kept in one place so retiring [CaptureMetrics] in favor of logs is a single-class change.
+ */
+private class MetricsRecorder(
+    captureMetrics: CaptureMetrics,
+    private val draftSequenceMetrics: DraftSequenceMetrics,
+    isPendingRequest: Boolean,
+) {
 
     init {
-        require(workloadKeys.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload key." }
+        draftSequenceMetrics.isPendingRequest = isPendingRequest
+        captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
-}
 
-/** Sequence of workload type names only (size and queue axes erased) - the calibration fallback key. */
-data class WorkloadSequenceShape(val workloadTypeNames: List<String>)
-
-fun WorkloadKey.toReplayString(): String = when (this) {
-    is WorkloadKey.Bokeh -> "BOKEH(sizeBucket=$sizeBucket)"
-    is WorkloadKey.DynamicFunction -> "DYNAMIC_FUNCTION(sizeBucket=$sizeBucket)"
-    is WorkloadKey.Filter -> "FILTER(sizeBucket=$sizeBucket)"
-    is WorkloadKey.Watermark -> "WATERMARK(sizeBucket=$sizeBucket)"
-    is WorkloadKey.Encoding -> "ENCODING(sizeBucket=$sizeBucket,imageFormat=$imageFormat,isPendingRequest=$isPendingRequest)"
-}
-
-/** Decision-time sequence in replay format, e.g. "BOKEH(...)>FILTER(...)>ENCODING(...)". */
-fun WorkloadSequenceKey.toReplayString(): String = workloadKeys.joinToString(">") { it.toReplayString() }
-
-enum class WorkloadPolicy {
-    ADMIT,
-    OBSERVE,
-    COMPLETE,
-}
-
-/** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */
-enum class SizeBucket(val megaPixels: Int) {
-    MP12(12),
-    MP24(24),
-    MP50(50),
-    MP108(108),
-    MP200(200);
-
-    fun sizeRatio(to: SizeBucket): Double =
-        to.megaPixels.toDouble() / megaPixels.toDouble()
-
-    companion object {
-        fun of(size: Size): SizeBucket {
-            val pixels = size.width.toLong().coerceAtLeast(0L) *
-                    size.height.toLong().coerceAtLeast(0L)
-            val megaPixels = pixels.toDouble() / 1_000_000.0
-            return entries.minByOrNull { abs(megaPixels - it.megaPixels) } ?: MP12
+    fun onNodeExecutionStart(
+        nodeName: String,
+        workloadKey: WorkloadKey,
+        preExecutionMetrics: PreExecutionMetrics,
+    ): NodeExecutionMetrics {
+        val nodeExecutionMetrics = NodeExecutionMetrics(
+            nodeName = nodeName,
+            preExecutionMetrics = preExecutionMetrics,
+            workloadKey = workloadKey.toReplayString(),
+        )
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.nodeExecutionMetricsList += nodeExecutionMetrics
         }
+        return nodeExecutionMetrics
+    }
+
+    fun onPrediction(prediction: ExecutionPrediction) {
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.nodeExecutionPredictionList += prediction
+        }
+    }
+
+    fun onWatchdogArmed(nodeExecutionMetrics: NodeExecutionMetrics, watchdogTimeoutMs: Long) {
+        nodeExecutionMetrics.watchdogTimeoutMs = watchdogTimeoutMs
+        nodeExecutionMetrics.watchdogTimedOut = false
+    }
+
+    fun onWatchdogTimedOut(nodeExecutionMetrics: NodeExecutionMetrics) {
+        nodeExecutionMetrics.watchdogTimedOut = true
+        draftSequenceMetrics.hasWatchdogTimeout = true
+    }
+
+    fun onWorkloadCompleted(nodeExecutionMetrics: NodeExecutionMetrics, postExecutionMetrics: PostExecutionMetrics) {
+        nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
+    }
+
+    fun onCaptureEnd(isTimeout: Boolean) {
+        draftSequenceMetrics.isTimeout = isTimeout
     }
 }
 

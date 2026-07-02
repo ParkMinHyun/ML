@@ -307,22 +307,21 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision,
 )
 
-data class ScoreSample(
+internal data class ScoreSample(
     val score: Double,
     val weight: Double = 1.0,
 ) {
     fun decayed(factor: Double): ScoreSample = copy(weight = weight * factor)
 }
 
-
-fun score(predictedMs: Double, actualMs: Double): Double? {
+internal fun score(predictedMs: Double, actualMs: Double): Double? {
     if (predictedMs <= 0.0 || actualMs <= 0.0) {
         return null
     }
     return maxOf(0.0, ln(actualMs / predictedMs))
 }
 
-fun effectiveSampleSize(weights: List<Double>): Double {
+internal fun effectiveSampleSize(weights: List<Double>): Double {
     val sumW = weights.sum()
     val sumW2 = weights.sumOf { it * it }
     if (sumW <= 0.0 || sumW2 <= 0.0) {
@@ -332,14 +331,14 @@ fun effectiveSampleSize(weights: List<Double>): Double {
     return (sumW * sumW) / sumW2
 }
 
-fun adaptiveQuantile(effectiveSampleSize: Double): Double {
+internal fun adaptiveQuantile(effectiveSampleSize: Double): Double {
     if (effectiveSampleSize <= 0.0) {
         return 0.0
     }
     return 1.0 - 1.0 / (effectiveSampleSize + 1.0)
 }
 
-fun quantileScore(samples: List<ScoreSample>): Double {
+internal fun quantileScore(samples: List<ScoreSample>): Double {
     val weightedSamples = samples.filter { it.weight > 0.0 }
     if (weightedSamples.isEmpty()) {
         return 0.0
@@ -358,7 +357,7 @@ fun quantileScore(samples: List<ScoreSample>): Double {
     return weightedSamples.maxOf { it.score }
 }
 
-fun calibratedScore(
+internal fun calibratedScore(
     sequenceSamples: List<ScoreSample>,
     compatibleSamples: List<ScoreSample>,
 ): Double {

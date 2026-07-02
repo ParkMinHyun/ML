@@ -14,9 +14,10 @@ private const val TAG = "DraftSequenceExecutionSession"
 
 /**
  * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution]. It owns admission skip,
- * optional worker timeout, delayed completion, and metric completion.
+ * optional worker timeout, delayed completion, and metric completion. Which of those behaviors a session
+ * gets is defined by the per-[WorkloadPolicy] factories in the companion.
  */
-class DraftSequenceExecutionSession internal constructor(
+class DraftSequenceExecutionSession private constructor(
     private val shouldRun: Boolean = true,
     private val watchdogTimeoutMs: Long? = null,
     private val completeOnReturn: Boolean = true,
@@ -114,5 +115,35 @@ class DraftSequenceExecutionSession internal constructor(
             completed = true
             onCancel()
         }
+    }
+
+    companion object {
+        /** [WorkloadPolicy.ADMIT]: skippable by the admission decision and guarded by a watchdog. */
+        internal fun forAdmitWorkload(
+            shouldRun: Boolean,
+            watchdogTimeoutMs: Long,
+            onTimedOutTask: (CompletableFuture<*>) -> Unit,
+            onComplete: (PostExecutionMetrics) -> Unit,
+        ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(
+            shouldRun = shouldRun,
+            watchdogTimeoutMs = watchdogTimeoutMs,
+            onTimedOutTask = onTimedOutTask,
+            onComplete = onComplete,
+        )
+
+        /** [WorkloadPolicy.OBSERVE]: always runs, measured only. */
+        internal fun forObserveWorkload(
+            onComplete: (PostExecutionMetrics) -> Unit,
+        ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(onComplete = onComplete)
+
+        /** [WorkloadPolicy.COMPLETE]: runs now; completion is deferred to the profiler's capture-end call. */
+        internal fun forCompleteWorkload(
+            onCancel: () -> Unit,
+            onComplete: (PostExecutionMetrics) -> Unit,
+        ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(
+            completeOnReturn = false,
+            onCancel = onCancel,
+            onComplete = onComplete,
+        )
     }
 }
