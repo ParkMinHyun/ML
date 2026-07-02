@@ -4,6 +4,7 @@ import android.os.SystemClock
 import android.util.Size
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.DynamicFunctionNode
+import com.samsung.android.camera.core2.node.MultiFrameNodeBase
 import com.samsung.android.camera.core2.node.Node
 import com.samsung.android.camera.core2.node.dualBokeh.samsung.SecDualBokehNodeBase
 import com.samsung.android.camera.core2.node.filter.SecFilterNode
@@ -37,6 +38,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
     private val workloadDurations: MutableMap<WorkloadKey, Long> = mutableMapOf()
     private val sequenceSnapshots: MutableMap<WorkloadSequenceKey, SequencePredictionSnapshot> = mutableMapOf()
+    private val observedQueuePressureGroups = mutableSetOf<Class<out MultiFrameNodeBase>>()
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
@@ -91,6 +93,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
     ): DraftSequenceExecutionSession {
+        observeQueuePressureBudgetOnce(workloadKey, preExecutionMetrics)
         val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics).also(::rememberDecision)
         val prediction = when (workloadKey.policy) {
             WorkloadPolicy.ADMIT -> decision.executionPrediction
@@ -134,6 +137,16 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             ).also { session ->
                 pendingCompleteSession = session
             }
+        }
+    }
+
+    private fun observeQueuePressureBudgetOnce(
+        workloadKey: WorkloadKey,
+        preExecutionMetrics: PreExecutionMetrics,
+    ) {
+        val queuePressureGroup = workloadKey.queuePressureGroup ?: return
+        if (observedQueuePressureGroups.add(queuePressureGroup)) {
+            predictor.observeQueuePressureBudget(queuePressureGroup, preExecutionMetrics.budgetMs)
         }
     }
 
@@ -215,19 +228,28 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private fun workloadKeyFor(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
         val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
+        val queuePressureGroup = queuePressureGroupFor(node)
         return when (node) {
-            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
+            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket, queuePressureGroup)
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }
-            is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
-            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
-            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket)
+            is SecFilterNode -> WorkloadKey.Filter(sizeBucket, queuePressureGroup)
+            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket, queuePressureGroup)
+            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket, queuePressureGroup)
             is SecImageCodecNodeBase -> WorkloadKey.Encoding(
                 sizeBucket,
                 captureMetrics.resultImageFormat,
                 isPendingRequest,
+                queuePressureGroup,
             ).takeIf { node.isEncodeUsage }
             else -> null
         }
+    }
+
+    private fun queuePressureGroupFor(node: Node): Class<out MultiFrameNodeBase>? {
+        if (node is MultiFrameNodeBase) {
+            return MultiFrameNodeBase::class.java
+        }
+        return null
     }
 
     fun deinitializeDraftNodeChain() {
@@ -238,28 +260,43 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 /** Stable workload bucket shared by the workload EWMA and sequence calibrator. */
 sealed interface WorkloadKey {
     val policy: WorkloadPolicy
+    val sizeBucket: SizeBucket
+    val queuePressureGroup: Class<out MultiFrameNodeBase>?
 
-    data class Bokeh(val sizeBucket: SizeBucket) : WorkloadKey {
+    data class Bokeh(
+        override val sizeBucket: SizeBucket,
+        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
+    ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
     }
 
-    data class DynamicFunction(val sizeBucket: SizeBucket) : WorkloadKey {
+    data class DynamicFunction(
+        override val sizeBucket: SizeBucket,
+        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
+    ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
     }
 
-    data class Filter(val sizeBucket: SizeBucket) : WorkloadKey {
+    data class Filter(
+        override val sizeBucket: SizeBucket,
+        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
+    ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
     }
 
-    data class Watermark(val sizeBucket: SizeBucket) : WorkloadKey {
+    data class Watermark(
+        override val sizeBucket: SizeBucket,
+        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
+    ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
     }
 
     /** Mandatory tail from ImageCodec entry through saved draft task completion. */
     data class Encoding(
-        val sizeBucket: SizeBucket,
+        override val sizeBucket: SizeBucket,
         val imageFormat: Int,
         val isPendingRequest: Boolean,
+        override val queuePressureGroup: Class<out MultiFrameNodeBase>?,
     ) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.COMPLETE
     }
@@ -267,10 +304,14 @@ sealed interface WorkloadKey {
 
 /** Ordered key for a decision suffix, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
 data class WorkloadSequenceKey(val workloads: List<WorkloadKey>) {
+    val shape: WorkloadSequenceShape = WorkloadSequenceShape(workloads.map { it.javaClass.simpleName })
+
     init {
         require(workloads.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload." }
     }
 }
+
+data class WorkloadSequenceShape(val workloadNames: List<String>)
 
 private fun WorkloadKey.toReplayString(): String = when (this) {
     is WorkloadKey.Bokeh -> "BOKEH(sizeBucket=$sizeBucket)"
@@ -293,6 +334,9 @@ enum class SizeBucket(val megaPixels: Int) {
     MP50(50),
     MP108(108),
     MP200(200);
+
+    fun sizeRatio(to: SizeBucket): Double =
+        to.megaPixels.toDouble() / megaPixels.toDouble()
 
     companion object {
         fun of(size: Size): SizeBucket {

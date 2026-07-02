@@ -1,5 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
+import com.samsung.android.camera.core2.node.MultiFrameNodeBase
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToLong
@@ -14,20 +15,23 @@ class DraftSequenceExecutionPredictor {
 
     private val workloadModels = mutableMapOf<WorkloadKey, WorkloadEwmaModel>()
     private val sequenceScoreSamples = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
-    private val globalScoreSamples = mutableListOf<ScoreSample>()
+    private val sequenceShapeScoreSamples = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
+
+    private val queuePressureByGroup = mutableMapOf<Class<out MultiFrameNodeBase>, BudgetTrend>()
 
     @Synchronized
     fun predictAdmission(
         sequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        val nodeKey = WorkloadSequenceKey(listOf(sequenceKey.workloads.first()))
+        val headWorkload = sequenceKey.workloads.first()
+        val nodeKey = WorkloadSequenceKey(listOf(headWorkload))
         val nodePrediction = predictSequence(nodeKey)
         val sequencePrediction = predictSequence(sequenceKey)
+        val admit = admitUnderBudgetPolicy(headWorkload, sequencePrediction, preExecutionMetrics.budgetMs)
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
-                admit = sequencePrediction.isColdStart ||
-                        sequencePrediction.upperBoundMs <= preExecutionMetrics.budgetMs,
+                admit = admit,
                 nodePredictedDurationMs = nodePrediction.predictedMs.roundToNonNegativeLong(),
                 nodePredictedUpperBoundMs = nodePrediction.upperBoundMs.roundToNonNegativeLong(),
                 sequencePredictedDurationMs = sequencePrediction.predictedMs.roundToNonNegativeLong(),
@@ -51,6 +55,52 @@ class DraftSequenceExecutionPredictor {
             .coerceAtLeast(0L)
 
         return WatchdogTimeoutDecision(timeoutMs, decision)
+    }
+
+    @Synchronized
+    fun observeQueuePressureBudget(
+        queuePressureGroup: Class<out MultiFrameNodeBase>,
+        budgetMs: Long,
+    ) {
+        queuePressureByGroup.getOrPut(queuePressureGroup) { BudgetTrend(WORKLOAD_EWMA_ALPHA) }.observe(budgetMs)
+    }
+
+    private fun admitUnderBudgetPolicy(
+        headWorkload: WorkloadKey,
+        sequencePrediction: SequencePrediction,
+        budgetMs: Long,
+    ): Boolean {
+        if (sequencePrediction.isColdStart) {
+            return true
+        }
+        val queuePressureGroup = headWorkload.queuePressureGroup
+        if (queuePressureGroup != null) {
+            return admitsUnderQueue(queuePressureGroup, sequencePrediction.upperBoundMs, budgetMs)
+        }
+        return sequencePrediction.upperBoundMs <= budgetMs
+    }
+
+    /**
+     * ADMIT gate. Deadline safety alone (UB <= budget) only reacts once the queue is at the cliff, so a heavy head
+     * (e.g. 24MP) can build a backlog the mandatory tail can no longer undo. This additionally holds the queue
+     * stable: while this group's budget is shrinking shot over shot (trend < 0 = falling behind the shutter rate),
+     * it keeps [ADMIT_RUNWAY_SHOTS] shots of headroom before a shot stops fitting. No device-specific millisecond
+     * threshold: the trigger is derived from the measured budget trend and the learned upper bound.
+     */
+    private fun admitsUnderQueue(
+        queuePressureGroup: Class<out MultiFrameNodeBase>,
+        upperBoundMs: Double,
+        budgetMs: Long,
+    ): Boolean {
+        val slackMs = budgetMs - upperBoundMs
+        if (slackMs < 0.0) {
+            return false
+        }
+        val trendMs = queuePressureByGroup[queuePressureGroup]?.trendMs ?: return true
+        if (trendMs >= 0.0) {
+            return true
+        }
+        return slackMs >= ADMIT_RUNWAY_SHOTS * -trendMs
     }
 
     @Synchronized
@@ -84,13 +134,13 @@ class DraftSequenceExecutionPredictor {
         decayScoreSamples()
         samples.forEach { (sequenceKey, sample) ->
             sequenceScoreSamples.getOrPut(sequenceKey) { mutableListOf() } += sample
-            globalScoreSamples += sample
+            sequenceShapeScoreSamples.getOrPut(sequenceKey.shape) { mutableListOf() } += sample
         }
     }
 
     private fun decayScoreSamples() {
-        globalScoreSamples.decayWeights()
         sequenceScoreSamples.values.forEach { it.decayWeights() }
+        sequenceShapeScoreSamples.values.forEach { it.decayWeights() }
     }
 
     private fun MutableList<ScoreSample>.decayWeights() {
@@ -135,18 +185,23 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun predictedWorkloadDuration(workloadKey: WorkloadKey): Double {
-        workloadModels[workloadKey]?.let { return it.predictionMs() }
-        // New variant not seen yet: borrow the slowest model of the same workload type as a conservative cold-start
-        // estimate, so it gets a real bound instead of a blind admit. Self-corrects once it has its own samples.
+        // Conservative cross-size coupling: every same-type sibling bucket informs this workload, its EWMA level
+        // scaled by the megapixel ratio - a well-sampled MP12 x2 bounds an under-sampled MP24, and a heavy MP24 /2
+        // keeps the following MP12 conservative. max() lets cross-size only raise the estimate, never lower it;
+        // the sibling with ratio 1.0 is the workload's own model. Predict-time only: the scaled value is never fed
+        // back into any model, so buckets never learn from each other.
         return workloadModels
-            .filterKeys { it::class == workloadKey::class }
-            .values.maxOfOrNull { it.predictionMs() } ?: 0.0
+            .filterKeys { it.javaClass == workloadKey.javaClass }
+            .maxOfOrNull { (siblingKey, model) ->
+                model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket)
+            }
+            ?: 0.0
     }
 
     private fun calibratedScore(sequenceKey: WorkloadSequenceKey): Double {
         return calibratedScore(
             sequenceSamples = sequenceScoreSamples[sequenceKey].orEmpty(),
-            globalSamples = globalScoreSamples,
+            compatibleSamples = sequenceShapeScoreSamples[sequenceKey.shape].orEmpty(),
         )
     }
 
@@ -201,6 +256,20 @@ class DraftSequenceExecutionPredictor {
         }
     }
 
+    private class BudgetTrend(private val alpha: Double) {
+        private var lastBudgetMs: Long? = null
+        var trendMs: Double? = null
+            private set
+
+        fun observe(budgetMs: Long) {
+            lastBudgetMs?.let { prev ->
+                val deltaMs = (budgetMs - prev).toDouble()
+                trendMs = trendMs?.let { it + alpha * (deltaMs - it) } ?: deltaMs
+            }
+            lastBudgetMs = budgetMs
+        }
+    }
+
     companion object {
         /** Process-wide learned model shared by profilers created across captures. */
         @JvmStatic
@@ -212,6 +281,10 @@ class DraftSequenceExecutionPredictor {
         private const val WORKLOAD_EWMA_ALPHA = 0.30
         private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
+
+        // Queue runway: shots of budget headroom to preserve before divergence forces a timeout. A small,
+        // device-independent shot count -- not a per-model millisecond threshold.
+        private const val ADMIT_RUNWAY_SHOTS = 2
     }
 }
 
@@ -289,14 +362,13 @@ fun quantileScore(samples: List<ScoreSample>): Double {
 
 fun calibratedScore(
     sequenceSamples: List<ScoreSample>,
-    globalSamples: List<ScoreSample>,
+    compatibleSamples: List<ScoreSample>,
 ): Double {
-    // Each sequence's bound comes from its OWN residual tail (defensible, no cross-sequence contamination).
-    // The pooled-global tail is only a cold-start prior for a sequence we have never observed yet.
+    // Exact sequence residuals win; otherwise borrow only the same workload-type sequence shape.
     return if (sequenceSamples.isNotEmpty()) {
         quantileScore(sequenceSamples)
     } else {
-        quantileScore(globalSamples)
+        quantileScore(compatibleSamples)
     }
 }
 
