@@ -44,8 +44,8 @@ data class PostExecutionMetrics(
 )
 
 data class ExecutionPrediction @JvmOverloads constructor(
-    val sequencePredictedDurationMs: Long,
-    val sequencePredictedUpperBoundMs: Long,
+    val sequencePredictedDurationMs: Double,
+    val sequencePredictedUpperBoundMs: Double,
     val admit: Boolean = false,
     /**
      * Decision-time planned workload-key suffix in replay-string format. This is the predictor input for this
@@ -53,6 +53,4 @@ data class ExecutionPrediction @JvmOverloads constructor(
      * offline replay must read the sequence from this field instead of reconstructing it from executed-node rows.
      */
     val workloadSequenceKey: String? = null,
-    /** "MULTI_FRAME" when the deciding workload is queue-pressure gated (e.g. Bokeh); null otherwise. */
-    val queuePressureGroup: String? = null,
 )

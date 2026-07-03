@@ -156,14 +156,11 @@ data class ExecutionPredictionEntity(
     @ColumnInfo(name = "workload_sequence_key")
     val workloadSequenceKey: String?,
 
-    @ColumnInfo(name = "queue_pressure_group")
-    val queuePressureGroup: String?,
-
     @ColumnInfo(name = "sequence_predicted_duration_ms")
-    val sequencePredictedDurationMs: Long,
+    val sequencePredictedDurationMs: Double,
 
     @ColumnInfo(name = "sequence_predicted_upper_bound_ms")
-    val sequencePredictedUpperBoundMs: Long,
+    val sequencePredictedUpperBoundMs: Double,
 
     @ColumnInfo(
         name = "admit",

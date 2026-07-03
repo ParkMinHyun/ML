@@ -449,13 +449,13 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        fun sequencePredictionResidualMs(): Long? {
+        fun sequencePredictionResidualMs(): Double? {
             val prediction = prediction ?: return null
             val actualDurationMs = sequenceActualDurationMs ?: return null
             return actualDurationMs - prediction.sequencePredictedDurationMs
         }
 
-        fun sequenceUpperBoundSlackMs(): Long? {
+        fun sequenceUpperBoundSlackMs(): Double? {
             val prediction = prediction ?: return null
             val actualDurationMs = sequenceActualDurationMs ?: return null
             return prediction.sequencePredictedUpperBoundMs - actualDurationMs
@@ -756,7 +756,6 @@ class CaptureMetricsExcelExporter(
             Column("observedActualFeasible") { it.observedActualFeasible() },
             Column("") { "" },
             Column("workloadSequenceKey") { it.nodeRow.prediction?.workloadSequenceKey },
-            Column("queuePressureGroup") { it.nodeRow.prediction?.queuePressureGroup },
             Column("sequencePredictedDurationMs") { it.nodeRow.prediction?.sequencePredictedDurationMs },
             Column("sequencePredictedUpperBoundMs") { it.nodeRow.prediction?.sequencePredictedUpperBoundMs },
             Column("sequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },

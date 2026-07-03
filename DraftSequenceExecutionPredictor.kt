@@ -16,7 +16,7 @@ class DraftSequenceExecutionPredictor {
     private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
     private val workloadSequenceShapeScoreMap = mutableMapOf<List<Class<out WorkloadKey>>, MutableList<ScoreSample>>()
 
-    private val queueBudgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
+    private val budgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
 
     @Synchronized
     fun predictAdmission(
@@ -38,13 +38,11 @@ class DraftSequenceExecutionPredictor {
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
                 admit = admit,
-                sequencePredictedDurationMs = sequencePredictedMs.roundToNonNegativeLong(),
-                sequencePredictedUpperBoundMs = sequenceUpperBoundMs.roundToNonNegativeLong(),
+                sequencePredictedDurationMs = sequencePredictedMs,
+                sequencePredictedUpperBoundMs = sequenceUpperBoundMs,
                 workloadSequenceKey = workloadSequenceKey.toReplayString(),
-                queuePressureGroup = "MULTI_FRAME".takeIf { isQueuePressureGated },
             ),
             workloadSequenceKey = workloadSequenceKey,
-            sequencePredictedMs = sequencePredictedMs,
             workloadPredictedMs = workloadPredictedMs,
         )
     }
@@ -71,14 +69,14 @@ class DraftSequenceExecutionPredictor {
         // its admit bit is unused.
         val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
-            .coerceAtLeast(0L)
+            .roundToNonNegativeLong()
 
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
     @Synchronized
     fun observeQueuePressureBudget(budgetMs: Long) {
-        queueBudgetTrend.observe(budgetMs)
+        budgetTrend.observe(budgetMs)
     }
 
     private fun admitUnderBudgetPolicy(
@@ -110,7 +108,7 @@ class DraftSequenceExecutionPredictor {
         if (slackMs < 0.0) {
             return false
         }
-        val trendMs = queueBudgetTrend.trendMs ?: return true
+        val trendMs = budgetTrend.trendMs ?: return true
         if (trendMs >= 0.0) {
             return true
         }
@@ -137,7 +135,7 @@ class DraftSequenceExecutionPredictor {
     ) {
         val samples = admissionDecisions.mapNotNull { decision ->
             val clampedActualMs = clampedSequenceActualDuration(decision, workloadDurations) ?: return@mapNotNull null
-            val score = score(decision.sequencePredictedMs, clampedActualMs) ?: return@mapNotNull null
+            val score = score(decision.executionPrediction.sequencePredictedDurationMs, clampedActualMs) ?: return@mapNotNull null
             decision.workloadSequenceKey to ScoreSample(score = score)
         }
 
@@ -298,17 +296,15 @@ class DraftSequenceExecutionPredictor {
 }
 
 /**
- * One admission decision. [executionPrediction] is the persisted decision record (rounded, replay-ready);
- * the remaining fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.updateCapture]
- * consumes once at capture end. They stay outside [ExecutionPrediction] on purpose: residual scoring needs the
- * unrounded values, and neither a Double duplicate nor a per-workload map belongs in the metrics store.
+ * One admission decision. [executionPrediction] is the persisted decision record (replay-ready); the remaining
+ * fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.updateCapture] consumes once
+ * at capture end. They stay outside [ExecutionPrediction] on purpose: a typed key and a per-workload map do not
+ * belong in the metrics store.
  */
 data class AdmissionDecision(
     val executionPrediction: ExecutionPrediction,
     /** Sequence this decision was made for; capture-end score samples are keyed by it. */
     val workloadSequenceKey: WorkloadSequenceKey,
-    /** Decision-time sequence prediction, kept unrounded for capture-end residual scoring. */
-    val sequencePredictedMs: Double,
     /** Per-workload decision-time prediction, used to clamp workload underruns so one workload's spike is not diluted. */
     val workloadPredictedMs: Map<WorkloadKey, Double>,
 )

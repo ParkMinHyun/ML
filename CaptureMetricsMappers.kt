@@ -77,7 +77,6 @@ fun ExecutionPrediction.toEntity(
         captureMetricsId = captureMetricsId,
         order = order,
         workloadSequenceKey = workloadSequenceKey,
-        queuePressureGroup = queuePressureGroup,
         sequencePredictedDurationMs = sequencePredictedDurationMs,
         sequencePredictedUpperBoundMs = sequencePredictedUpperBoundMs,
         admit = admit,
@@ -177,7 +176,6 @@ fun ExecutionPredictionEntity.toModel(): ExecutionPrediction {
         sequencePredictedDurationMs = sequencePredictedDurationMs,
         sequencePredictedUpperBoundMs = sequencePredictedUpperBoundMs,
         workloadSequenceKey = workloadSequenceKey,
-        queuePressureGroup = queuePressureGroup,
     )
 }
 
