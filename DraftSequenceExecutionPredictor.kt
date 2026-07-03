@@ -1,8 +1,11 @@
 package com.samsung.android.camera.core2.ml
 
+import com.samsung.android.camera.core2.util.CLog
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToLong
+
+private const val TAG = "DraftSequenceExecutionPredictor"
 
 /**
  * Sequence-aware, phase-aware, adaptive upper bound.
@@ -88,7 +91,7 @@ class DraftSequenceExecutionPredictor {
         return when {
             // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
             sequencePredictedMs <= 0.0 -> true
-            isQueuePressureGated -> admitsUnderQueue(sequenceUpperBoundMs, budgetMs)
+            isQueuePressureGated -> admitsUnderQueue(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
             else -> sequenceUpperBoundMs <= budgetMs
         }
     }
@@ -101,18 +104,25 @@ class DraftSequenceExecutionPredictor {
      * threshold: the trigger is derived from the measured budget trend and the learned upper bound.
      */
     private fun admitsUnderQueue(
+        predictedMs: Double,
         upperBoundMs: Double,
         budgetMs: Long,
     ): Boolean {
         val slackMs = budgetMs - upperBoundMs
         if (slackMs < 0.0) {
+            CLog.w(TAG, "[mhyun2.park] reject admission by upperbound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", predictedMs, upperBoundMs, budgetMs)
             return false
         }
         val trendMs = budgetTrend.trendMs ?: return true
         if (trendMs >= 0.0) {
             return true
         }
-        return slackMs >= ADMIT_RUNWAY_SHOTS * -trendMs
+
+        val abc = slackMs >= ADMIT_RUNWAY_SHOTS * -trendMs
+        if (!abc) {
+            CLog.e(TAG, "[mhyun2.park] reject admission by queue-pressure - slackMs=%f, trendMs=%f, budgetMs=%d", slackMs, ADMIT_RUNWAY_SHOTS * -trendMs, budgetMs)
+        }
+        return abc
     }
 
     @Synchronized
