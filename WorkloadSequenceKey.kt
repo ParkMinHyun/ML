@@ -7,9 +7,9 @@ data class WorkloadSequenceKey(val workloadKeys: List<WorkloadKey>) {
         require(workloadKeys.isNotEmpty()) { "WorkloadSequenceKey must contain at least one workload key." }
     }
 
-    /** Whether the deciding head workload is queue-pressure gated (e.g. Bokeh). */
-    val isQueuePressureGated: Boolean
-        get() = workloadKeys.first().isQueuePressureGated
+    /** Whether the deciding head workload is budget-trend gated (e.g. Bokeh). */
+    val isBudgetTrendGated: Boolean
+        get() = workloadKeys.first().isBudgetTrendGated
 }
 
 /** Decision-time sequence in replay format, e.g. "BOKEH(...)>FILTER(...)>ENCODING(...)". */

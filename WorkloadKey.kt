@@ -20,12 +20,12 @@ sealed interface WorkloadKey {
      * Bokeh), so its admission must preserve runway against the shot-over-shot budget trend, not just the
      * current deadline.
      */
-    val isQueuePressureGated: Boolean
+    val isBudgetTrendGated: Boolean
         get() = false
 
     data class Bokeh(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
-        override val isQueuePressureGated: Boolean = true
+        override val isBudgetTrendGated: Boolean = true
     }
 
     data class DynamicFunction(override val sizeBucket: SizeBucket) : WorkloadKey {

@@ -85,10 +85,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
     ): DraftSequenceExecutionSession {
-        if (workloadKey.isQueuePressureGated) {
-            // ponytail: no per-capture dedupe - Bokeh is the only queue-pressure workload and yields one
+        if (workloadKey.isBudgetTrendGated) {
+            // ponytail: no per-capture dedupe - Bokeh is the only budget-trend-gated workload and yields one
             // session per capture; bring back a per-capture observed flag if a second one ever appears.
-            predictor.observeQueuePressureBudget(preExecutionMetrics.budgetMs)
+            predictor.observeBudget(preExecutionMetrics.budgetMs)
         }
         val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
             .also(modelUpdate::remember)

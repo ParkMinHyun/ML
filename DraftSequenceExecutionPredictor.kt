@@ -15,10 +15,13 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  */
 class DraftSequenceExecutionPredictor {
 
-    private val workloadTrendMap = mutableMapOf<WorkloadKey, WorkloadTrend>()
+    private val workloadDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
     private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
     private val workloadSequenceShapeScoreMap = mutableMapOf<List<Class<out WorkloadKey>>, MutableList<ScoreSample>>()
 
+    // ponytail: single shared instance - valid only while one workload type (Bokeh) is budget-trend gated.
+    // A second gated type would mix budgets observed at different pipeline positions; split into a
+    // per-workload-type map at that point.
     private val budgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
 
     @Synchronized
@@ -31,9 +34,9 @@ class DraftSequenceExecutionPredictor {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::predictedWorkloadDuration)
         val sequencePredictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = correctedSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
-        val isQueuePressureGated = workloadSequenceKey.isQueuePressureGated
+        val isBudgetTrendGated = workloadSequenceKey.isBudgetTrendGated
         val admit = admitUnderBudgetPolicy(
-            isQueuePressureGated,
+            isBudgetTrendGated,
             sequencePredictedMs,
             sequenceUpperBoundMs,
             preExecutionMetrics.budgetMs,
@@ -68,7 +71,7 @@ class DraftSequenceExecutionPredictor {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
-        // The reserve tail is COMPLETE-only, so this internal decision is naturally not queue-pressure gated;
+        // The reserve tail is COMPLETE-only, so this internal decision is naturally not budget-trend gated;
         // its admit bit is unused.
         val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
@@ -77,13 +80,14 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
+    /** Feeds [budgetTrend]: one observation per shot, taken at the budget-trend-gated workload's start. */
     @Synchronized
-    fun observeQueuePressureBudget(budgetMs: Long) {
+    fun observeBudget(budgetMs: Long) {
         budgetTrend.observe(budgetMs)
     }
 
     private fun admitUnderBudgetPolicy(
-        isQueuePressureGated: Boolean,
+        isBudgetTrendGated: Boolean,
         sequencePredictedMs: Double,
         sequenceUpperBoundMs: Double,
         budgetMs: Long,
@@ -91,7 +95,7 @@ class DraftSequenceExecutionPredictor {
         return when {
             // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
             sequencePredictedMs <= 0.0 -> true
-            isQueuePressureGated -> admitsUnderQueue(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
+            isBudgetTrendGated -> admitsUnderFallingBudget(budgetMs, sequencePredictedMs, sequenceUpperBoundMs)
             else -> sequenceUpperBoundMs <= budgetMs
         }
     }
@@ -100,29 +104,28 @@ class DraftSequenceExecutionPredictor {
      * ADMIT gate. Deadline safety alone (UB <= budget) only reacts once the queue is at the cliff, so a heavy head
      * (e.g. 24MP) can build a backlog the mandatory tail can no longer undo. This additionally holds the queue
      * stable: while the queue's budget is shrinking shot over shot (trend < 0 = falling behind the shutter rate),
-     * it keeps [ADMIT_RUNWAY_SHOTS] shots of headroom before a shot stops fitting. No device-specific millisecond
+     * it keeps [BUDGET_RUNWAY_SHOTS] shots of headroom before a shot stops fitting. No device-specific millisecond
      * threshold: the trigger is derived from the measured budget trend and the learned upper bound.
      */
-    private fun admitsUnderQueue(
+    private fun admitsUnderFallingBudget(
+        budgetMs: Long,
         predictedMs: Double,
         upperBoundMs: Double,
-        budgetMs: Long,
     ): Boolean {
         val slackMs = budgetMs - upperBoundMs
         if (slackMs < 0.0) {
-            CLog.w(TAG, "[mhyun2.park] reject admission by upperbound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", predictedMs, upperBoundMs, budgetMs)
+            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", predictedMs, upperBoundMs, budgetMs)
             return false
         }
-        val trendMs = budgetTrend.trendMs ?: return true
-        if (trendMs >= 0.0) {
-            return true
+
+        val fallingTrendMs = budgetTrend.trendMs?.takeIf { it < 0.0 } ?: return true
+        val requiredRunwayMs = BUDGET_RUNWAY_SHOTS * -fallingTrendMs
+        if (slackMs < requiredRunwayMs) {
+            CLog.w(TAG, "[mhyun2.park] reject admission by budget runway - slackMs=%f, requiredRunwayMs=%f, budgetMs=%d", slackMs, requiredRunwayMs, budgetMs)
+            return false
         }
 
-        val abc = slackMs >= ADMIT_RUNWAY_SHOTS * -trendMs
-        if (!abc) {
-            CLog.e(TAG, "[mhyun2.park] reject admission by queue-pressure - slackMs=%f, trendMs=%f, budgetMs=%d", slackMs, ADMIT_RUNWAY_SHOTS * -trendMs, budgetMs)
-        }
-        return abc
+        return true
     }
 
     @Synchronized
@@ -135,7 +138,7 @@ class DraftSequenceExecutionPredictor {
         addScoreSamples(validWorkloadDurations, admissionDecisions)
 
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            workloadTrendMap.getOrPut(workloadKey) { WorkloadTrend() }.update(durationMs.toDouble())
+            workloadDurationTrendMap.getOrPut(workloadKey) { WorkloadDurationTrend() }.update(durationMs.toDouble())
         }
     }
 
@@ -215,7 +218,7 @@ class DraftSequenceExecutionPredictor {
         // keeps the following MP12 conservative. max() lets cross-size only raise the estimate, never lower it;
         // the sibling with ratio 1.0 is the workload's own model. Predict-time only: the scaled value is never fed
         // back into any model, so buckets never learn from each other.
-        return workloadTrendMap.entries
+        return workloadDurationTrendMap.entries
             .filter { it.key.javaClass == workloadKey.javaClass }
             .maxOfOrNull { (siblingKey, model) ->
                 model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket)
@@ -250,7 +253,7 @@ class DraftSequenceExecutionPredictor {
     }
 
     /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
-    private class WorkloadTrend {
+    private class WorkloadDurationTrend {
         private var sampleCount: Int = 0
         private var levelMs: Double? = null
 
@@ -299,9 +302,10 @@ class DraftSequenceExecutionPredictor {
         private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
 
-        // Queue runway: shots of budget headroom to preserve before divergence forces a timeout. A small,
-        // device-independent shot count -- not a per-model millisecond threshold.
-        private const val ADMIT_RUNWAY_SHOTS = 2
+        // Budget runway: shots of budget headroom to preserve while the budget trend is falling, before
+        // divergence forces a timeout. A small, device-independent shot count -- not a per-model millisecond
+        // threshold.
+        private const val BUDGET_RUNWAY_SHOTS = 2
     }
 }
 
