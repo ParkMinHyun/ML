@@ -34,7 +34,7 @@ class DraftSequenceExecutionPredictor {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::predictedWorkloadDuration)
         val sequencePredictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = correctedSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
-        val isBudgetTrendGated = workloadSequenceKey.isBudgetTrendGated
+        val isBudgetTrendGated = workloadSequenceKey.headWorkloadKey.isBudgetTrendGated
         val admit = admitUnderBudgetPolicy(
             isBudgetTrendGated,
             sequencePredictedMs,
@@ -118,8 +118,8 @@ class DraftSequenceExecutionPredictor {
             return false
         }
 
-        val fallingTrendMs = budgetTrend.trendMs?.takeIf { it < 0.0 } ?: return true
-        val requiredRunwayMs = BUDGET_RUNWAY_SHOTS * -fallingTrendMs
+        val fallingBudgetTrendMs = budgetTrend.trendMs?.takeIf { it < 0.0 } ?: return true
+        val requiredRunwayMs = BUDGET_RUNWAY_SHOTS * -fallingBudgetTrendMs
         if (slackMs < requiredRunwayMs) {
             CLog.w(TAG, "[mhyun2.park] reject admission by budget runway - slackMs=%f, requiredRunwayMs=%f, budgetMs=%d", slackMs, requiredRunwayMs, budgetMs)
             return false
