@@ -50,7 +50,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      *
      * ADMIT workloads (Bokeh / Filter) are admitted by their remaining suffix UB.
      * OBSERVE workloads (DynamicFunction / Watermark) always run but stay in prediction;
-     * COMPLETE workload is the mandatory tail.
+     * RESERVE workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
@@ -90,15 +90,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     /**
      * Feeds the first leading node's budget to captureAvailable pacing. Leading = the first ADMIT (Bokeh/Filter)
-     * or OBSERVE (Watermark/DynamicFunction) node - anything before the COMPLETE tail. A COMPLETE head means the
+     * or OBSERVE (Watermark/DynamicFunction) node - anything before the RESERVE tail. A RESERVE head means the
      * encoding is already the first node, so there is no pre-encoding budget to pace from and nothing to observe.
      */
     private fun observeFirstBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
-        if (hasObservedFirstBudget || workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.COMPLETE) {
+        if (hasObservedFirstBudget || workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.RESERVE) {
             return
         }
 
-        predictor.observeBudget(workloadSequenceKey, budgetMs)
+        predictor.observeCaptureAvailableSlack(workloadSequenceKey, budgetMs)
         hasObservedFirstBudget = true
     }
 
@@ -130,7 +130,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 )
             }
             WorkloadPolicy.OBSERVE -> DraftSequenceExecutionSession.forObserveWorkload(onComplete)
-            WorkloadPolicy.COMPLETE -> DraftSequenceExecutionSession.forCompleteWorkload(
+            WorkloadPolicy.RESERVE -> DraftSequenceExecutionSession.forReserveWorkload(
                 onCancel = { pendingCompleteSession = null },
                 onComplete = onComplete,
             ).also { session ->
@@ -139,7 +139,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    /** Completes the COMPLETE workload, updates Predictor's UB, and records whether this capture timed out. */
+    /** Completes the RESERVE workload, updates Predictor's UB, and records whether this capture timed out. */
     fun completeDraftSequenceExecution(): Boolean {
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
@@ -154,7 +154,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         return isTimeout
     }
 
-    /** Cancels the pending COMPLETE workload without discarding collected samples. */
+    /** Cancels the pending RESERVE workload without discarding collected samples. */
     fun cancelDraftSequenceExecution() {
         pendingCompleteSession?.cancel()
         pendingCompleteSession = null

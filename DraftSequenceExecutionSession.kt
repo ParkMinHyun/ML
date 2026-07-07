@@ -136,8 +136,8 @@ class DraftSequenceExecutionSession private constructor(
             onComplete: (PostExecutionMetrics) -> Unit,
         ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(onComplete = onComplete)
 
-        /** [WorkloadPolicy.COMPLETE]: runs now; completion is deferred to the profiler's capture-end call. */
-        internal fun forCompleteWorkload(
+        /** [WorkloadPolicy.RESERVE]: runs now; completion is deferred to the profiler's capture-end call. */
+        internal fun forReserveWorkload(
             onCancel: () -> Unit,
             onComplete: (PostExecutionMetrics) -> Unit,
         ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(

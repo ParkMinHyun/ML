@@ -116,7 +116,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     private CaptureAvailableDelay createCaptureAvailableDelay(@NonNull CaptureAvailableData data) {
         final long legacyDelayMs = Math.max(0, data.getAverageDraftTime() - data.getCaptureAvailableTime());
-        final Long slackMs = DraftSequenceExecutionPredictor.getInstance().predictCaptureAvailableSlackMs();
+        final Long slackMs = DraftSequenceExecutionPredictor.getInstance().captureAvailableSlackMs();
 
         if (slackMs == null) {
             return CaptureAvailableDelay.useLegacy(legacyDelayMs,

@@ -228,7 +228,7 @@ class CaptureMetricsExcelExporter(
                     "not stored in capture metrics - take it per capture from CaptureAvailableApmPolicy logs. " +
                     "firstLeadingBudgetMs is the budget at the first leading node (Bokeh/Filter/Watermark/DynamicFunction), " +
                     "so OBSERVE-only captures are paced too, matching the runtime. encodingReserveUpperBoundMs is the encoding " +
-                    "tail's suffix UB (= runtime COMPLETE-only reserve); pacingSlackMs is signed while the runtime watchdog " +
+                    "tail's suffix UB (= runtime reserve over the RESERVE tail); pacingSlackMs is signed while the runtime watchdog " +
                     "value clamps at 0.",
         ),
     )
@@ -310,7 +310,7 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
 
         /**
-         * First leading node of the capture - the node whose budget the runtime observeBudget records. Leading =
+         * First leading node of the capture - the node whose budget the runtime observeCaptureAvailableSlack records. Leading =
          * any predicted node before the encoding tail (Bokeh/Filter/Watermark/DynamicFunction), so an OBSERVE-only
          * capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
          */
@@ -318,8 +318,8 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.prediction != null }?.takeIf { it != encodingReserveRow }
 
         /**
-         * Encoding reserve node - the COMPLETE tail, i.e. the last predicted node. Its suffix UB is exactly the
-         * runtime's COMPLETE-only reserve (UB[Encoding]), so encodingReserveUpperBoundMs no longer over-counts the
+         * Encoding reserve node - the RESERVE tail, i.e. the last predicted node. Its suffix UB is exactly the
+         * runtime's reserve over the RESERVE tail (UB[Encoding]), so encodingReserveUpperBoundMs no longer over-counts the
          * intervening OBSERVE stages the old "first non-admission node" proxy included.
          */
         val encodingReserveRow: NodeRow?

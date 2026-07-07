@@ -37,7 +37,7 @@ sealed interface WorkloadKey {
         val imageFormat: Int,
         val isPendingRequest: Boolean,
     ) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.COMPLETE
+        override val policy: WorkloadPolicy = WorkloadPolicy.RESERVE
     }
 }
 
@@ -52,7 +52,7 @@ fun WorkloadKey.toReplayString(): String = when (this) {
 enum class WorkloadPolicy {
     ADMIT,
     OBSERVE,
-    COMPLETE,
+    RESERVE,
 }
 
 /** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */
