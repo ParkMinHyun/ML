@@ -353,6 +353,18 @@ class CaptureMetricsExcelExporter(
     ) {
         fun admissionStage(): String? = nodeRow.admissionStage()
 
+        fun admissionSkipReason(): String? {
+            val prediction = nodeRow.prediction ?: return null
+            if (!nodeRow.isAdmissionWorkload || prediction.admit) {
+                return null
+            }
+            return if (prediction.sequencePredictedUpperBoundMs > nodeRow.node.preExecutionMetrics.budgetMs) {
+                ADMISSION_SKIP_REASON_UPPER_BOUND
+            } else {
+                ADMISSION_SKIP_REASON_BUDGET_RUNWAY
+            }
+        }
+
         fun observedActualFeasible(): Boolean? {
             if (!isFullyObservedSuffix()) {
                 return null
@@ -675,6 +687,8 @@ class CaptureMetricsExcelExporter(
         private const val ADMIT_FILTER_PREFIX = "FILTER("
         private const val ADMISSION_STAGE_BOKEH = "Bokeh"
         private const val ADMISSION_STAGE_FILTER = "Filter"
+        private const val ADMISSION_SKIP_REASON_UPPER_BOUND = "upper bound"
+        private const val ADMISSION_SKIP_REASON_BUDGET_RUNWAY = "budget runway"
 
         private fun rate(numerator: Int, denominator: Int): Double? {
             if (denominator <= 0) {
@@ -747,6 +761,7 @@ class CaptureMetricsExcelExporter(
             Column("") { "" },
             Column("budgetMs") { it.nodeRow.node.preExecutionMetrics.budgetMs },
             Column("admit") { it.nodeRow.prediction?.admit },
+            Column("admissionSkipReason") { it.admissionSkipReason() },
             Column("durationMs") { it.nodeRow.nodeActualDurationMs },
             Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
             Column("watchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },

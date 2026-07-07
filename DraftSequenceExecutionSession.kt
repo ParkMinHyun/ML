@@ -32,10 +32,10 @@ class DraftSequenceExecutionSession private constructor(
     private var completed = false
 
     @Throws(Exception::class)
-    fun <T> execute(skippedValue: T, task: Callable<T>): T? {
+    fun <T> execute(skippedTask: Callable<T>, task: Callable<T>): T? {
         if (!shouldRun) {
             PLog.e(TAG, "[mhyun2.park] skip the execute")
-            return skippedValue
+            return skippedTask.call()
         }
 
         return try {

@@ -15,24 +15,8 @@ sealed interface WorkloadKey {
     val policy: WorkloadPolicy
     val sizeBucket: SizeBucket
 
-    /**
-     * True when this workload's admission must preserve runway against the shot-over-shot budget trend,
-     * not just the current deadline. Gate a workload only when it meets all of:
-     *  1. ADMIT policy - the gate can only act on skippable work.
-     *  2. Expensive - its duration is on the order of the per-shot budget decline, so a single admission
-     *     burns about one shot of runway (Bokeh: hundreds of ms).
-     *  3. Escalating failure - a wrong admission is not cleaned up within the shot: the node holds
-     *     cross-shot resources (multi-frame queue, buffers) or an overrun ends in watchdog/timeout.
-     * A cheap per-shot workload (e.g. Filter) stays ungated: the deadline check already bounds its damage
-     * to one shot. Before gating a second type, split the Predictor's shared budget trend per workload
-     * type - budgets observed at different pipeline positions must not mix.
-     */
-    val isBudgetTrendGated: Boolean
-        get() = false
-
     data class Bokeh(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
-        override val isBudgetTrendGated: Boolean = true
     }
 
     data class DynamicFunction(override val sizeBucket: SizeBucket) : WorkloadKey {

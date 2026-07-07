@@ -102,6 +102,28 @@ class CaptureMetricsRepository(
         }
     }
 
+    suspend fun deleteFromId(captureMetricsId: Int): Int {
+        return dao.deleteFromId(captureMetricsId)
+    }
+
+    fun deleteFromIdBlocking(captureMetricsId: Int): Int {
+        return runBlocking(Dispatchers.IO) {
+            deleteFromId(captureMetricsId)
+        }
+    }
+
+    @JvmOverloads
+    fun deleteFromIdAsync(captureMetricsId: Int, callback: Consumer<Int>? = null) {
+        asyncScope.launch {
+            try {
+                val deletedCount = deleteFromId(captureMetricsId)
+                callback?.accept(deletedCount)
+            } catch (t: Throwable) {
+                CLog.e(TAG, "[mhyun2.park] deleteFromIdAsync failed", t)
+            }
+        }
+    }
+
     companion object {
         private const val TAG = "CaptureMetricsRepository"
 

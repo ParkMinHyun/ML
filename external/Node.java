@@ -1264,7 +1264,7 @@ public abstract class Node implements PictureFormatProcessableInterface {
             final DraftSequenceExecutionSession session = draftSequenceExecutionProfiler.profileNodeExecution(this);
             if (null != session) {
                 try {
-                    return session.execute(getSkippedImage(picture, bundle), () -> executor.apply(picture, bundle));
+                    return session.execute(() -> getSkippedImageBuffer(picture, bundle), () -> executor.apply(picture, bundle));
                 } catch (TimeoutException e) {
                     CLog.w(getNodeTag(), "[mhyun2.park] processPictureWithProfiler - timeout, nodeId=" + mNodeId);
                     bundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_ERROR_PROFILER, true);
@@ -1281,7 +1281,7 @@ public abstract class Node implements PictureFormatProcessableInterface {
     }
 
     @NonNull
-    protected ImageBuffer getSkippedImage(@NonNull ImageBuffer picture, @NonNull ExtraBundle bundle) {
+    protected ImageBuffer getSkippedImageBuffer(@NonNull ImageBuffer picture, @NonNull ExtraBundle bundle) {
         return picture;
     }
 

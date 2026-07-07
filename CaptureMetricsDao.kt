@@ -57,4 +57,12 @@ abstract class CaptureMetricsDao {
 
     @Query("DELETE FROM capture_metrics")
     protected abstract suspend fun deleteAllInternal(): Int
+
+    @Transaction
+    open suspend fun deleteFromId(captureMetricsId: Int): Int {
+        return deleteFromIdInternal(captureMetricsId)
+    }
+
+    @Query("DELETE FROM capture_metrics WHERE capture_metrics_id >= :captureMetricsId")
+    protected abstract suspend fun deleteFromIdInternal(captureMetricsId: Int): Int
 }

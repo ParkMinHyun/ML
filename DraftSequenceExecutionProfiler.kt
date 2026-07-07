@@ -37,6 +37,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
+    private var hasObservedFirstAdmitBudget = false
 
     fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -59,11 +60,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             workloadKey = workloadKey,
             preExecutionMetrics = preExecutionMetrics,
         )
+
+        observeFirstAdmitBudget(workloadSequenceKey, preExecutionMetrics.budgetMs)
+        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics).also(modelUpdate::remember)
+        val prediction = decision.executionPrediction
+        metricsRecorder.onPrediction(prediction)
+
         return createExecutionSession(
             workloadKey = workloadKey,
             workloadSequenceKey = workloadSequenceKey,
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
+            prediction = prediction,
         )
     }
 
@@ -79,25 +87,20 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
+    private fun observeFirstAdmitBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+        if (!hasObservedFirstAdmitBudget && workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.ADMIT) {
+            predictor.observeBudget(workloadSequenceKey, budgetMs)
+            hasObservedFirstAdmitBudget = true
+        }
+    }
+
     private fun createExecutionSession(
         workloadKey: WorkloadKey,
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
         nodeExecutionMetrics: NodeExecutionMetrics,
+        prediction: ExecutionPrediction,
     ): DraftSequenceExecutionSession {
-        if (workloadKey.isBudgetTrendGated) {
-            // ponytail: no per-capture dedupe - Bokeh is the only budget-trend-gated workload and yields one
-            // session per capture; bring back a per-capture observed flag if a second one ever appears.
-            predictor.observeBudget(preExecutionMetrics.budgetMs)
-        }
-        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
-            .also(modelUpdate::remember)
-        val prediction = when (workloadKey.policy) {
-            WorkloadPolicy.ADMIT -> decision.executionPrediction
-            WorkloadPolicy.OBSERVE, WorkloadPolicy.COMPLETE -> decision.executionPrediction.copy(admit = true)
-        }
-        metricsRecorder.onPrediction(prediction)
-
         val onComplete: (PostExecutionMetrics) -> Unit = { postExecutionMetrics ->
             metricsRecorder.onWorkloadCompleted(nodeExecutionMetrics, postExecutionMetrics)
             modelUpdate.recordWorkloadDuration(workloadKey, postExecutionMetrics.durationMs)

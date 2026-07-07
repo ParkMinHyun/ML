@@ -196,15 +196,17 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
         @Override
         public void onRequestCollectionCompleted(int ppSequenceId) {
             final int sequenceId = Optional.ofNullable(mCamDevice).map(camDevice -> camDevice.getSequenceId(ppSequenceId)).orElse(-1);
-            sendCaptureAvailable(sequenceId, /*timestamp*/0L);
-            PictureCallbackHelper.onPostProcessingFrameCollectionCompleted(PROCESSING_PHOTO_TAG, mPictureCallback, sequenceId, mCamDevice);
+            sendCaptureAvailableImmediately(sequenceId,
+                    /*timestamp*/0L,
+                    () -> PictureCallbackHelper.onPostProcessingFrameCollectionCompleted(PROCESSING_PHOTO_TAG, mPictureCallback, sequenceId, mCamDevice));
         }
 
         @Override
         public void onRequestCollectionStopped(int ppSequenceId) {
             final int sequenceId = Optional.ofNullable(mCamDevice).map(camDevice -> camDevice.getSequenceId(ppSequenceId)).orElse(-1);
-            sendCaptureAvailable(sequenceId, /*timestamp*/0L);
-            PictureCallbackHelper.onPostProcessingFrameCollectionStopped(PROCESSING_PHOTO_TAG, mPictureCallback, sequenceId, mCamDevice);
+            sendCaptureAvailableImmediately(sequenceId,
+                    /*timestamp*/0L,
+                    () -> PictureCallbackHelper.onPostProcessingFrameCollectionStopped(PROCESSING_PHOTO_TAG, mPictureCallback, sequenceId, mCamDevice));
         }
 
         @Override
@@ -223,7 +225,7 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
             final int sequenceId = Optional.ofNullable(mCamDevice)
                     .map(camDevice -> camDevice.getSequenceId(ppSequenceId))
                     .orElse(-1);
-            sendCaptureAvailable(sequenceId, /*timestamp*/0L);
+            sendCaptureAvailable(sequenceId, /*timestamp*/0L, null);
         }
 
         @Override
@@ -231,7 +233,7 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
             final int sequenceId = Optional.ofNullable(mCamDevice)
                     .map(camDevice -> camDevice.getSequenceId(ppSequenceId))
                     .orElse(-1);
-            sendCaptureAvailable(sequenceId, /*timestamp*/0L);
+            sendCaptureAvailable(sequenceId, /*timestamp*/0L, null);
         }
     };
 
@@ -1391,7 +1393,6 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
             }
 
             mIsIPPCapturing = false;
-            mIsWatermarkEnable = false;
             mIsWideDistortionEnable = false;
         } finally {
             mPictureProcessLock.unlock();

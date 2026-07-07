@@ -17,12 +17,8 @@ class DraftSequenceExecutionPredictor {
 
     private val workloadDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
     private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
-    private val workloadSequenceShapeScoreMap = mutableMapOf<List<Class<out WorkloadKey>>, MutableList<ScoreSample>>()
-
-    // ponytail: single shared instance - valid only while one workload type (Bokeh) is budget-trend gated.
-    // A second gated type would mix budgets observed at different pipeline positions; split into a
-    // per-workload-type map at that point.
-    private val budgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
+    private val workloadSequenceShapeScoreMap = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
+    private val captureAvailableBudgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
 
     @Synchronized
     fun predictAdmission(
@@ -34,13 +30,14 @@ class DraftSequenceExecutionPredictor {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::predictedWorkloadDuration)
         val sequencePredictedMs = predictedSequenceDuration(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = correctedSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
-        val isBudgetTrendGated = workloadSequenceKey.headWorkloadKey.isBudgetTrendGated
-        val admit = admitUnderBudgetPolicy(
-            isBudgetTrendGated,
-            sequencePredictedMs,
-            sequenceUpperBoundMs,
-            preExecutionMetrics.budgetMs,
-        )
+        val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
+            WorkloadPolicy.ADMIT -> admitUnderBudgetPolicy(
+                sequencePredictedMs,
+                sequenceUpperBoundMs,
+                preExecutionMetrics.budgetMs,
+            )
+            WorkloadPolicy.OBSERVE, WorkloadPolicy.COMPLETE -> true
+        }
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
                 admit = admit,
@@ -71,8 +68,7 @@ class DraftSequenceExecutionPredictor {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
-        // The reserve tail is COMPLETE-only, so this internal decision is naturally not budget-trend gated;
-        // its admit bit is unused.
+        // The reserve tail is COMPLETE-only, so this internal decision's admit bit is unused.
         val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
         val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
             .roundToNonNegativeLong()
@@ -80,52 +76,53 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    /** Feeds [budgetTrend]: one observation per shot, taken at the budget-trend-gated workload's start. */
+    /** Feeds the draft sequence's first ADMIT budget into the captureAvailable back-pressure trend. */
     @Synchronized
-    fun observeBudget(budgetMs: Long) {
-        budgetTrend.observe(budgetMs)
-    }
-
-    private fun admitUnderBudgetPolicy(
-        isBudgetTrendGated: Boolean,
-        sequencePredictedMs: Double,
-        sequenceUpperBoundMs: Double,
-        budgetMs: Long,
-    ): Boolean {
-        return when {
-            // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
-            sequencePredictedMs <= 0.0 -> true
-            isBudgetTrendGated -> admitsUnderFallingBudget(budgetMs, sequencePredictedMs, sequenceUpperBoundMs)
-            else -> sequenceUpperBoundMs <= budgetMs
+    fun observeBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+        if (workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.ADMIT) {
+            captureAvailableBudgetTrend.observe(budgetMs)
         }
     }
 
     /**
-     * ADMIT gate. Deadline safety alone (UB <= budget) only reacts once the queue is at the cliff, so a heavy head
-     * (e.g. 24MP) can build a backlog the mandatory tail can no longer undo. This additionally holds the queue
-     * stable: while the queue's budget is shrinking shot over shot (trend < 0 = falling behind the shutter rate),
-     * it keeps [BUDGET_RUNWAY_SHOTS] shots of headroom before a shot stops fitting. No device-specific millisecond
-     * threshold: the trigger is derived from the measured budget trend and the learned upper bound.
+     * Capture-available pressure derived from the first ADMIT budget trend. A negative trend is diagnostic pressure:
+     * legacy service-rate pacing should be retained because the observed budget is already falling.
      */
-    private fun admitsUnderFallingBudget(
+    @Synchronized
+    fun predictCaptureAvailableDelayMs(): Long = captureAvailableBudgetTrend.fallingDelayMs(CAPTURE_AVAILABLE_DELAY_SCALE)
+
+    /**
+     * Positive budget recovery can be spent as an advance credit against legacy service-rate delay. Only one EWMA step
+     * of recovery is spent per callback, so a large budget reset cannot immediately collapse the delay to zero.
+     */
+    @Synchronized
+    fun predictCaptureAvailableAdvanceMs(): Long = captureAvailableBudgetTrend.risingAdvanceMs(CAPTURE_AVAILABLE_ADVANCE_SCALE)
+
+    @Synchronized
+    fun hasCaptureAvailableBudgetTrend(): Boolean = captureAvailableBudgetTrend.hasTrend()
+
+    /**
+     * ADMIT gate. Admission is bounded by the learned sequence upper bound only; budget trend is observed separately
+     * and consumed by [predictCaptureAvailableDelayMs] as captureAvailable back-pressure.
+     */
+    private fun admitUnderBudgetPolicy(
+        sequencePredictedMs: Double,
+        sequenceUpperBoundMs: Double,
         budgetMs: Long,
-        predictedMs: Double,
-        upperBoundMs: Double,
     ): Boolean {
-        val slackMs = budgetMs - upperBoundMs
-        if (slackMs < 0.0) {
-            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", predictedMs, upperBoundMs, budgetMs)
-            return false
+        // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
+        if (sequencePredictedMs <= 0.0) {
+            return true
         }
 
-        val fallingBudgetTrendMs = budgetTrend.trendMs?.takeIf { it < 0.0 } ?: return true
-        val requiredRunwayMs = BUDGET_RUNWAY_SHOTS * -fallingBudgetTrendMs
-        if (slackMs < requiredRunwayMs) {
-            CLog.w(TAG, "[mhyun2.park] reject admission by budget runway - slackMs=%f, requiredRunwayMs=%f, budgetMs=%d", slackMs, requiredRunwayMs, budgetMs)
-            return false
+        val slackMs = budgetMs - sequenceUpperBoundMs
+        val rejectedByUpperBound = slackMs < 0.0
+
+        if (rejectedByUpperBound) {
+            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         }
 
-        return true
+        return !rejectedByUpperBound
     }
 
     @Synchronized
@@ -275,7 +272,7 @@ class DraftSequenceExecutionPredictor {
         }
     }
 
-    /** Shot-over-shot budget delta, EWMA-tracked - negative means the queue is falling behind the shutter rate. */
+    /** Budget delta between observations, EWMA-tracked - negative means the queue is falling behind the shutter rate. */
     private class BudgetTrend(private val alpha: Double) {
         private var lastBudgetMs: Long? = null
         var trendMs: Double? = null
@@ -287,6 +284,24 @@ class DraftSequenceExecutionPredictor {
                 trendMs = trendMs?.let { it + alpha * (deltaMs - it) } ?: deltaMs
             }
             lastBudgetMs = budgetMs
+        }
+
+        fun hasTrend(): Boolean = trendMs != null
+
+        fun fallingDelayMs(delayScale: Double): Long {
+            return trendMs
+                ?.takeIf { it < 0.0 }
+                ?.let { -it * delayScale }
+                ?.roundToNonNegativeLong()
+                ?: 0L
+        }
+
+        fun risingAdvanceMs(advanceScale: Double): Long {
+            return trendMs
+                ?.takeIf { it > 0.0 }
+                ?.let { it * advanceScale }
+                ?.roundToNonNegativeLong()
+                ?: 0L
         }
     }
 
@@ -301,11 +316,8 @@ class DraftSequenceExecutionPredictor {
         private const val WORKLOAD_EWMA_ALPHA = 0.30
         private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
-
-        // Budget runway: shots of budget headroom to preserve while the budget trend is falling, before
-        // divergence forces a timeout. A small, device-independent shot count -- not a per-model millisecond
-        // threshold.
-        private const val BUDGET_RUNWAY_SHOTS = 2
+        private const val CAPTURE_AVAILABLE_DELAY_SCALE = 1.0 / (1.0 - WORKLOAD_EWMA_ALPHA)
+        private const val CAPTURE_AVAILABLE_ADVANCE_SCALE = WORKLOAD_EWMA_ALPHA
     }
 }
 
@@ -328,10 +340,6 @@ data class WatchdogTimeoutDecision(
     /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
     val decision: AdmissionDecision?,
 )
-
-/** Workload-type sequence with the size axis erased - the calibration fallback key for cold sequences. */
-private val WorkloadSequenceKey.shape: List<Class<out WorkloadKey>>
-    get() = workloadKeys.map { it.javaClass }
 
 internal data class ScoreSample(
     val score: Double,
