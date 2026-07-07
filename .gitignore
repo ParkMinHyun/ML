@@ -1,2 +1,3 @@
 .codex/
+.agents/
 .claude/settings.local.json
