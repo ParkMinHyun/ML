@@ -18,25 +18,23 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  */
 class DraftSequenceExecutionPredictor {
 
-    private val workloadDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
-    private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
-    private val workloadSequenceShapeScoreMap = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
+    private val durationTrendByWorkload = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
+    private val residualsBySequence = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
+    private val residualsByShape = mutableMapOf<WorkloadSequenceShape, MutableList<ResidualSample>>()
     private var observedSlackMs: Long? = null
-
-    // ---- Admission ----
 
     @Synchronized
     fun predictAdmission(
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        // Memoized per decision: estimateWorkloadDuration scans the sibling models, and the suffix walk in
-        // estimateSequenceUpperBound would otherwise rescan them O(n^2) times per decision.
-        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadDuration)
-        val sequencePredictedMs = estimateSequenceDuration(workloadSequenceKey, workloadPredictedMs)
-        val sequenceUpperBoundMs = estimateSequenceUpperBound(workloadSequenceKey, workloadPredictedMs)
+        // Memoized per decision: estimateWorkloadMs scans sibling models, and estimateUpperBoundMs would otherwise
+        // rescan them O(n^2) through the suffix walk.
+        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
+        val sequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
+        val sequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
-            WorkloadPolicy.ADMIT -> admitUnderBudgetPolicy(
+            WorkloadPolicy.ADMIT -> fitsUpperBoundBudget(
                 sequencePredictedMs,
                 sequenceUpperBoundMs,
                 preExecutionMetrics.budgetMs,
@@ -59,7 +57,7 @@ class DraftSequenceExecutionPredictor {
      * ADMIT gate. Admission is bounded by the learned sequence upper bound only; budget slack is observed separately
      * and consumed by [captureAvailableSlackMs] as captureAvailable pacing.
      */
-    private fun admitUnderBudgetPolicy(
+    private fun fitsUpperBoundBudget(
         sequencePredictedMs: Double,
         sequenceUpperBoundMs: Double,
         budgetMs: Long,
@@ -77,7 +75,114 @@ class DraftSequenceExecutionPredictor {
         return admit
     }
 
-    // ---- Watchdog timeout ----
+    private fun estimateWorkloadMs(workloadKey: WorkloadKey): Double {
+        // Conservative cross-size coupling: every same-type sibling bucket informs this workload. A smaller sibling
+        // scales UP by the megapixel ratio (a well-sampled MP12 x2 bounds an under-sampled MP24); a larger sibling is
+        // used as-is, never scaled down (a heavy MP24 bounds MP12 at its full value, not halved) - the ratio floors at
+        // 1.0. max() over siblings only raises the estimate; the ratio-1.0 sibling is the workload's own model.
+        // Predict-time only: the scaled value is never fed back into any model, so buckets never learn from each other.
+        return durationTrendByWorkload.entries
+            .filter { it.key.javaClass == workloadKey.javaClass }
+            .maxOfOrNull { (siblingKey, model) ->
+                model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
+            }
+            ?: 0.0
+    }
+
+    private fun estimateUpperBoundMs(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
+        // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
+        // head EWMA plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1, the
+        // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
+        val workloadKeys = workloadSequenceKey.workloadKeys
+        var corrected = 0.0
+        for (index in workloadKeys.indices.reversed()) {
+            val suffixRawUpperBoundMs = estimateRawUpperBoundMs(
+                WorkloadSequenceKey(workloadKeys.drop(index)),
+                workloadPredictedMs,
+            )
+            corrected = maxOf(suffixRawUpperBoundMs, workloadPredictedMs.getValue(workloadKeys[index]) + corrected)
+        }
+        return corrected
+    }
+
+    private fun estimateRawUpperBoundMs(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
+        val predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
+        if (predictedMs <= 0.0) {
+            return 0.0
+        }
+
+        return predictedMs * exp(residualScoreFor(workloadSequenceKey))
+    }
+
+    private fun sumPredictedMs(
+        workloadSequenceKey: WorkloadSequenceKey,
+        workloadPredictedMs: Map<WorkloadKey, Double>,
+    ): Double {
+        return workloadSequenceKey.workloadKeys.sumOf { workloadPredictedMs.getValue(it) }
+    }
+
+    private fun residualScoreFor(workloadSequenceKey: WorkloadSequenceKey): Double {
+        return selectResidualScore(
+            sequenceSamples = residualsBySequence[workloadSequenceKey].orEmpty(),
+            compatibleSamples = residualsByShape[workloadSequenceKey.shape].orEmpty(),
+        )
+    }
+
+    private fun selectResidualScore(
+        sequenceSamples: List<ResidualSample>,
+        compatibleSamples: List<ResidualSample>,
+    ): Double {
+        // Exact sequence residuals win; otherwise borrow only the same workload-type sequence shape.
+        return if (sequenceSamples.isNotEmpty()) {
+            weightedQuantileScore(sequenceSamples)
+        } else {
+            weightedQuantileScore(compatibleSamples)
+        }
+    }
+
+    private fun weightedQuantileScore(samples: List<ResidualSample>): Double {
+        val weightedSamples = samples.filter { it.weight > 0.0 }
+        if (weightedSamples.isEmpty()) {
+            return 0.0
+        }
+
+        val totalWeight = weightedSamples.sumOf { it.weight }
+        val targetWeight = totalWeight * quantileForSampleSize(
+            effectiveSampleSize(weightedSamples.map { it.weight }),
+        )
+        var cumulativeWeight = 0.0
+        for (sample in weightedSamples.sortedBy { it.score }) {
+            cumulativeWeight += sample.weight
+            if (cumulativeWeight >= targetWeight) {
+                return sample.score
+            }
+        }
+
+        return weightedSamples.maxOf { it.score }
+    }
+
+    private fun quantileForSampleSize(sampleSize: Double): Double {
+        if (sampleSize <= 0.0) {
+            return 0.0
+        }
+        return 1.0 - 1.0 / (sampleSize + 1.0)
+    }
+
+    private fun effectiveSampleSize(weights: List<Double>): Double {
+        val sumW = weights.sum()
+        val sumW2 = weights.sumOf { it * it }
+        if (sumW <= 0.0 || sumW2 <= 0.0) {
+            return 0.0
+        }
+
+        return (sumW * sumW) / sumW2
+    }
 
     /**
      * Watchdog budget for the ADMIT workload at the head of [workloadSequenceKey]: the time left after reserving
@@ -90,20 +195,108 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val tailKeys = mandatoryTailKeys(workloadSequenceKey)
+        val tailKeys = reserveTailKeys(workloadSequenceKey)
         if (tailKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
         // The tail is RESERVE-only, so this internal decision's admit bit is unused.
         val decision = predictAdmission(WorkloadSequenceKey(tailKeys), preExecutionMetrics)
-        val timeoutMs = (preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs)
-            .roundToNonNegativeLong()
+        val remainingBudgetMs = preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs
+        val timeoutMs = when {
+            remainingBudgetMs.isNaN() || remainingBudgetMs <= 0.0 -> 0L
+            remainingBudgetMs >= Long.MAX_VALUE.toDouble() -> Long.MAX_VALUE
+            else -> remainingBudgetMs.roundToLong().coerceAtLeast(0L)
+        }
 
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    // ---- CaptureAvailable pacing ----
+    /** RESERVE workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
+    private fun reserveTailKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+        return workloadSequenceKey.workloadKeys
+            .drop(1)
+            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVE }
+    }
+
+    @Synchronized
+    fun learnFromCapture(
+        workloadDurations: Map<WorkloadKey, Long>,
+        admissionDecisions: Collection<AdmissionDecision>,
+    ) {
+        val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
+
+        addResidualSamples(validWorkloadDurations, admissionDecisions)
+
+        validWorkloadDurations.forEach { (workloadKey, durationMs) ->
+            durationTrendByWorkload.getOrPut(workloadKey) { WorkloadDurationTrend() }
+                .observeDurationMs(durationMs.toDouble())
+        }
+    }
+
+    private fun addResidualSamples(
+        workloadDurations: Map<WorkloadKey, Long>,
+        admissionDecisions: Collection<AdmissionDecision>,
+    ) {
+        val samples = admissionDecisions.mapNotNull { decision ->
+            val actualMs = clampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
+            val score = logResidualScore(
+                predictedMs = decision.executionPrediction.sequencePredictedDurationMs,
+                actualMs = actualMs,
+            ) ?: return@mapNotNull null
+            decision.workloadSequenceKey to ResidualSample(score = score)
+        }
+
+        if (samples.isEmpty()) {
+            return
+        }
+
+        decayResidualWeights()
+        samples.forEach { (workloadSequenceKey, sample) ->
+            residualsBySequence.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
+            residualsByShape.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
+        }
+    }
+
+    /**
+     * Containment-scoped actual: each workload contributes max(its decision-time prediction, its actual), so a
+     * single workload's overrun is reflected at the sequence's scale even when another workload happened to run
+     * fast that capture. Returns null if any workload in the sequence did not run (incomplete sequence cannot be
+     * scored).
+     */
+    private fun clampedActualMs(
+        decision: AdmissionDecision,
+        workloadDurations: Map<WorkloadKey, Long>,
+    ): Double? {
+        var total = 0.0
+        for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
+            val actualMs = workloadDurations[workloadKey] ?: return null
+            val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
+            total += maxOf(predictedMs, actualMs.toDouble())
+        }
+        return total.takeIf { it > 0.0 }
+    }
+
+    private fun logResidualScore(predictedMs: Double, actualMs: Double): Double? {
+        if (predictedMs <= 0.0 || actualMs <= 0.0) {
+            return null
+        }
+        return maxOf(0.0, ln(actualMs / predictedMs))
+    }
+
+    private fun decayResidualWeights() {
+        residualsBySequence.values.forEach { it.decayAndPrune() }
+        residualsByShape.values.forEach { it.decayAndPrune() }
+    }
+
+    private fun MutableList<ResidualSample>.decayAndPrune() {
+        for (index in indices) {
+            this[index] = this[index].decayed(SCORE_WEIGHT_DECAY)
+        }
+        // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
+        // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
+        removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
+    }
 
     /**
      * Caches captureAvailable pacing slack from the draft sequence's first leading-node budget: the headroom left
@@ -120,11 +313,11 @@ class DraftSequenceExecutionPredictor {
             return
         }
 
-        val tailKeys = mandatoryTailKeys(workloadSequenceKey)
+        val tailKeys = reserveTailKeys(workloadSequenceKey)
         val reserveUpperBoundMs = if (tailKeys.isEmpty()) {
             0.0
         } else {
-            estimateSequenceUpperBound(WorkloadSequenceKey(tailKeys), tailKeys.associateWith(::estimateWorkloadDuration))
+            estimateUpperBoundMs(WorkloadSequenceKey(tailKeys), tailKeys.associateWith(::estimateWorkloadMs))
         }
         observedSlackMs = (budgetMs - reserveUpperBoundMs).roundToLong()
     }
@@ -139,141 +332,6 @@ class DraftSequenceExecutionPredictor {
     @Synchronized
     fun captureAvailableSlackMs(): Long? = observedSlackMs
 
-    // ---- Capture-end learning ----
-
-    @Synchronized
-    fun updateCapture(
-        workloadDurations: Map<WorkloadKey, Long>,
-        admissionDecisions: Collection<AdmissionDecision>,
-    ) {
-        val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
-
-        addScoreSamples(validWorkloadDurations, admissionDecisions)
-
-        validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            workloadDurationTrendMap.getOrPut(workloadKey) { WorkloadDurationTrend() }.update(durationMs.toDouble())
-        }
-    }
-
-    private fun addScoreSamples(
-        workloadDurations: Map<WorkloadKey, Long>,
-        admissionDecisions: Collection<AdmissionDecision>,
-    ) {
-        val samples = admissionDecisions.mapNotNull { decision ->
-            val clampedActualMs = clampedSequenceActualDuration(decision, workloadDurations) ?: return@mapNotNull null
-            val score = score(decision.executionPrediction.sequencePredictedDurationMs, clampedActualMs) ?: return@mapNotNull null
-            decision.workloadSequenceKey to ScoreSample(score = score)
-        }
-
-        if (samples.isEmpty()) {
-            return
-        }
-
-        decayScoreSamples()
-        samples.forEach { (workloadSequenceKey, sample) ->
-            workloadSequenceKeyScoreMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
-            workloadSequenceShapeScoreMap.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
-        }
-    }
-
-    private fun decayScoreSamples() {
-        workloadSequenceKeyScoreMap.values.forEach { it.decayWeights() }
-        workloadSequenceShapeScoreMap.values.forEach { it.decayWeights() }
-    }
-
-    private fun MutableList<ScoreSample>.decayWeights() {
-        for (index in indices) {
-            this[index] = this[index].decayed(SCORE_WEIGHT_DECAY)
-        }
-        // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
-        // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
-        removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
-    }
-
-    // ---- Shared prediction helpers ----
-
-    /** RESERVE workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
-    private fun mandatoryTailKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
-        return workloadSequenceKey.workloadKeys
-            .drop(1)
-            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVE }
-    }
-
-    private fun estimateSequenceUpperBound(
-        workloadSequenceKey: WorkloadSequenceKey,
-        workloadPredictedMs: Map<WorkloadKey, Double>,
-    ): Double {
-        // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
-        // head EWMA plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1, the
-        // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
-        val workloadKeys = workloadSequenceKey.workloadKeys
-        var corrected = 0.0
-        for (index in workloadKeys.indices.reversed()) {
-            val suffixRawUpperBound = estimateRawUpperBound(WorkloadSequenceKey(workloadKeys.drop(index)), workloadPredictedMs)
-            corrected = maxOf(suffixRawUpperBound, workloadPredictedMs.getValue(workloadKeys[index]) + corrected)
-        }
-        return corrected
-    }
-
-    private fun estimateRawUpperBound(
-        workloadSequenceKey: WorkloadSequenceKey,
-        workloadPredictedMs: Map<WorkloadKey, Double>,
-    ): Double {
-        val predictedMs = estimateSequenceDuration(workloadSequenceKey, workloadPredictedMs)
-        if (predictedMs <= 0.0) {
-            return 0.0
-        }
-
-        return predictedMs * exp(calibratedSequenceScore(workloadSequenceKey))
-    }
-
-    private fun estimateSequenceDuration(
-        workloadSequenceKey: WorkloadSequenceKey,
-        workloadPredictedMs: Map<WorkloadKey, Double>,
-    ): Double {
-        return workloadSequenceKey.workloadKeys.sumOf { workloadPredictedMs.getValue(it) }
-    }
-
-    private fun estimateWorkloadDuration(workloadKey: WorkloadKey): Double {
-        // Conservative cross-size coupling: every same-type sibling bucket informs this workload. A smaller sibling
-        // scales UP by the megapixel ratio (a well-sampled MP12 x2 bounds an under-sampled MP24); a larger sibling is
-        // used as-is, never scaled down (a heavy MP24 bounds MP12 at its full value, not halved) - the ratio floors at
-        // 1.0. max() over siblings only raises the estimate; the ratio-1.0 sibling is the workload's own model.
-        // Predict-time only: the scaled value is never fed back into any model, so buckets never learn from each other.
-        return workloadDurationTrendMap.entries
-            .filter { it.key.javaClass == workloadKey.javaClass }
-            .maxOfOrNull { (siblingKey, model) ->
-                model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
-            }
-            ?: 0.0
-    }
-
-    private fun calibratedSequenceScore(workloadSequenceKey: WorkloadSequenceKey): Double {
-        return calibratedScore(
-            sequenceSamples = workloadSequenceKeyScoreMap[workloadSequenceKey].orEmpty(),
-            compatibleSamples = workloadSequenceShapeScoreMap[workloadSequenceKey.shape].orEmpty(),
-        )
-    }
-
-    /**
-     * Containment-scoped actual: each workload contributes max(its decision-time prediction, its actual), so a
-     * single workload's overrun is reflected at the sequence's scale even when another workload happened to run
-     * fast that capture. Returns null if any workload in the sequence did not run (incomplete sequence cannot be
-     * scored).
-     */
-    private fun clampedSequenceActualDuration(
-        decision: AdmissionDecision,
-        workloadDurations: Map<WorkloadKey, Long>,
-    ): Double? {
-        var total = 0.0
-        for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
-            val actualMs = workloadDurations[workloadKey] ?: return null
-            val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
-            total += maxOf(predictedMs, actualMs.toDouble())
-        }
-        return total.takeIf { it > 0.0 }
-    }
-
     /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
     private class WorkloadDurationTrend {
         private var sampleCount: Int = 0
@@ -281,7 +339,7 @@ class DraftSequenceExecutionPredictor {
 
         fun predictionMs(): Double = levelMs ?: 0.0
 
-        fun update(actualMs: Double) {
+        fun observeDurationMs(actualMs: Double) {
             if (actualMs <= 0.0) {
                 return
             }
@@ -295,6 +353,13 @@ class DraftSequenceExecutionPredictor {
                 currentLevelMs + effectiveAlpha * (actualMs - currentLevelMs)
             }
         }
+    }
+
+    private data class ResidualSample(
+        val score: Double,
+        val weight: Double = 1.0,
+    ) {
+        fun decayed(factor: Double): ResidualSample = copy(weight = weight * factor)
     }
 
     companion object {
@@ -311,70 +376,9 @@ class DraftSequenceExecutionPredictor {
     }
 }
 
-internal fun score(predictedMs: Double, actualMs: Double): Double? {
-    if (predictedMs <= 0.0 || actualMs <= 0.0) {
-        return null
-    }
-    return maxOf(0.0, ln(actualMs / predictedMs))
-}
-
-internal fun effectiveSampleSize(weights: List<Double>): Double {
-    val sumW = weights.sum()
-    val sumW2 = weights.sumOf { it * it }
-    if (sumW <= 0.0 || sumW2 <= 0.0) {
-        return 0.0
-    }
-
-    return (sumW * sumW) / sumW2
-}
-
-internal fun adaptiveQuantile(effectiveSampleSize: Double): Double {
-    if (effectiveSampleSize <= 0.0) {
-        return 0.0
-    }
-    return 1.0 - 1.0 / (effectiveSampleSize + 1.0)
-}
-
-internal fun quantileScore(samples: List<ScoreSample>): Double {
-    val weightedSamples = samples.filter { it.weight > 0.0 }
-    if (weightedSamples.isEmpty()) {
-        return 0.0
-    }
-
-    val totalWeight = weightedSamples.sumOf { it.weight }
-    val targetWeight = totalWeight * adaptiveQuantile(effectiveSampleSize(weightedSamples.map { it.weight }))
-    var cumulativeWeight = 0.0
-    for (sample in weightedSamples.sortedBy { it.score }) {
-        cumulativeWeight += sample.weight
-        if (cumulativeWeight >= targetWeight) {
-            return sample.score
-        }
-    }
-
-    return weightedSamples.maxOf { it.score }
-}
-
-internal fun calibratedScore(
-    sequenceSamples: List<ScoreSample>,
-    compatibleSamples: List<ScoreSample>,
-): Double {
-    // Exact sequence residuals win; otherwise borrow only the same workload-type sequence shape.
-    return if (sequenceSamples.isNotEmpty()) {
-        quantileScore(sequenceSamples)
-    } else {
-        quantileScore(compatibleSamples)
-    }
-}
-
-private fun Double.roundToNonNegativeLong(): Long = when {
-    isNaN() || this <= 0.0 -> 0L
-    this >= Long.MAX_VALUE.toDouble() -> Long.MAX_VALUE
-    else -> roundToLong().coerceAtLeast(0L)
-}
-
 /**
  * One admission decision. [executionPrediction] is the persisted decision record (replay-ready); the remaining
- * fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.updateCapture] consumes once
+ * fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.learnFromCapture] consumes once
  * at capture end. They stay outside [ExecutionPrediction] on purpose: a typed key and a per-workload map do not
  * belong in the metrics store.
  */
@@ -391,10 +395,3 @@ data class WatchdogTimeoutDecision(
     /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
     val decision: AdmissionDecision?,
 )
-
-internal data class ScoreSample(
-    val score: Double,
-    val weight: Double = 1.0,
-) {
-    fun decayed(factor: Double): ScoreSample = copy(weight = weight * factor)
-}

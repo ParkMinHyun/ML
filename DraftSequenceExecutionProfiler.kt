@@ -139,13 +139,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    /** Completes the RESERVE workload, updates Predictor's UB, and records whether this capture timed out. */
+    /** Completes the RESERVE workload, lets Predictor learn from the capture, and records whether it timed out. */
     fun completeDraftSequenceExecution(): Boolean {
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
 
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
-            predictor.updateCapture(workloadDurations, admissionDecisions)
+            predictor.learnFromCapture(workloadDurations, admissionDecisions)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
