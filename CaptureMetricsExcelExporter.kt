@@ -59,6 +59,8 @@ class CaptureMetricsExcelExporter(
 
             writeSheet(workbook, styles, "DecisionQuality", buildDecisionQualitySummaries(enrichedNormalCaptures), buildDecisionQualityColumns())
             writeSheet(workbook, styles, "PolicyOutcome", buildPolicyOutcomeSummaries(enrichedNormalCaptures), buildPolicyOutcomeColumns())
+            writeSheet(workbook, styles, "ReviewMetrics", buildReviewMetricSummaries(enrichedNormalCaptures), buildReviewMetricColumns())
+            writeSheet(workbook, styles, "SimulationScenarios", buildSimulationScenarioSummaries(enrichedNormalCaptures), buildSimulationScenarioColumns())
             writeSheet(workbook, styles, "MetricNotes", buildMetricNotes(), buildMetricNoteColumns())
 
             // Write main sheet
@@ -138,21 +140,13 @@ class CaptureMetricsExcelExporter(
         captures: List<EnrichedCaptureRow>,
         sheetNamePrefix: String,
     ) {
-        val nodeRowsByNodeName = buildNodeSheetRows(captures.map { it.row })
+        val nodeRowsByNodeName = nodeSheetRows(captures.map { it.row })
             .groupBy { it.nodeRow.node.nodeName }
 
         nodeRowsByNodeName.toSortedMap().forEach { (nodeName, rows) ->
             val sheetName = uniqueSheetName(workbook, "$sheetNamePrefix$nodeName")
             val nodeColumns = buildNodeColumns()
             writeSheet(workbook, styles, sheetName, rows, nodeColumns)
-        }
-    }
-
-    private fun buildNodeSheetRows(captures: List<CaptureRow>): List<NodeSheetRow> {
-        return captures.flatMap { capture ->
-            capture.nodeRows.mapIndexed { index, nodeRow ->
-                NodeSheetRow(capture, index + 1, nodeRow)
-            }
         }
     }
 
@@ -168,6 +162,18 @@ class CaptureMetricsExcelExporter(
     private fun buildPolicyOutcomeSummaries(captures: List<EnrichedCaptureRow>): List<PolicyOutcomeSummary> {
         return captureGroups(captures.map { it.row }).map { group ->
             PolicyOutcomeSummary.from(group.name, group.captures)
+        }
+    }
+
+    private fun buildReviewMetricSummaries(captures: List<EnrichedCaptureRow>): List<ReviewMetricSummary> {
+        return captureGroups(captures.map { it.row }).flatMap { group ->
+            ReviewMetricSummary.from(group.name, group.captures)
+        }
+    }
+
+    private fun buildSimulationScenarioSummaries(captures: List<EnrichedCaptureRow>): List<SimulationScenarioSummary> {
+        return captureGroups(captures.map { it.row }).flatMap { group ->
+            SimulationScenarioSummary.from(group.name, group.captures)
         }
     }
 
@@ -201,6 +207,14 @@ class CaptureMetricsExcelExporter(
         MetricNote(
             metric = "PolicyOutcome",
             note = "Sequential outcomes are mutually exclusive per capture and are the right place to discuss Filter preservation and observed Filter loss after Bokeh admit.",
+        ),
+        MetricNote(
+            metric = "ReviewMetrics",
+            note = "Professor/SEIP-facing one-page metrics: timeout/watchdog rate, Filter preservation, Bokeh execution, full-feature success, selective Bokeh skip, and decision-quality metrics.",
+        ),
+        MetricNote(
+            metric = "SimulationScenarios",
+            note = "Current Model rows are observed online. Always Run and Always Skip Bokeh rows are upper-bound/proxy simulations from recorded predictions; actual timeout/watchdog and unnecessary-skip counts require offline replay or shadow execution.",
         ),
         MetricNote(
             metric = "Pacing simulation",
@@ -327,6 +341,40 @@ class CaptureMetricsExcelExporter(
         val isFilterPreserved: Boolean
             get() = filterDecisionRow?.wasAdmitted == true
 
+        val isBokehExecuted: Boolean
+            get() = bokehDecisionRow?.wasAdmitted == true
+
+        val isFullFeatureSuccess: Boolean
+            get() = policyOutcome() == PolicyOutcome.FULL_FEATURE_SUCCESS
+
+        val isSelectiveBokehSkipSuccess: Boolean
+            get() = policyOutcome() == PolicyOutcome.SELECTIVE_BOKEH_SKIP_SUCCESS
+
+        val isBothSkipped: Boolean
+            get() = bokehDecisionRow?.wasSkipped == true && filterDecisionRow?.wasSkipped == true
+
+        val bokehPredictedBudgetOverrun: Boolean?
+            get() = predictedBudgetOverrun(bokehDecisionRow)
+
+        val bokehObservedBudgetOverrun: Boolean?
+            get() = observedBudgetOverrun(bokehDecisionRow)
+
+        val filterPredictedBudgetOverrun: Boolean?
+            get() = predictedBudgetOverrun(filterDecisionRow)
+
+        val filterObservedBudgetOverrun: Boolean?
+            get() = observedBudgetOverrun(filterDecisionRow)
+
+        /** "Always run everything" proxy risk: any admission decision's recorded UB above its budget. */
+        val alwaysRunBudgetRiskByUpperBound: Boolean?
+            get() {
+                val decisionRows = listOfNotNull(bokehDecisionRow, filterDecisionRow)
+                if (decisionRows.isEmpty()) {
+                    return null
+                }
+                return decisionRows.any { predictedBudgetOverrun(it) == true }
+            }
+
         fun firstNodeLowMemoryLabel(): String {
             val isLowMemory = nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
                 ?: return "Memory Not Recorded"
@@ -356,6 +404,22 @@ class CaptureMetricsExcelExporter(
                 bokehSkipped && filterSkipped -> PolicyOutcome.TAIL_ONLY_SAFE
                 else -> PolicyOutcome.OTHER
             }
+        }
+
+        private fun predictedBudgetOverrun(decisionRow: NodeRow?): Boolean? {
+            val row = decisionRow ?: return null
+            val prediction = row.prediction ?: return null
+            return prediction.sequencePredictedUpperBoundMs > row.node.preExecutionMetrics.budgetMs
+        }
+
+        /** Delegates to [NodeSheetRow.observedActualFeasible] so Capture and node sheets can never disagree. */
+        private fun observedBudgetOverrun(decisionRow: NodeRow?): Boolean? {
+            val row = decisionRow ?: return null
+            val decisionIndex = nodeRows.indexOf(row)
+            if (decisionIndex < 0) {
+                return null
+            }
+            return NodeSheetRow(this, decisionIndex + 1, row).observedActualFeasible()?.let { feasible -> !feasible }
         }
     }
 
@@ -532,13 +596,7 @@ class CaptureMetricsExcelExporter(
     ) {
         companion object {
             fun from(group: String, decision: String, captures: List<CaptureRow>): DecisionQualitySummary {
-                val decisionRows = captures.flatMap { capture ->
-                    capture.nodeRows.mapIndexed { index, nodeRow ->
-                        NodeSheetRow(capture, index + 1, nodeRow)
-                    }
-                }.filter {
-                    it.admissionStage() == decision
-                }
+                val decisionRows = decisionRows(captures, decision)
 
                 val correctAdmitCount = decisionRows.count {
                     it.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT
@@ -665,6 +723,294 @@ class CaptureMetricsExcelExporter(
         }
     }
 
+    private class ReviewMetricSummary(
+        val group: String,
+        val category: String,
+        val metric: String,
+        val numerator: Int?,
+        val denominator: Int?,
+        val rate: Double?,
+        val evidenceLevel: String,
+        val note: String,
+    ) {
+        companion object {
+            fun from(group: String, captures: List<CaptureRow>): List<ReviewMetricSummary> {
+                val total = captures.size
+                val bokehSkipCount = captures.count { it.bokehDecisionRow?.wasSkipped == true }
+                val bokehDecisionRows = decisionRows(captures, ADMISSION_STAGE_BOKEH)
+                val filterDecisionRows = decisionRows(captures, ADMISSION_STAGE_FILTER)
+
+                return listOf(
+                    reviewMetric(
+                        group = group,
+                        category = "Product outcome",
+                        metric = "timeout/watchdog 발생률",
+                        numerator = captures.count { it.hasTimeoutOrWatchdogFailure },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Timeout 또는 watchdog 중 하나라도 발생한 capture 비율.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Product outcome",
+                        metric = "Filter 보존율",
+                        numerator = captures.count { it.isFilterPreserved },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Filter admission이 보존된 capture 비율.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Product outcome",
+                        metric = "Bokeh 실행률",
+                        numerator = captures.count { it.isBokehExecuted },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Bokeh admission이 실행된 capture 비율.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Product outcome",
+                        metric = "full feature 성공률",
+                        numerator = captures.count { it.isFullFeatureSuccess },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Bokeh와 Filter가 모두 완료된 capture 비율.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Selective degrade",
+                        metric = "Bokeh skip + Filter 보존",
+                        numerator = captures.count { it.isSelectiveBokehSkipSuccess },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Bokeh만 선택적으로 skip하고 Filter는 완료된 capture.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Selective degrade",
+                        metric = "둘 다 skip",
+                        numerator = captures.count { it.isBothSkipped },
+                        denominator = total,
+                        evidenceLevel = "Observed online",
+                        note = "Bokeh와 Filter가 모두 skip된 capture.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Bokeh skip validation",
+                        metric = "Bokeh skip",
+                        numerator = bokehSkipCount,
+                        denominator = total,
+                        evidenceLevel = "Observed decision",
+                        note = "현재 모델이 Bokeh를 skip한 건수.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Bokeh skip validation",
+                        metric = "Bokeh skip 중 budget 초과 예상",
+                        numerator = captures.count {
+                            it.bokehDecisionRow?.wasSkipped == true && it.bokehPredictedBudgetOverrun == true
+                        },
+                        denominator = bokehSkipCount,
+                        evidenceLevel = "Predicted upper bound",
+                        note = "Bokeh skip row에서 predicted upper bound가 budget보다 큰 건수.",
+                    ),
+                    ReviewMetricSummary(
+                        group = group,
+                        category = "Bokeh skip validation",
+                        metric = "불필요한 Bokeh skip",
+                        numerator = null,
+                        denominator = bokehSkipCount,
+                        rate = null,
+                        evidenceLevel = "Offline oracle required",
+                        note = "Bokeh를 실행했어도 budget 안에 들어왔을 skip 건수. offline replay/shadow 실행으로만 확정 가능.",
+                    ),
+                    reviewMetric(
+                        group = group,
+                        category = "Bokeh skip validation",
+                        metric = "Bokeh skip 후 Filter 보존",
+                        numerator = captures.count {
+                            it.bokehDecisionRow?.wasSkipped == true && it.filterDecisionRow?.wasCompleted == true
+                        },
+                        denominator = bokehSkipCount,
+                        evidenceLevel = "Observed outcome",
+                        note = "Bokeh skip capture 중 Filter가 완료된 건수. '덕분에' 보존됐는지는 baseline/offline 비교 필요.",
+                    ),
+                    admitMetric(
+                        group = group,
+                        decision = ADMISSION_STAGE_BOKEH,
+                        metric = "Bokeh admit success",
+                        decisionRows = bokehDecisionRows,
+                    ),
+                    ubMetric(
+                        group = group,
+                        decision = ADMISSION_STAGE_BOKEH,
+                        metric = "Bokeh UB miss",
+                        decisionRows = bokehDecisionRows,
+                    ),
+                    admitMetric(
+                        group = group,
+                        decision = ADMISSION_STAGE_FILTER,
+                        metric = "Filter admit success",
+                        decisionRows = filterDecisionRows,
+                    ),
+                    ubMetric(
+                        group = group,
+                        decision = ADMISSION_STAGE_FILTER,
+                        metric = "Filter UB miss",
+                        decisionRows = filterDecisionRows,
+                    ),
+                )
+            }
+
+            private fun admitMetric(
+                group: String,
+                decision: String,
+                metric: String,
+                decisionRows: List<NodeSheetRow>,
+            ): ReviewMetricSummary {
+                val correctAdmitCount = decisionRows.count {
+                    it.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT
+                }
+                val unsafeAdmitCount = decisionRows.count {
+                    it.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT
+                }
+                val observedAdmitCount = correctAdmitCount + unsafeAdmitCount
+                return reviewMetric(
+                    group = group,
+                    category = "Decision quality",
+                    metric = metric,
+                    numerator = correctAdmitCount,
+                    denominator = observedAdmitCount,
+                    evidenceLevel = "Observed admitted suffix",
+                    note = "$decision admit 결정이 실제 budget 안에 들어온 비율.",
+                )
+            }
+
+            private fun ubMetric(
+                group: String,
+                decision: String,
+                metric: String,
+                decisionRows: List<NodeSheetRow>,
+            ): ReviewMetricSummary {
+                val evaluatedCount = decisionRows.count { it.sequenceUpperBoundMiss() != null }
+                val missCount = decisionRows.count { it.sequenceUpperBoundMiss() == true }
+                return reviewMetric(
+                    group = group,
+                    category = "Decision quality",
+                    metric = metric,
+                    numerator = missCount,
+                    denominator = evaluatedCount,
+                    evidenceLevel = "Observed admitted suffix",
+                    note = "$decision predicted upper bound보다 실제 suffix 시간이 길었던 비율.",
+                )
+            }
+
+            private fun reviewMetric(
+                group: String,
+                category: String,
+                metric: String,
+                numerator: Int,
+                denominator: Int,
+                evidenceLevel: String,
+                note: String,
+            ): ReviewMetricSummary {
+                return ReviewMetricSummary(
+                    group = group,
+                    category = category,
+                    metric = metric,
+                    numerator = numerator,
+                    denominator = denominator,
+                    rate = rate(numerator, denominator),
+                    evidenceLevel = evidenceLevel,
+                    note = note,
+                )
+            }
+        }
+    }
+
+    private class SimulationScenarioSummary(
+        val group: String,
+        val scenario: String,
+        val method: String,
+        val captureCount: Int,
+        val timeoutWatchdogRiskCount: Int?,
+        val timeoutWatchdogRiskEvaluatedCount: Int?,
+        val timeoutWatchdogRiskRate: Double?,
+        val filterPreservedCount: Int?,
+        val filterPreservationRate: Double?,
+        val bokehExecutedCount: Int?,
+        val bokehExecutionRate: Double?,
+        val fullFeatureSuccessCount: Int?,
+        val fullFeatureSuccessRate: Double?,
+        val offlineOracleRequired: Boolean,
+        val note: String,
+    ) {
+        companion object {
+            fun from(group: String, captures: List<CaptureRow>): List<SimulationScenarioSummary> {
+                val total = captures.size
+                val alwaysRunRiskKnownCount = captures.count { it.alwaysRunBudgetRiskByUpperBound != null }
+                val alwaysRunRiskCount = captures.count { it.alwaysRunBudgetRiskByUpperBound == true }
+                val alwaysSkipRiskKnownCount = captures.count { it.filterPredictedBudgetOverrun != null }
+                val alwaysSkipRiskCount = captures.count { it.filterPredictedBudgetOverrun == true }
+
+                return listOf(
+                    SimulationScenarioSummary(
+                        group = group,
+                        scenario = "Current Model",
+                        method = "Observed online",
+                        captureCount = total,
+                        timeoutWatchdogRiskCount = captures.count { it.hasTimeoutOrWatchdogFailure },
+                        timeoutWatchdogRiskEvaluatedCount = total,
+                        timeoutWatchdogRiskRate = rate(captures.count { it.hasTimeoutOrWatchdogFailure }, total),
+                        filterPreservedCount = captures.count { it.isFilterPreserved },
+                        filterPreservationRate = rate(captures.count { it.isFilterPreserved }, total),
+                        bokehExecutedCount = captures.count { it.isBokehExecuted },
+                        bokehExecutionRate = rate(captures.count { it.isBokehExecuted }, total),
+                        fullFeatureSuccessCount = captures.count { it.isFullFeatureSuccess },
+                        fullFeatureSuccessRate = rate(captures.count { it.isFullFeatureSuccess }, total),
+                        offlineOracleRequired = false,
+                        note = "현재 정책의 실제 online 결과.",
+                    ),
+                    SimulationScenarioSummary(
+                        group = group,
+                        scenario = "Always Run Bokeh + Filter",
+                        method = "Predicted UB simulation",
+                        captureCount = total,
+                        timeoutWatchdogRiskCount = alwaysRunRiskCount,
+                        timeoutWatchdogRiskEvaluatedCount = alwaysRunRiskKnownCount,
+                        timeoutWatchdogRiskRate = rate(alwaysRunRiskCount, alwaysRunRiskKnownCount),
+                        filterPreservedCount = captures.count { it.filterDecisionRow != null },
+                        filterPreservationRate = rate(captures.count { it.filterDecisionRow != null }, total),
+                        bokehExecutedCount = captures.count { it.bokehDecisionRow != null },
+                        bokehExecutionRate = rate(captures.count { it.bokehDecisionRow != null }, total),
+                        fullFeatureSuccessCount = captures.count { it.alwaysRunBudgetRiskByUpperBound == false },
+                        fullFeatureSuccessRate = rate(captures.count { it.alwaysRunBudgetRiskByUpperBound == false }, total),
+                        offlineOracleRequired = true,
+                        note = "Bokeh/Filter를 항상 실행한다고 가정하고 recorded predicted upper bound > budget을 risk로 세는 proxy. 실제 timeout/watchdog는 offline replay 필요.",
+                    ),
+                    SimulationScenarioSummary(
+                        group = group,
+                        scenario = "Always Skip Bokeh",
+                        method = "Filter-decision proxy",
+                        captureCount = total,
+                        timeoutWatchdogRiskCount = alwaysSkipRiskCount,
+                        timeoutWatchdogRiskEvaluatedCount = alwaysSkipRiskKnownCount,
+                        timeoutWatchdogRiskRate = rate(alwaysSkipRiskCount, alwaysSkipRiskKnownCount),
+                        filterPreservedCount = captures.count { it.filterDecisionRow?.wasAdmitted == true },
+                        filterPreservationRate = rate(captures.count { it.filterDecisionRow?.wasAdmitted == true }, total),
+                        bokehExecutedCount = 0,
+                        bokehExecutionRate = rate(0, total),
+                        fullFeatureSuccessCount = 0,
+                        fullFeatureSuccessRate = rate(0, total),
+                        offlineOracleRequired = true,
+                        note = "Bokeh를 항상 포기하고 Filter decision만 본 proxy. Bokeh skip으로 생기는 추가 runway까지 반영하려면 offline replay/shadow 실행 필요.",
+                    ),
+                )
+            }
+        }
+    }
+
     private class MetricNote(
         val metric: String,
         val note: String,
@@ -731,6 +1077,18 @@ class CaptureMetricsExcelExporter(
             return numerator.toDouble() / denominator.toDouble()
         }
 
+        private fun nodeSheetRows(captures: List<CaptureRow>): List<NodeSheetRow> {
+            return captures.flatMap { capture ->
+                capture.nodeRows.mapIndexed { index, nodeRow ->
+                    NodeSheetRow(capture, index + 1, nodeRow)
+                }
+            }
+        }
+
+        private fun decisionRows(captures: List<CaptureRow>, decision: String): List<NodeSheetRow> {
+            return nodeSheetRows(captures).filter { it.admissionStage() == decision }
+        }
+
         private fun buildCaptureColumns(): List<Column<EnrichedCaptureRow>> = listOf(
             Column("captureIndex") { it.row.captureIndex },
             Column("ppSequenceId") { it.row.metrics.ppSequenceId },
@@ -764,6 +1122,10 @@ class CaptureMetricsExcelExporter(
             Column("filterCompleted") { it.row.filterDecisionRow?.wasCompleted },
             Column("filterPreserved") { it.row.isFilterPreserved },
             Column("sequentialPolicyOutcome") { it.row.policyOutcome().label },
+            Column("bokehPredictedBudgetOverrun") { it.row.bokehPredictedBudgetOverrun },
+            Column("bokehObservedBudgetOverrun") { it.row.bokehObservedBudgetOverrun },
+            Column("filterPredictedBudgetOverrun") { it.row.filterPredictedBudgetOverrun },
+            Column("filterObservedBudgetOverrun") { it.row.filterObservedBudgetOverrun },
             Column("firstAdmitBudgetMs") { it.row.firstAdmissionDecisionRow?.node?.preExecutionMetrics?.budgetMs },
             Column("encodingReserveUpperBoundMs") { it.row.encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs },
             Column("pacingSlackMs") { it.row.pacingSlackMs },
@@ -862,6 +1224,35 @@ class CaptureMetricsExcelExporter(
             Column("watchdogFailureRate") { it.watchdogFailureRate },
             Column("otherCount") { it.otherCount },
             Column("otherRate") { it.otherRate },
+        )
+
+        private fun buildReviewMetricColumns(): List<Column<ReviewMetricSummary>> = listOf(
+            Column("group") { it.group },
+            Column("category") { it.category },
+            Column("metric") { it.metric },
+            Column("numerator") { it.numerator },
+            Column("denominator") { it.denominator },
+            Column("rate") { it.rate },
+            Column("evidenceLevel") { it.evidenceLevel },
+            Column("note") { it.note },
+        )
+
+        private fun buildSimulationScenarioColumns(): List<Column<SimulationScenarioSummary>> = listOf(
+            Column("group") { it.group },
+            Column("scenario") { it.scenario },
+            Column("method") { it.method },
+            Column("captureCount") { it.captureCount },
+            Column("timeoutWatchdogRiskCount") { it.timeoutWatchdogRiskCount },
+            Column("timeoutWatchdogRiskEvaluatedCount") { it.timeoutWatchdogRiskEvaluatedCount },
+            Column("timeoutWatchdogRiskRate") { it.timeoutWatchdogRiskRate },
+            Column("filterPreservedCount") { it.filterPreservedCount },
+            Column("filterPreservationRate") { it.filterPreservationRate },
+            Column("bokehExecutedCount") { it.bokehExecutedCount },
+            Column("bokehExecutionRate") { it.bokehExecutionRate },
+            Column("fullFeatureSuccessCount") { it.fullFeatureSuccessCount },
+            Column("fullFeatureSuccessRate") { it.fullFeatureSuccessRate },
+            Column("offlineOracleRequired") { it.offlineOracleRequired },
+            Column("note") { it.note },
         )
 
         private fun buildMetricNoteColumns(): List<Column<MetricNote>> = listOf(
