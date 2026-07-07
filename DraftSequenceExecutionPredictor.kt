@@ -13,8 +13,8 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated at
  * decision-sequence level from positive residual ratios captured before workload EWMA updates.
  *
- * Besides admission, it feeds captureAvailable pacing: [observeBudget] caches the first ADMIT budget's headroom above
- * the COMPLETE-tail reserve, exposed via [predictCaptureAvailableSlackMs].
+ * Besides admission, it feeds captureAvailable pacing: [observeBudget] caches the first leading-node budget's headroom
+ * above the COMPLETE-tail reserve, exposed via [predictCaptureAvailableSlackMs].
  */
 class DraftSequenceExecutionPredictor {
 
@@ -78,14 +78,17 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Caches captureAvailable pacing slack from the draft sequence's first ADMIT budget: the headroom left above
-     * the learned COMPLETE-tail (encoding) reserve - the same reserve [predictWatchdogTimeout] grants against.
-     * Level-based on purpose: every ADMIT capture overwrites it, so a fresh burst paces from its own budget
-     * instead of a stale trend carried over from the previous burst.
+     * Caches captureAvailable pacing slack from the draft sequence's first leading-node budget: the headroom left
+     * above the learned COMPLETE-tail (encoding) reserve - the same reserve [predictWatchdogTimeout] grants against.
+     * The head is any leading workload (ADMIT Bokeh/Filter or OBSERVE Watermark/DynamicFunction); a COMPLETE head is
+     * rejected because the encoding would already be the first node, leaving no pre-encoding budget to pace from.
+     * A heavy OBSERVE-only capture (e.g. Watermark + encoding, no Bokeh/Filter) is paced through this path too.
+     * Level-based on purpose: every capture overwrites it, so a fresh burst paces from its own budget instead of a
+     * stale trend carried over from the previous burst.
      */
     @Synchronized
     fun observeBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
-        if (workloadSequenceKey.headWorkloadKey.policy != WorkloadPolicy.ADMIT) {
+        if (workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.COMPLETE) {
             return
         }
 
@@ -93,7 +96,7 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * CaptureAvailable pacing slack: budget headroom above the COMPLETE-tail reserve of the latest ADMIT sequence.
+     * CaptureAvailable pacing slack: budget headroom above the COMPLETE-tail reserve of the latest observed sequence.
      * Consumers spend it 1:1 as an advance on legacy service-rate pacing - 1ms of slack is 1ms of advance, no tuning
      * constant - so the budget parks at the reserve instead of draining until the admission gate rejects. Negative
      * means the budget is already below the reserve (full pacing; admission is rejecting in the same state).

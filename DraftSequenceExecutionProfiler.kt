@@ -38,7 +38,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
-    private var hasObservedFirstAdmitBudget = false
+    private var hasObservedFirstBudget = false
 
     fun setDraftNodeChainAccessor(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -62,7 +62,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
         )
 
-        observeFirstAdmitBudget(workloadSequenceKey, preExecutionMetrics.budgetMs)
+        observeFirstBudget(workloadSequenceKey, preExecutionMetrics.budgetMs)
         val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics).also(modelUpdate::remember)
         val prediction = decision.executionPrediction
         metricsRecorder.onPrediction(prediction)
@@ -88,11 +88,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
-    private fun observeFirstAdmitBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
-        if (!hasObservedFirstAdmitBudget && workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.ADMIT) {
-            predictor.observeBudget(workloadSequenceKey, budgetMs)
-            hasObservedFirstAdmitBudget = true
+    /**
+     * Feeds the first leading node's budget to captureAvailable pacing. Leading = the first ADMIT (Bokeh/Filter)
+     * or OBSERVE (Watermark/DynamicFunction) node - anything before the COMPLETE tail. A COMPLETE head means the
+     * encoding is already the first node, so there is no pre-encoding budget to pace from and nothing to observe.
+     */
+    private fun observeFirstBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+        if (hasObservedFirstBudget || workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.COMPLETE) {
+            return
         }
+
+        predictor.observeBudget(workloadSequenceKey, budgetMs)
+        hasObservedFirstBudget = true
     }
 
     private fun createExecutionSession(
@@ -223,6 +230,10 @@ private class ModelUpdateBuffer {
 /**
  * Sole writer of the [CaptureMetrics]/[DraftSequenceMetrics] observability store; nothing model-facing reads
  * from it. Kept in one place so retiring [CaptureMetrics] in favor of logs is a single-class change.
+ *
+ * Writers arrive from three threads - node execution (process), workload completion (worker), and the watchdog -
+ * so every mutation is guarded by the [draftSequenceMetrics] monitor to give the export reader a single
+ * happens-before edge over both the lists and the scalar flags.
  */
 private class MetricsRecorder(
     captureMetrics: CaptureMetrics,
@@ -258,21 +269,29 @@ private class MetricsRecorder(
     }
 
     fun onWatchdogArmed(nodeExecutionMetrics: NodeExecutionMetrics, watchdogTimeoutMs: Long) {
-        nodeExecutionMetrics.watchdogTimeoutMs = watchdogTimeoutMs
-        nodeExecutionMetrics.watchdogTimedOut = false
+        synchronized(draftSequenceMetrics) {
+            nodeExecutionMetrics.watchdogTimeoutMs = watchdogTimeoutMs
+            nodeExecutionMetrics.watchdogTimedOut = false
+        }
     }
 
     fun onWatchdogTimedOut(nodeExecutionMetrics: NodeExecutionMetrics) {
-        nodeExecutionMetrics.watchdogTimedOut = true
-        draftSequenceMetrics.hasWatchdogTimeout = true
+        synchronized(draftSequenceMetrics) {
+            nodeExecutionMetrics.watchdogTimedOut = true
+            draftSequenceMetrics.hasWatchdogTimeout = true
+        }
     }
 
     fun onWorkloadCompleted(nodeExecutionMetrics: NodeExecutionMetrics, postExecutionMetrics: PostExecutionMetrics) {
-        nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
+        synchronized(draftSequenceMetrics) {
+            nodeExecutionMetrics.postExecutionMetrics = postExecutionMetrics
+        }
     }
 
     fun onCaptureEnd(isTimeout: Boolean) {
-        draftSequenceMetrics.isTimeout = isTimeout
+        synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.isTimeout = isTimeout
+        }
     }
 }
 
