@@ -33,11 +33,13 @@ import java.util.List;
 
 /**
  * <div class="camera_en">
- * Policy that schedules captureAvailable callbacks using draft-sequence budget trend back-pressure.
+ * Policy that schedules captureAvailable callbacks using draft-sequence budget slack: the headroom above the
+ * learned encoding reserve is spent 1:1 as an advance on legacy service-rate pacing.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
- * draft sequence budget trend back-pressure에 따라 captureAvailable 콜백을 스케줄링하는 정책입니다.
+ * draft sequence budget slack에 따라 captureAvailable 콜백을 스케줄링하는 정책입니다. 학습된 encoding
+ * reserve 위의 여유를 legacy service-rate 지연에서 1:1로 차감합니다.
  * </div>
  */
 public class CaptureAvailableApmPolicy extends ApmPolicy {
@@ -81,12 +83,12 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Executes calculating the delay from the draft-sequence budget trend,
+     * Executes calculating the delay from the draft-sequence budget slack,
      * then schedules the provided {@code runnable}.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * draft sequence budget trend로 지연을 구하고, 제공된 {@code runnable}을 스케줄링합니다.
+     * draft sequence budget slack으로 지연을 구하고, 제공된 {@code runnable}을 스케줄링합니다.
      * </div>
      *
      * @param sequenceId sequenceId
@@ -114,25 +116,14 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     private CaptureAvailableDelay createCaptureAvailableDelay(@NonNull CaptureAvailableData data) {
         final long legacyDelayMs = Math.max(0, data.getAverageDraftTime() - data.getCaptureAvailableTime());
-        final DraftSequenceExecutionPredictor predictor = DraftSequenceExecutionPredictor.getInstance();
-        final boolean budgetTrendObserved = predictor.hasCaptureAvailableBudgetTrend();
-        final long budgetPressureDelayMs = budgetTrendObserved ? predictor.predictCaptureAvailableDelayMs() : 0L;
-        final long budgetAdvanceMs = budgetTrendObserved ? predictor.predictCaptureAvailableAdvanceMs() : 0L;
+        final Long slackMs = DraftSequenceExecutionPredictor.getInstance().predictCaptureAvailableSlackMs();
 
-        if (!budgetTrendObserved) {
-            return CaptureAvailableDelay.useLegacy(
-                    legacyDelayMs,
-                    budgetPressureDelayMs,
-                    budgetAdvanceMs,
-                    budgetTrendObserved,
-                    "legacy average delay is used until budget trend is observed");
+        if (slackMs == null) {
+            return CaptureAvailableDelay.useLegacy(legacyDelayMs,
+                    "legacy average delay is used until budget slack is observed");
         }
 
-        if (budgetPressureDelayMs > 0L) {
-            return CaptureAvailableDelay.useBudgetPressure(legacyDelayMs, budgetPressureDelayMs, budgetAdvanceMs);
-        }
-
-        return CaptureAvailableDelay.useBudgetAdvance(legacyDelayMs, budgetAdvanceMs);
+        return CaptureAvailableDelay.useBudgetSlack(legacyDelayMs, slackMs);
     }
 
     private void logCaptureAvailableDelay(int sequenceId, @NonNull CaptureAvailableData data,
@@ -177,71 +168,48 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     }
 
     private record CaptureAvailableDelay(long legacyDelayMs,
-                                         long budgetPressureDelayMs,
-                                         long budgetAdvanceMs,
+                                         long slackMs,
                                          long appliedDelayMs,
-                                         boolean budgetTrendObserved,
+                                         boolean slackObserved,
                                          boolean warning,
-                                         String reason) {
-            private CaptureAvailableDelay(long legacyDelayMs, long budgetPressureDelayMs, long budgetAdvanceMs,
-                                          long appliedDelayMs, boolean budgetTrendObserved, boolean warning,
-                                          @NonNull String reason) {
-                this.legacyDelayMs = legacyDelayMs;
-                this.budgetPressureDelayMs = budgetPressureDelayMs;
-                this.budgetAdvanceMs = budgetAdvanceMs;
-                this.appliedDelayMs = appliedDelayMs;
-                this.budgetTrendObserved = budgetTrendObserved;
-                this.warning = warning;
-                this.reason = reason;
-            }
+                                         @NonNull String reason) {
 
-            static CaptureAvailableDelay useLegacy(long legacyDelayMs, long budgetPressureDelayMs, long budgetAdvanceMs,
-                                                   boolean budgetTrendObserved, @NonNull String reason) {
-                return new CaptureAvailableDelay(legacyDelayMs, budgetPressureDelayMs, budgetAdvanceMs,
-                        legacyDelayMs, budgetTrendObserved, false, reason);
-            }
-
-            static CaptureAvailableDelay useBudgetPressure(long legacyDelayMs, long budgetPressureDelayMs,
-                                                           long budgetAdvanceMs) {
-                final long appliedDelayMs = Math.min(budgetPressureDelayMs, legacyDelayMs);
-                if (budgetPressureDelayMs > legacyDelayMs) {
-                    return new CaptureAvailableDelay(legacyDelayMs, budgetPressureDelayMs, budgetAdvanceMs,
-                            appliedDelayMs, true, true,
-                            "legacy average delay caps budget pressure delay by " + (budgetPressureDelayMs - legacyDelayMs) + "ms");
-                }
-                if (appliedDelayMs < legacyDelayMs) {
-                    return new CaptureAvailableDelay(legacyDelayMs, budgetPressureDelayMs, budgetAdvanceMs,
-                            appliedDelayMs, true, false,
-                            "budget pressure delay is faster by " + (legacyDelayMs - appliedDelayMs) + "ms");
-                }
-                return useLegacy(legacyDelayMs, budgetPressureDelayMs, budgetAdvanceMs,
-                        true, "budget pressure delay is same as legacy average delay");
-            }
-
-            static CaptureAvailableDelay useBudgetAdvance(long legacyDelayMs, long budgetAdvanceMs) {
-                final long appliedDelayMs = Math.max(0L, legacyDelayMs - budgetAdvanceMs);
-                if (appliedDelayMs < legacyDelayMs) {
-                    return new CaptureAvailableDelay(legacyDelayMs, 0L, budgetAdvanceMs,
-                            appliedDelayMs, true, false,
-                            "budget recovery advances legacy delay by " + (legacyDelayMs - appliedDelayMs) + "ms");
-                }
-                return useLegacy(legacyDelayMs, 0L, budgetAdvanceMs,
-                        true, "legacy average delay is retained because budget trend has no usable advance");
-            }
-
-            String formatLogMessage(int sequenceId, @NonNull CaptureAvailableData data, boolean scheduled) {
-                return "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
-                        + ", budgetTrendObserved=" + budgetTrendObserved
-                        + ", budgetPressureDelay=" + budgetPressureDelayMs + "ms"
-                        + ", budgetAdvance=" + budgetAdvanceMs + "ms"
-                        + ", predictorDelay=" + appliedDelayMs + "ms"
-                        + ", legacyDelay=" + legacyDelayMs + "ms"
-                        + ", appliedDelay=" + appliedDelayMs + "ms"
-                        + ", scheduled=" + scheduled
-                        + ", averageDraftTime=" + data.getAverageDraftTime() + "ms"
-                        + ", captureAvailableTime=" + data.getCaptureAvailableTime() + "ms";
-            }
+        static CaptureAvailableDelay useLegacy(long legacyDelayMs, @NonNull String reason) {
+            return new CaptureAvailableDelay(legacyDelayMs, 0L, legacyDelayMs, false, false, reason);
         }
+
+        static CaptureAvailableDelay useBudgetSlack(long legacyDelayMs, long slackMs) {
+            // Slack is spent 1:1 as an advance on legacy pacing: 1ms of headroom above the encoding reserve
+            // releases the next capture 1ms earlier, so the budget parks at the reserve instead of draining.
+            final long appliedDelayMs = Math.min(legacyDelayMs, Math.max(0L, legacyDelayMs - slackMs));
+            if (slackMs < 0L) {
+                // Below the encoding reserve: full legacy pacing while the admission gate is rejecting.
+                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, true,
+                        "budget is " + (-slackMs) + "ms below the encoding reserve - full legacy pacing");
+            }
+            if (appliedDelayMs == 0L) {
+                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
+                        "budget slack covers the full legacy delay");
+            }
+            if (appliedDelayMs == legacyDelayMs) {
+                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
+                        "budget is parked at the encoding reserve - full legacy pacing");
+            }
+            return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
+                    "budget slack advances legacy delay by " + slackMs + "ms");
+        }
+
+        String formatLogMessage(int sequenceId, @NonNull CaptureAvailableData data, boolean scheduled) {
+            return "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
+                    + ", slackObserved=" + slackObserved
+                    + ", slack=" + slackMs + "ms"
+                    + ", legacyDelay=" + legacyDelayMs + "ms"
+                    + ", appliedDelay=" + appliedDelayMs + "ms"
+                    + ", scheduled=" + scheduled
+                    + ", averageDraftTime=" + data.getAverageDraftTime() + "ms"
+                    + ", captureAvailableTime=" + data.getCaptureAvailableTime() + "ms";
+        }
+    }
 
     private static class CaptureAvailableData {
         private static final CaptureAvailableData EMPTY = new CaptureAvailableData(List.of(), 0L);

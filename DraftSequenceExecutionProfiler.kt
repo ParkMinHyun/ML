@@ -34,6 +34,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val modelUpdate = ModelUpdateBuffer()
     private val metricsRecorder = MetricsRecorder(captureMetrics, draftSequenceMetrics, isPendingRequest)
     private val nodeChainLifecycle = DraftNodeChainLifecycle()
+    private val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
@@ -164,7 +165,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun workloadKeyFor(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
-        val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
         return when (node) {
             is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }

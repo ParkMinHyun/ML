@@ -12,13 +12,16 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  *
  * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated at
  * decision-sequence level from positive residual ratios captured before workload EWMA updates.
+ *
+ * Besides admission, it feeds captureAvailable pacing: [observeBudget] caches the first ADMIT budget's headroom above
+ * the COMPLETE-tail reserve, exposed via [predictCaptureAvailableSlackMs].
  */
 class DraftSequenceExecutionPredictor {
 
     private val workloadDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
     private val workloadSequenceKeyScoreMap = mutableMapOf<WorkloadSequenceKey, MutableList<ScoreSample>>()
     private val workloadSequenceShapeScoreMap = mutableMapOf<WorkloadSequenceShape, MutableList<ScoreSample>>()
-    private val captureAvailableBudgetTrend = BudgetTrend(WORKLOAD_EWMA_ALPHA)
+    private var captureAvailableSlackMs: Long? = null
 
     @Synchronized
     fun predictAdmission(
@@ -61,9 +64,7 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val reserveWorkloadKeys = workloadSequenceKey.workloadKeys
-            .drop(1)
-            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
+        val reserveWorkloadKeys = reserveTailKeys(workloadSequenceKey)
         if (reserveWorkloadKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
@@ -76,34 +77,50 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    /** Feeds the draft sequence's first ADMIT budget into the captureAvailable back-pressure trend. */
+    /**
+     * Caches captureAvailable pacing slack from the draft sequence's first ADMIT budget: the headroom left above
+     * the learned COMPLETE-tail (encoding) reserve - the same reserve [predictWatchdogTimeout] grants against.
+     * Level-based on purpose: every ADMIT capture overwrites it, so a fresh burst paces from its own budget
+     * instead of a stale trend carried over from the previous burst.
+     */
     @Synchronized
     fun observeBudget(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
-        if (workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.ADMIT) {
-            captureAvailableBudgetTrend.observe(budgetMs)
+        if (workloadSequenceKey.headWorkloadKey.policy != WorkloadPolicy.ADMIT) {
+            return
         }
+
+        captureAvailableSlackMs = (budgetMs - reserveUpperBoundMs(reserveTailKeys(workloadSequenceKey))).roundToLong()
     }
 
     /**
-     * Capture-available pressure derived from the first ADMIT budget trend. A negative trend is diagnostic pressure:
-     * legacy service-rate pacing should be retained because the observed budget is already falling.
+     * CaptureAvailable pacing slack: budget headroom above the COMPLETE-tail reserve of the latest ADMIT sequence.
+     * Consumers spend it 1:1 as an advance on legacy service-rate pacing - 1ms of slack is 1ms of advance, no tuning
+     * constant - so the budget parks at the reserve instead of draining until the admission gate rejects. Negative
+     * means the budget is already below the reserve (full pacing; admission is rejecting in the same state).
+     * Null until the first ADMIT sequence is observed - callers keep legacy pacing until then.
      */
     @Synchronized
-    fun predictCaptureAvailableDelayMs(): Long = captureAvailableBudgetTrend.fallingDelayMs(CAPTURE_AVAILABLE_DELAY_SCALE)
+    fun predictCaptureAvailableSlackMs(): Long? = captureAvailableSlackMs
+
+    /** COMPLETE workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
+    private fun reserveTailKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+        return workloadSequenceKey.workloadKeys
+            .drop(1)
+            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.COMPLETE }
+    }
+
+    private fun reserveUpperBoundMs(reserveWorkloadKeys: List<WorkloadKey>): Double {
+        if (reserveWorkloadKeys.isEmpty()) {
+            return 0.0
+        }
+
+        val reserveSequenceKey = WorkloadSequenceKey(reserveWorkloadKeys)
+        return correctedSequenceUpperBound(reserveSequenceKey, reserveWorkloadKeys.associateWith(::predictedWorkloadDuration))
+    }
 
     /**
-     * Positive budget recovery can be spent as an advance credit against legacy service-rate delay. Only one EWMA step
-     * of recovery is spent per callback, so a large budget reset cannot immediately collapse the delay to zero.
-     */
-    @Synchronized
-    fun predictCaptureAvailableAdvanceMs(): Long = captureAvailableBudgetTrend.risingAdvanceMs(CAPTURE_AVAILABLE_ADVANCE_SCALE)
-
-    @Synchronized
-    fun hasCaptureAvailableBudgetTrend(): Boolean = captureAvailableBudgetTrend.hasTrend()
-
-    /**
-     * ADMIT gate. Admission is bounded by the learned sequence upper bound only; budget trend is observed separately
-     * and consumed by [predictCaptureAvailableDelayMs] as captureAvailable back-pressure.
+     * ADMIT gate. Admission is bounded by the learned sequence upper bound only; budget slack is observed separately
+     * and consumed by [predictCaptureAvailableSlackMs] as captureAvailable pacing.
      */
     private fun admitUnderBudgetPolicy(
         sequencePredictedMs: Double,
@@ -115,14 +132,12 @@ class DraftSequenceExecutionPredictor {
             return true
         }
 
-        val slackMs = budgetMs - sequenceUpperBoundMs
-        val rejectedByUpperBound = slackMs < 0.0
-
-        if (rejectedByUpperBound) {
+        val admit = sequenceUpperBoundMs <= budgetMs
+        if (!admit) {
             CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         }
 
-        return !rejectedByUpperBound
+        return admit
     }
 
     @Synchronized
@@ -272,39 +287,6 @@ class DraftSequenceExecutionPredictor {
         }
     }
 
-    /** Budget delta between observations, EWMA-tracked - negative means the queue is falling behind the shutter rate. */
-    private class BudgetTrend(private val alpha: Double) {
-        private var lastBudgetMs: Long? = null
-        var trendMs: Double? = null
-            private set
-
-        fun observe(budgetMs: Long) {
-            lastBudgetMs?.let { prev ->
-                val deltaMs = (budgetMs - prev).toDouble()
-                trendMs = trendMs?.let { it + alpha * (deltaMs - it) } ?: deltaMs
-            }
-            lastBudgetMs = budgetMs
-        }
-
-        fun hasTrend(): Boolean = trendMs != null
-
-        fun fallingDelayMs(delayScale: Double): Long {
-            return trendMs
-                ?.takeIf { it < 0.0 }
-                ?.let { -it * delayScale }
-                ?.roundToNonNegativeLong()
-                ?: 0L
-        }
-
-        fun risingAdvanceMs(advanceScale: Double): Long {
-            return trendMs
-                ?.takeIf { it > 0.0 }
-                ?.let { it * advanceScale }
-                ?.roundToNonNegativeLong()
-                ?: 0L
-        }
-    }
-
     companion object {
         /** Process-wide learned model shared by profilers created across captures. */
         @JvmStatic
@@ -316,8 +298,6 @@ class DraftSequenceExecutionPredictor {
         private const val WORKLOAD_EWMA_ALPHA = 0.30
         private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
-        private const val CAPTURE_AVAILABLE_DELAY_SCALE = 1.0 / (1.0 - WORKLOAD_EWMA_ALPHA)
-        private const val CAPTURE_AVAILABLE_ADVANCE_SCALE = WORKLOAD_EWMA_ALPHA
     }
 }
 

@@ -202,6 +202,17 @@ class CaptureMetricsExcelExporter(
             metric = "PolicyOutcome",
             note = "Sequential outcomes are mutually exclusive per capture and are the right place to discuss Filter preservation and observed Filter loss after Bokeh admit.",
         ),
+        MetricNote(
+            metric = "Pacing simulation",
+            note = "Slack-policy delay = MAX(0, MIN(legacyDelay, legacyDelay - pacingSlackMs)). " +
+                    "Trend-policy delay: EWMA(alpha=0.3) over firstAdmitBudgetMs deltas between consecutive same-session rows; " +
+                    "negative trend * 1.43 capped at legacyDelay, positive trend * 0.3 subtracted from legacyDelay. " +
+                    "legacyDelay = MAX(0, AVERAGE(last 3 draftNodeDurationMs) - captureAvailableTime); captureAvailableTime is " +
+                    "not stored in capture metrics - take it per capture from CaptureAvailableApmPolicy logs. " +
+                    "encodingReserveUpperBoundMs is the recorded suffix UB after the first admission decision, so it can " +
+                    "include OBSERVE stages that the runtime COMPLETE-only reserve excludes; pacingSlackMs is signed while " +
+                    "the runtime watchdog value clamps at 0.",
+        ),
     )
 
     private fun <T> writeSheet(
@@ -279,6 +290,29 @@ class CaptureMetricsExcelExporter(
 
         val filterDecisionRow: NodeRow?
             get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
+
+        /** First admission decision of the capture - the node whose budget feeds captureAvailable pacing. */
+        val firstAdmissionDecisionRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.isAdmissionWorkload && it.prediction != null }
+
+        /** First tail node after the first admission decision - the draft/encoding stage the pacing reserve protects. */
+        val encodingReserveRow: NodeRow?
+            get() {
+                val admissionIndex = nodeRows.indexOfFirst { it.isAdmissionWorkload && it.prediction != null }
+                if (admissionIndex < 0) {
+                    return null
+                }
+                return nodeRows.drop(admissionIndex + 1)
+                    .firstOrNull { !it.isAdmissionWorkload && it.prediction != null }
+            }
+
+        /** Signed pacing slack the slack policy consumes: first ADMIT budget minus the encoding reserve. */
+        val pacingSlackMs: Double?
+            get() {
+                val budgetMs = firstAdmissionDecisionRow?.node?.preExecutionMetrics?.budgetMs ?: return null
+                val reserveMs = encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs ?: return null
+                return budgetMs - reserveMs
+            }
 
         val hasTimeoutFailure: Boolean
             get() = metrics.draftSequenceMetrics?.isTimeout == true
@@ -730,6 +764,10 @@ class CaptureMetricsExcelExporter(
             Column("filterCompleted") { it.row.filterDecisionRow?.wasCompleted },
             Column("filterPreserved") { it.row.isFilterPreserved },
             Column("sequentialPolicyOutcome") { it.row.policyOutcome().label },
+            Column("firstAdmitBudgetMs") { it.row.firstAdmissionDecisionRow?.node?.preExecutionMetrics?.budgetMs },
+            Column("encodingReserveUpperBoundMs") { it.row.encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs },
+            Column("pacingSlackMs") { it.row.pacingSlackMs },
+            Column("draftNodeDurationMs") { it.row.encodingReserveRow?.nodeActualDurationMs },
             Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
