@@ -173,7 +173,9 @@ class CaptureMetricsExcelExporter(
         return captureGroups(captures.map { it.row }).flatMap { group ->
             listOf(
                 DecisionQualitySummary.from(group.name, ADMISSION_STAGE_BOKEH, group.captures),
+                DecisionQualitySummary.from(group.name, ADMISSION_STAGE_DECODING, group.captures),
                 DecisionQualitySummary.from(group.name, ADMISSION_STAGE_FILTER, group.captures),
+                DecisionQualitySummary.from(group.name, ADMISSION_STAGE_OVERLAY_WATERMARK, group.captures),
             )
         }
     }
@@ -352,13 +354,19 @@ class CaptureMetricsExcelExporter(
         val bokehDecisionRow: NodeRow?
             get() = nodeRows.firstOrNull { it.isBokehWorkload && it.prediction != null }
 
+        val decodingDecisionRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.isDecodingWorkload && it.prediction != null }
+
         val filterDecisionRow: NodeRow?
             get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
 
+        val overlayWatermarkDecisionRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.isOverlayWatermarkWorkload && it.prediction != null }
+
         /**
          * First leading node of the capture - the node whose budget the runtime updateCaptureAvailablePacing records. Leading =
-         * any predicted node before the encoding tail (Bokeh/Filter/Watermark/DynamicFunction), so a REQUIRED-only
-         * capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
+         * any predicted node before the encoding tail (Bokeh/Decoding/Filter/Watermark/DynamicFunction), so a
+         * REQUIRED-only capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
          */
         val firstLeadingRow: NodeRow?
             get() = nodeRows.firstOrNull { it.prediction != null }?.takeIf { it != encodingReserveRow }
@@ -457,7 +465,12 @@ class CaptureMetricsExcelExporter(
         /** "Always run everything" proxy risk: any admission decision's recorded UB above its budget. */
         val alwaysRunBudgetRiskByUpperBound: Boolean?
             get() {
-                val decisionRows = listOfNotNull(bokehDecisionRow, filterDecisionRow)
+                val decisionRows = listOfNotNull(
+                    bokehDecisionRow,
+                    decodingDecisionRow,
+                    filterDecisionRow,
+                    overlayWatermarkDecisionRow,
+                )
                 if (decisionRows.isEmpty()) {
                     return null
                 }
@@ -670,11 +683,18 @@ class CaptureMetricsExcelExporter(
         val isBokehWorkload: Boolean
             get() = node.workloadKey?.startsWith(ADMIT_BOKEH_PREFIX) == true
 
+        val isDecodingWorkload: Boolean
+            get() = node.workloadKey?.startsWith(ADMIT_DECODING_PREFIX) == true
+
         val isFilterWorkload: Boolean
             get() = node.workloadKey?.startsWith(ADMIT_FILTER_PREFIX) == true
 
+        val isOverlayWatermarkWorkload: Boolean
+            get() = node.workloadKey?.startsWith(ADMIT_WATERMARK_PREFIX) == true &&
+                    node.workloadKey?.contains(WATERMARK_TYPE_OVERLAY) == true
+
         val isAdmissionWorkload: Boolean
-            get() = isBokehWorkload || isFilterWorkload
+            get() = isBokehWorkload || isDecodingWorkload || isFilterWorkload || isOverlayWatermarkWorkload
 
         val wasAdmitted: Boolean?
             get() = prediction?.admit
@@ -688,7 +708,9 @@ class CaptureMetricsExcelExporter(
         fun admissionStage(): String? {
             return when {
                 isBokehWorkload -> ADMISSION_STAGE_BOKEH
+                isDecodingWorkload -> ADMISSION_STAGE_DECODING
                 isFilterWorkload -> ADMISSION_STAGE_FILTER
+                isOverlayWatermarkWorkload -> ADMISSION_STAGE_OVERLAY_WATERMARK
                 else -> null
             }
         }
@@ -1197,7 +1219,13 @@ class CaptureMetricsExcelExporter(
                 val simulations = captures.flatMap { capture ->
                     listOfNotNull(capture.row.budgetDeficitPacing, capture.queueAwarePacing)
                 }
-                val stages = listOf(PACING_TARGET_ALL, ADMISSION_STAGE_BOKEH, ADMISSION_STAGE_FILTER)
+                val stages = listOf(
+                    PACING_TARGET_ALL,
+                    ADMISSION_STAGE_BOKEH,
+                    ADMISSION_STAGE_DECODING,
+                    ADMISSION_STAGE_FILTER,
+                    ADMISSION_STAGE_OVERLAY_WATERMARK,
+                )
 
                 return simulations.groupBy { it.method }
                     .toSortedMap()
@@ -1315,9 +1343,14 @@ class CaptureMetricsExcelExporter(
         private val FILE_NAME = "${Build.MODEL}_metrics.xlsx"
         private const val MAX_SHEET_NAME_LENGTH = 31
         private const val ADMIT_BOKEH_PREFIX = "BOKEH("
+        private const val ADMIT_DECODING_PREFIX = "DECODING("
         private const val ADMIT_FILTER_PREFIX = "FILTER("
+        private const val ADMIT_WATERMARK_PREFIX = "WATERMARK("
+        private const val WATERMARK_TYPE_OVERLAY = "watermarkType=OVERLAY"
         private const val ADMISSION_STAGE_BOKEH = "Bokeh"
+        private const val ADMISSION_STAGE_DECODING = "Decoding"
         private const val ADMISSION_STAGE_FILTER = "Filter"
+        private const val ADMISSION_STAGE_OVERLAY_WATERMARK = "OverlayWatermark"
         private const val PACING_TARGET_ALL = "All"
         private const val BUDGET_DEFICIT_PACING_METHOD = "Budget-deficit predicted UB proxy"
         private const val QUEUE_AWARE_PACING_METHOD = "Queue-aware burst proxy"
@@ -1353,7 +1386,10 @@ class CaptureMetricsExcelExporter(
             val workloadSequenceKey = leadingRow.prediction?.workloadSequenceKey.orEmpty()
             return when {
                 workloadSequenceKey.contains(ADMIT_BOKEH_PREFIX) -> ADMISSION_STAGE_BOKEH
+                workloadSequenceKey.contains(ADMIT_DECODING_PREFIX) -> ADMISSION_STAGE_DECODING
                 workloadSequenceKey.contains(ADMIT_FILTER_PREFIX) -> ADMISSION_STAGE_FILTER
+                workloadSequenceKey.contains(ADMIT_WATERMARK_PREFIX) &&
+                        workloadSequenceKey.contains(WATERMARK_TYPE_OVERLAY) -> ADMISSION_STAGE_OVERLAY_WATERMARK
                 else -> "ObserveOnly"
             }
         }

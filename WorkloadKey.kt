@@ -1,6 +1,7 @@
 package com.samsung.android.camera.core2.ml
 
 import android.util.Size
+import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import kotlin.math.abs
 
 /**
@@ -27,8 +28,18 @@ sealed interface WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OPTIONAL
     }
 
-    data class Watermark(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.REQUIRED
+    data class Watermark(
+        override val sizeBucket: SizeBucket,
+        val watermarkType: WatermarkType,
+    ) : WorkloadKey {
+        /** FRAME must always stamp (correctness); OVERLAY is a degradable enhancement. */
+        override val policy: WorkloadPolicy =
+            if (watermarkType == WatermarkType.FRAME) WorkloadPolicy.REQUIRED else WorkloadPolicy.OPTIONAL
+    }
+
+    /** JPEG-to-YUV prerequisite for downstream optional YUV effects. */
+    data class Decoding(override val sizeBucket: SizeBucket) : WorkloadKey {
+        override val policy: WorkloadPolicy = WorkloadPolicy.OPTIONAL
     }
 
     /** Mandatory tail from ImageCodec entry through saved draft task completion. */
@@ -45,7 +56,8 @@ fun WorkloadKey.toReplayString(): String = when (this) {
     is WorkloadKey.Bokeh -> "BOKEH(sizeBucket=$sizeBucket)"
     is WorkloadKey.DynamicFunction -> "DYNAMIC_FUNCTION(sizeBucket=$sizeBucket)"
     is WorkloadKey.Filter -> "FILTER(sizeBucket=$sizeBucket)"
-    is WorkloadKey.Watermark -> "WATERMARK(sizeBucket=$sizeBucket)"
+    is WorkloadKey.Watermark -> "WATERMARK(sizeBucket=$sizeBucket,watermarkType=$watermarkType)"
+    is WorkloadKey.Decoding -> "DECODING(sizeBucket=$sizeBucket)"
     is WorkloadKey.Encoding -> "ENCODING(sizeBucket=$sizeBucket,imageFormat=$imageFormat,isPendingRequest=$isPendingRequest)"
 }
 

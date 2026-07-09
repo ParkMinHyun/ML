@@ -10,6 +10,7 @@ import com.samsung.android.camera.core2.node.imageCodec.samsung.SecImageCodecNod
 import com.samsung.android.camera.core2.node.watermark.WatermarkNode
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor
 import com.samsung.android.camera.core2.util.CLog
+import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import java.util.concurrent.CompletableFuture
 
 private const val TAG = "DraftSequenceExecutionProfiler"
@@ -24,9 +25,9 @@ private const val TAG = "DraftSequenceExecutionProfiler"
  * - [nodeChainLifecycle] owns the draft node chain's deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
+    private val deviceStateReader: DeviceStateReader,
     private val captureMetrics: CaptureMetrics,
     private val isPendingRequest: Boolean,
-    private val deviceStateReader: DeviceStateReader,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
     draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
 ) {
@@ -38,6 +39,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
+    private var optionalEnhancementChainRejected = false
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
@@ -64,9 +66,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     /**
      * Profiles one predictable node execution.
      *
-     * OPTIONAL workloads (Bokeh / Filter) are admitted by their remaining suffix UB.
-     * REQUIRED workloads (DynamicFunction / Watermark) always run but are not reserve-protected;
-     * RESERVED workload is the mandatory tail.
+     * OPTIONAL workloads are admitted by their remaining suffix UB. JPEG-path Decoding, Filter, and Overlay
+     * Watermark are a dependent enhancement chain: rejecting Decoding or Filter rejects downstream optional effects.
+     * REQUIRED workloads (DynamicFunction / Frame Watermark) always run but are not reserve-protected; RESERVED
+     * workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
@@ -78,8 +81,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
         )
 
-        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics).also(modelUpdate::remember)
-        val prediction = decision.executionPrediction
+        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
+        val effectiveAdmit = effectiveAdmit(workloadKey, decision.executionPrediction.admit)
+        val effectiveDecision = decision.copy(
+            executionPrediction = decision.executionPrediction.copy(admit = effectiveAdmit),
+        )
+        modelUpdate.remember(effectiveDecision)
+        val prediction = effectiveDecision.executionPrediction
         metricsRecorder.onPrediction(prediction)
 
         return createExecutionSession(
@@ -89,6 +97,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             nodeExecutionMetrics = nodeExecutionMetrics,
             prediction = prediction,
         )
+    }
+
+    private fun effectiveAdmit(workloadKey: WorkloadKey, modelAdmit: Boolean): Boolean {
+        val admit = modelAdmit &&
+                !(optionalEnhancementChainRejected && workloadKey.dependsOnOptionalEnhancementChain())
+        if (!admit && workloadKey.rejectsDownstreamOptionalEnhancements()) {
+            optionalEnhancementChainRejected = true
+        }
+        return admit
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {
@@ -182,12 +199,16 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }
             is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
             is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
-            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket)
-            is SecImageCodecNodeBase -> WorkloadKey.Encoding(
-                sizeBucket,
-                captureMetrics.resultImageFormat,
-                isPendingRequest,
-            ).takeIf { node.isEncodeUsage }
+            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket, node.watermarkType)
+            is SecImageCodecNodeBase -> when {
+                node.isDecodingUsage -> WorkloadKey.Decoding(sizeBucket)
+                node.isEncodeUsage -> WorkloadKey.Encoding(
+                    sizeBucket,
+                    captureMetrics.resultImageFormat,
+                    isPendingRequest,
+                )
+                else -> error("SecImageCodecNodeBase is neither decoding nor encoding usage: ${node.javaClass.simpleName}")
+            }
             else -> null
         }
     }
@@ -195,6 +216,22 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun deinitializeDraftNodeChain() {
         nodeChainLifecycle.deinitializeWhenIdle()
     }
+}
+
+// Dependent optional enhancement chain, in fixed pipeline order: Decoding -> Filter -> Overlay Watermark.
+// Rejecting an upstream link (its own budget reject or an inherited one) skips every dependent link after it;
+// Frame Watermark is REQUIRED and never participates.
+
+private fun WorkloadKey.dependsOnOptionalEnhancementChain(): Boolean = when (this) {
+    is WorkloadKey.Filter -> true
+    is WorkloadKey.Watermark -> watermarkType == WatermarkType.OVERLAY
+    else -> false
+}
+
+private fun WorkloadKey.rejectsDownstreamOptionalEnhancements(): Boolean = when (this) {
+    is WorkloadKey.Decoding,
+    is WorkloadKey.Filter -> true
+    else -> false
 }
 
 /**

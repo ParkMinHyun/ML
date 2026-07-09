@@ -13,8 +13,9 @@ private const val TAG = "DraftSequenceExecutionPredictor"
 /**
  * Sequence-aware, phase-aware, adaptive upper bound.
  *
- * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated at
- * decision-sequence level from positive residual ratios captured before workload EWMA updates.
+ * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated
+ * from positive residual ratios captured before workload EWMA updates; exact decision-sequence residuals win, with
+ * global residuals as the cold-sequence fallback.
  *
  * Besides admission, it feeds captureAvailable pacing: [updateCaptureAvailablePacing] refreshes the pacing prediction
  * and [decideCaptureAvailablePacing] converts it into a callback delay per admission.
@@ -23,15 +24,9 @@ class DraftSequenceExecutionPredictor {
 
     private val workloadKeyDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
     private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
-    private val workloadSequenceShapeResidualMap = mutableMapOf<WorkloadSequenceShape, MutableList<ResidualSample>>()
+    private val globalResidualSamples = mutableListOf<ResidualSample>()
     private var captureAvailablePacingPrediction: CaptureAvailablePacingPrediction? = null
-
-    // Admitted-backlog clock for captureAvailable pacing: predicted durations of captures whose callback was
-    // released but whose draft has not started yet, plus the uptime when the pipeline is predicted to go idle.
-    // Rebased on observation at every draft start, cleared when the draft queue drains.
-    private val admittedDraftPredictedMsQueue = ArrayDeque<Double>()
-    private var admittedDraftPredictedSumMs = 0.0
-    private var draftPipelineBusyUntilUptimeMs = 0L
+    private val backlogClock = AdmittedBacklogClock()
 
     @Synchronized
     fun predictAdmission(
@@ -138,22 +133,10 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun residualScoreFor(workloadSequenceKey: WorkloadSequenceKey): Double {
-        return selectResidualScore(
-            sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey].orEmpty(),
-            compatibleSamples = workloadSequenceShapeResidualMap[workloadSequenceKey.shape].orEmpty(),
+        val sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey]
+        return weightedQuantileScore(
+            if (sequenceSamples.isNullOrEmpty()) globalResidualSamples else sequenceSamples,
         )
-    }
-
-    private fun selectResidualScore(
-        sequenceSamples: List<ResidualSample>,
-        compatibleSamples: List<ResidualSample>,
-    ): Double {
-        // Exact sequence residuals win; otherwise borrow only the same workload-type sequence shape.
-        return if (sequenceSamples.isNotEmpty()) {
-            weightedQuantileScore(sequenceSamples)
-        } else {
-            weightedQuantileScore(compatibleSamples)
-        }
     }
 
     private fun weightedQuantileScore(samples: List<ResidualSample>): Double {
@@ -264,7 +247,7 @@ class DraftSequenceExecutionPredictor {
         decayResidualWeights()
         samples.forEach { (workloadSequenceKey, sample) ->
             workloadSequenceKeyResidualMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
-            workloadSequenceShapeResidualMap.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
+            globalResidualSamples += sample
         }
     }
 
@@ -296,7 +279,7 @@ class DraftSequenceExecutionPredictor {
 
     private fun decayResidualWeights() {
         workloadSequenceKeyResidualMap.values.forEach { it.decayAndPrune() }
-        workloadSequenceShapeResidualMap.values.forEach { it.decayAndPrune() }
+        globalResidualSamples.decayAndPrune()
     }
 
     private fun MutableList<ResidualSample>.decayAndPrune() {
@@ -336,13 +319,7 @@ class DraftSequenceExecutionPredictor {
             workloadSequenceKey = workloadSequenceKey.toReplayString(),
         )
 
-        // A draft actually started: rebase the admitted-backlog clock on observation. The oldest queue entry is the
-        // capture starting now; the pipeline stays busy for its fresh prediction plus the admissions still waiting
-        // behind it. Push/pop mismatches (skipped callbacks, RESERVED-head captures) do not accumulate - every
-        // draft start recomputes the clock from scratch.
-        admittedDraftPredictedMsQueue.removeFirstOrNull()?.let { admittedDraftPredictedSumMs -= it }
-        draftPipelineBusyUntilUptimeMs = SystemClock.uptimeMillis() +
-            ceil(preferredDraftPathPredictedMs + admittedDraftPredictedSumMs.coerceAtLeast(0.0)).toLong()
+        backlogClock.rebaseOnDraftStart(preferredDraftPathPredictedMs)
     }
 
     /**
@@ -361,11 +338,10 @@ class DraftSequenceExecutionPredictor {
     fun decideCaptureAvailablePacing(): CaptureAvailablePacingDecision? {
         val prediction = captureAvailablePacingPrediction ?: return null
 
-        val nowUptimeMs = SystemClock.uptimeMillis()
         val levelDeficitMs = positiveCeilMs(
             prediction.preferredDraftPathUpperBoundMs - prediction.firstLeadingBudgetMs.coerceAtLeast(0L),
         )
-        val backlogMs = (draftPipelineBusyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
+        val backlogMs = backlogClock.backlogMs()
         // Delaying the callback lets the backlog drain before the next capture's timeout clock starts, so the
         // admitted capture keeps its full preferred-path budget once backlog - delay fits the capture timeout.
         val backlogDeficitMs = positiveCeilMs(
@@ -373,10 +349,7 @@ class DraftSequenceExecutionPredictor {
         )
         val delayMs = maxOf(levelDeficitMs, backlogDeficitMs)
 
-        admittedDraftPredictedMsQueue.addLast(prediction.preferredDraftPathPredictedMs)
-        admittedDraftPredictedSumMs += prediction.preferredDraftPathPredictedMs
-        draftPipelineBusyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, draftPipelineBusyUntilUptimeMs) +
-            ceil(prediction.preferredDraftPathPredictedMs).toLong()
+        backlogClock.onCallbackAdmitted(prediction.preferredDraftPathPredictedMs, delayMs)
 
         return CaptureAvailablePacingDecision(
             delayMs = delayMs,
@@ -392,9 +365,44 @@ class DraftSequenceExecutionPredictor {
     @Synchronized
     fun clearCaptureAvailablePacing() {
         captureAvailablePacingPrediction = null
-        admittedDraftPredictedMsQueue.clear()
-        admittedDraftPredictedSumMs = 0.0
-        draftPipelineBusyUntilUptimeMs = 0L
+        backlogClock.clear()
+    }
+
+    /**
+     * Admitted-backlog clock for captureAvailable pacing: predicted durations of captures whose callback was
+     * released but whose draft has not started yet, plus the uptime when the pipeline is predicted to go idle.
+     * Not self-synchronized - only touched under the predictor's monitor.
+     */
+    private class AdmittedBacklogClock {
+        private val waitingPredictedMsQueue = ArrayDeque<Double>()
+        private var busyUntilUptimeMs = 0L
+
+        /** Admitted-but-undrained draft work left, measured from now. */
+        fun backlogMs(): Long = (busyUntilUptimeMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+
+        /** One callback released: its capture joins the waiting backlog and extends the busy horizon by its prediction. */
+        fun onCallbackAdmitted(predictedMs: Double, delayMs: Long) {
+            waitingPredictedMsQueue.addLast(predictedMs)
+            busyUntilUptimeMs = maxOf(SystemClock.uptimeMillis() + delayMs, busyUntilUptimeMs) +
+                ceil(predictedMs).toLong()
+        }
+
+        /**
+         * A draft actually started: rebase on observation. The oldest waiting admission is the capture starting
+         * now; the pipeline stays busy for its fresh prediction plus the admissions still waiting behind it.
+         * Push/pop mismatches (skipped callbacks, RESERVED-head captures) do not accumulate - every draft start
+         * recomputes the clock from scratch.
+         */
+        fun rebaseOnDraftStart(startingPredictedMs: Double) {
+            waitingPredictedMsQueue.removeFirstOrNull()
+            busyUntilUptimeMs = SystemClock.uptimeMillis() +
+                ceil(startingPredictedMs + waitingPredictedMsQueue.sum()).toLong()
+        }
+
+        fun clear() {
+            waitingPredictedMsQueue.clear()
+            busyUntilUptimeMs = 0L
+        }
     }
 
     /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
