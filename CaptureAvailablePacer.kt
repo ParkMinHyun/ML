@@ -17,19 +17,18 @@ class CaptureAvailablePacer(
     private val backlogClock = AdmittedBacklogClock()
 
     /**
-     * Observes a draft start: refreshes the pacing prediction from the draft sequence's first leading-node budget
-     * (first-leading budget, mandatory RESERVED-tail upper bound, preferred draft-path upper bound) and rebases the
-     * admitted-backlog clock. The head is any leading workload (OPTIONAL Bokeh/Filter or REQUIRED
-     * Watermark/DynamicFunction); a RESERVED head is rejected upstream because the encoding would already be the
-     * first node, leaving no pre-encoding budget to pace from. A heavy REQUIRED-only capture (e.g. Watermark +
-     * encoding, no Bokeh/Filter) is paced through this path too. Level-based on purpose: every capture overwrites
-     * it, so a fresh burst paces from its own budget instead of a stale trend carried over from the previous burst.
+     * Observes a draft start: refreshes the pacing prediction from the draft sequence's current budget
+     * (draft-start budget, mandatory RESERVED upper bound, preferred draft-path upper bound) and rebases the
+     * admitted-backlog clock. The head is the first workload paced for this draft: OPTIONAL Bokeh/Filter, REQUIRED
+     * Watermark/DynamicFunction, or RESERVED Encoding for encoding-only captures. Level-based on purpose: every
+     * capture overwrites it, so a fresh burst paces from its own budget instead of a stale trend carried over from
+     * the previous burst.
      */
     @Synchronized
     fun observeDraftStart(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
         val estimate = predictor.estimateDraftPath(workloadSequenceKey)
         pacingPrediction = CaptureAvailablePacingPrediction(
-            firstLeadingBudgetMs = budgetMs,
+            draftStartBudgetMs = budgetMs,
             mandatoryReserveUpperBoundMs = estimate.mandatoryReserveUpperBoundMs,
             preferredDraftPathPredictedMs = estimate.predictedMs,
             preferredDraftPathUpperBoundMs = estimate.upperBoundMs,
@@ -39,7 +38,7 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * Decides the captureAvailable pacing delay for one admission. Null until the first leading sequence is observed,
+     * Decides the captureAvailable pacing delay for one admission. Null until the first draft sequence is observed,
      * so a fresh process' first capture is never paced.
      *
      * The delay is the larger of two deficits against the preferred draft-path upper bound:
@@ -55,7 +54,7 @@ class CaptureAvailablePacer(
         val prediction = pacingPrediction ?: return null
 
         val levelDeficitMs = positiveCeilMs(
-            prediction.preferredDraftPathUpperBoundMs - prediction.firstLeadingBudgetMs.coerceAtLeast(0L),
+            prediction.preferredDraftPathUpperBoundMs - prediction.draftStartBudgetMs.coerceAtLeast(0L),
         )
         val backlogMs = backlogClock.backlogMs()
         // Delaying the callback lets the backlog drain before the next capture's timeout clock starts, so the
@@ -106,8 +105,8 @@ class CaptureAvailablePacer(
         /**
          * A draft actually started: rebase on observation. The oldest waiting admission is the capture starting
          * now; the pipeline stays busy for its fresh prediction plus the admissions still waiting behind it.
-         * Push/pop mismatches (skipped callbacks, RESERVED-head captures) do not accumulate - every draft start
-         * recomputes the clock from scratch.
+         * Push/pop mismatches from skipped callbacks do not accumulate - every draft start recomputes the clock
+         * from scratch.
          */
         fun rebaseOnDraftStart(startingPredictedMs: Double) {
             waitingPredictedMsQueue.removeFirstOrNull()
@@ -134,7 +133,7 @@ class CaptureAvailablePacer(
  * itself is at risk.
  */
 data class CaptureAvailablePacingPrediction(
-    val firstLeadingBudgetMs: Long,
+    val draftStartBudgetMs: Long,
     val mandatoryReserveUpperBoundMs: Double,
     val preferredDraftPathPredictedMs: Double,
     val preferredDraftPathUpperBoundMs: Double,

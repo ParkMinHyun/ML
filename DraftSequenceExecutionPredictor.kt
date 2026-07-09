@@ -174,8 +174,8 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * Watchdog budget for the OPTIONAL workload at the head of [workloadSequenceKey]: the time left after reserving
-     * the sequence's mandatory RESERVED tail. REQUIRED workloads are measured but not reserved for.
-     * [WatchdogTimeoutDecision.decision] is null when the sequence has no mandatory tail - the whole budget is
+     * the sequence's mandatory RESERVED work. REQUIRED workloads are measured but not reserved for.
+     * [WatchdogTimeoutDecision.decision] is null when the sequence has no mandatory reserve - the whole budget is
      * granted and there is nothing to calibrate.
      */
     @Synchronized
@@ -183,13 +183,13 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val tailKeys = reservedTailWorkloadKeys(workloadSequenceKey)
-        if (tailKeys.isEmpty()) {
+        val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
+        if (reserveWorkloadKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
-        // The tail is RESERVED-only, so this internal decision's admit bit is unused.
-        val decision = predictAdmission(WorkloadSequenceKey(tailKeys), preExecutionMetrics)
+        // The reserve is RESERVED-only, so this internal decision's admit bit is unused.
+        val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
         val remainingBudgetMs = preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs
         val timeoutMs = when {
             remainingBudgetMs.isNaN() || remainingBudgetMs <= 0.0 -> 0L
@@ -200,10 +200,9 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    /** RESERVED workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
-    private fun reservedTailWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+    /** RESERVED workloads in the observed draft path, including a RESERVED head for encoding-only captures. */
+    private fun mandatoryReserveWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
-            .drop(1)
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
     }
 
@@ -287,20 +286,23 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Point/upper-bound estimates for [workloadSequenceKey] plus its mandatory RESERVED-tail upper bound, read in
+     * Point/upper-bound estimates for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in
      * one consistent model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with.
      */
     @Synchronized
     fun estimateDraftPath(workloadSequenceKey: WorkloadSequenceKey): DraftPathEstimate {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
-        val tailWorkloadKeys = reservedTailWorkloadKeys(workloadSequenceKey)
+        val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
         return DraftPathEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
             upperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs),
-            mandatoryReserveUpperBoundMs = if (tailWorkloadKeys.isEmpty()) {
+            mandatoryReserveUpperBoundMs = if (reserveWorkloadKeys.isEmpty()) {
                 0.0
             } else {
-                estimateUpperBoundMs(WorkloadSequenceKey(tailWorkloadKeys), tailWorkloadKeys.associateWith(::estimateWorkloadMs))
+                estimateUpperBoundMs(
+                    WorkloadSequenceKey(reserveWorkloadKeys),
+                    reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
+                )
             },
         )
     }
@@ -369,7 +371,7 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/** One consistent model snapshot for a draft path: point sum, sequence upper bound, mandatory RESERVED-tail upper bound. */
+/** One consistent model snapshot for a draft path: point sum, sequence upper bound, mandatory RESERVED upper bound. */
 data class DraftPathEstimate(
     val predictedMs: Double,
     val upperBoundMs: Double,

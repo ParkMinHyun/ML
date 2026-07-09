@@ -264,16 +264,16 @@ class CaptureMetricsExcelExporter(
             metric = "Pacing simulation",
             note = "Runtime pacing delay = MAX(level deficit, admitted-backlog deficit vs CAPTURE_TIMEOUT); the backlog " +
                     "term needs runtime admission times that CaptureMetrics does not persist, so this sheet reproduces the " +
-                    "level term only: optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - MAX(0, firstLeadingBudgetMs))). " +
+                    "level term only: optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - MAX(0, draftStartBudgetMs))). " +
                     "mandatoryReserveDeficitMs and optionalHeadroomMs remain as diagnostics; " +
                     "encodingReserveUpperBoundMs only classifies log severity (mandatory reserve at risk when budget < reserve). " +
-                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching the runtime CaptureAvailablePacer draft-start observation. " +
+                    "pacingTargetUpperBoundMs is the draft-start workload suffix UB, matching the runtime CaptureAvailablePacer observation. " +
                     "simulatedBudgetAfterPacingMs assumes 1ms callback delay contributes 1ms budget runway in the counterfactual replay. " +
                     "The policy has no prior callback-delay input, threshold, or device-tuned constant.",
         ),
         MetricNote(
             metric = "Queue-aware pacing simulation",
-            note = "Queue-aware pacing uses availableBudgetMs = firstLeadingBudgetMs - queuedDraftWorkMs; " +
+            note = "Queue-aware pacing uses availableBudgetMs = draftStartBudgetMs - queuedDraftWorkMs; " +
                     "queuedDraftWorkMs = MAX(0, CEIL(predictedDraftDurationMs - captureAvailableElapsedProxyMs)) * queuedDraftCountProxy. " +
                     "CaptureMetrics currently does not persist runtime captureAvailable elapsed time or runtime draft queue depth, " +
                     "so this exporter uses captureAvailableElapsedProxyMs=0 and queuedDraftCountProxy=sessionCaptureIndex-1 as a conservative burst proxy. " +
@@ -364,13 +364,12 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.isOverlayWatermarkWorkload && it.prediction != null }
 
         /**
-         * First leading node of the capture - the node whose budget the runtime CaptureAvailablePacer records at
-         * draft start. Leading = any predicted node before the encoding tail (Bokeh/Decoding/Filter/Watermark/
-         * DynamicFunction), so a REQUIRED-only capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring
-         * the runtime.
+         * Draft-start node of the capture - the node whose budget the runtime CaptureAvailablePacer records at
+         * draft start. This is the first predicted node in the configured sequence; encoding-only captures use the
+         * RESERVED Encoding row, mirroring the runtime.
          */
-        val firstLeadingRow: NodeRow?
-            get() = nodeRows.firstOrNull { it.prediction != null }?.takeIf { it != encodingReserveRow }
+        val draftStartRow: NodeRow?
+            get() = nodeRows.firstOrNull { it.prediction != null }
 
         /**
          * Encoding reserve node - the RESERVED tail, i.e. the last predicted node. Its suffix UB is exactly the
@@ -380,10 +379,10 @@ class CaptureMetricsExcelExporter(
         val encodingReserveRow: NodeRow?
             get() = nodeRows.lastOrNull { it.prediction != null }
 
-        /** Signed headroom above the mandatory reserve: first leading budget minus the encoding reserve UB. */
+        /** Signed headroom above the mandatory reserve: draft-start budget minus the encoding reserve UB. */
         val pacingSlackMs: Double?
             get() {
-                val budgetMs = firstLeadingRow?.node?.preExecutionMetrics?.budgetMs ?: return null
+                val budgetMs = draftStartRow?.node?.preExecutionMetrics?.budgetMs ?: return null
                 val reserveMs = mandatoryReserveUpperBoundMs ?: return null
                 return budgetMs - reserveMs
             }
@@ -392,12 +391,12 @@ class CaptureMetricsExcelExporter(
             get() = encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs
 
         val pacingTargetUpperBoundMs: Double?
-            get() = firstLeadingRow?.prediction?.sequencePredictedUpperBoundMs
+            get() = draftStartRow?.prediction?.sequencePredictedUpperBoundMs
 
         val budgetDeficitPacing: PacingSimulation?
             get() {
-                val leadingRow = firstLeadingRow ?: return null
-                val budgetMs = leadingRow.node.preExecutionMetrics.budgetMs
+                val startRow = draftStartRow ?: return null
+                val budgetMs = startRow.node.preExecutionMetrics.budgetMs
                 val reserveUpperBoundMs = mandatoryReserveUpperBoundMs ?: return null
                 val targetUpperBoundMs = pacingTargetUpperBoundMs ?: return null
                 val clampedBudgetMs = budgetMs.coerceAtLeast(0L)
@@ -410,7 +409,7 @@ class CaptureMetricsExcelExporter(
                 val simulatedBudgetAfterPacingMs = budgetMs + appliedDelayMs
 
                 return PacingSimulation(
-                    targetStage = pacingTargetStage(leadingRow),
+                    targetStage = pacingTargetStage(startRow),
                     budgetMs = budgetMs,
                     mandatoryReserveUpperBoundMs = reserveUpperBoundMs,
                     targetUpperBoundMs = targetUpperBoundMs,
@@ -479,10 +478,10 @@ class CaptureMetricsExcelExporter(
             }
 
         fun queueAwarePacing(captureAvailableElapsedMs: Long, queuedDraftCount: Int): PacingSimulation? {
-            val leadingRow = firstLeadingRow ?: return null
-            val timeoutBudgetMs = leadingRow.node.preExecutionMetrics.budgetMs
+            val startRow = draftStartRow ?: return null
+            val timeoutBudgetMs = startRow.node.preExecutionMetrics.budgetMs
             val requiredReserveMs = mandatoryReserveUpperBoundMs ?: return null
-            val predictedDraftDurationMs = leadingRow.prediction?.sequencePredictedDurationMs ?: return null
+            val predictedDraftDurationMs = startRow.prediction?.sequencePredictedDurationMs ?: return null
             val preferredDraftPathBudgetMs = pacingTargetUpperBoundMs ?: return null
             val captureAvailableElapsedProxyMs = captureAvailableElapsedMs.coerceAtLeast(0L)
             val queuedDraftCountProxy = queuedDraftCount.coerceAtLeast(0)
@@ -498,7 +497,7 @@ class CaptureMetricsExcelExporter(
             val simulatedBudgetAfterPacingMs = availableBudgetMs + appliedDelayMs
 
             return PacingSimulation(
-                targetStage = pacingTargetStage(leadingRow),
+                targetStage = pacingTargetStage(startRow),
                 budgetMs = timeoutBudgetMs,
                 mandatoryReserveUpperBoundMs = requiredReserveMs,
                 targetUpperBoundMs = preferredDraftPathBudgetMs,
@@ -1444,7 +1443,7 @@ class CaptureMetricsExcelExporter(
             Column("bokehObservedBudgetOverrun") { it.row.bokehObservedBudgetOverrun },
             Column("filterPredictedBudgetOverrun") { it.row.filterPredictedBudgetOverrun },
             Column("filterObservedBudgetOverrun") { it.row.filterObservedBudgetOverrun },
-            Column("firstLeadingBudgetMs") { it.row.firstLeadingRow?.node?.preExecutionMetrics?.budgetMs },
+            Column("draftStartBudgetMs") { it.row.draftStartRow?.node?.preExecutionMetrics?.budgetMs },
             Column("encodingReserveUpperBoundMs") { it.row.mandatoryReserveUpperBoundMs },
             Column("pacingTargetUpperBoundMs") { it.row.pacingTargetUpperBoundMs },
             Column("pacingSlackMs") { it.row.pacingSlackMs },

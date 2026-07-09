@@ -37,7 +37,7 @@ sealed interface WorkloadKey {
             if (watermarkType == WatermarkType.FRAME) WorkloadPolicy.REQUIRED else WorkloadPolicy.OPTIONAL
     }
 
-    /** JPEG-to-YUV prerequisite for downstream optional YUV effects. */
+    /** JPEG-to-YUV prerequisite for downstream YUV effects; Frame Watermark forces it to run. */
     data class Decoding(override val sizeBucket: SizeBucket) : WorkloadKey {
         override val policy: WorkloadPolicy = WorkloadPolicy.OPTIONAL
     }

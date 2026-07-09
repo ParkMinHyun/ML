@@ -106,7 +106,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             final CaptureAvailablePacingPrediction pacingPrediction = pacingDecision.getPrediction();
 
             appliedDelayMs = pacingDecision.getDelayMs();
-            warning = pacingPrediction.getFirstLeadingBudgetMs() < pacingPrediction.getMandatoryReserveUpperBoundMs();
+            warning = pacingPrediction.getDraftStartBudgetMs() < pacingPrediction.getMandatoryReserveUpperBoundMs();
 
             if (warning) {
                 reason = "mandatory reserve at risk - pace preferred draft path by " + appliedDelayMs + "ms";
@@ -118,7 +118,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 reason = "budget is enough";
             }
 
-            pacingDetails = ", firstLeadingBudget=" + pacingPrediction.getFirstLeadingBudgetMs() + "ms"
+            pacingDetails = ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
                     + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
                     + ", preferredDraftPathPredicted=" + pacingPrediction.getPreferredDraftPathPredictedMs() + "ms"
                     + ", preferredDraftPathUpperBound=" + pacingPrediction.getPreferredDraftPathUpperBoundMs() + "ms"

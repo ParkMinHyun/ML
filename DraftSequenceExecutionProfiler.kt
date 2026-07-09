@@ -40,11 +40,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
-    private var optionalEnhancementChainRejected = false
+    private var skipRemainingYuvEffects = false
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
-     * Bokeh pacing uses the full planned suffix even before the second input arrives.
+     * Bokeh pacing uses the full planned suffix even before the second input arrives; encoding-only captures pace
+     * the RESERVED Encoding sequence so captureAvailable admission and draft-start observations stay balanced.
      */
     fun initializeDraftNodeChain(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -53,13 +54,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
             workloadKeyFor(plannedNode, requireReadyToRun = false)
         }
-        val leadingIndex = plannedWorkloadKeys.indexOfFirst { it.policy != WorkloadPolicy.RESERVED }
-        if (leadingIndex < 0) {
+        if (plannedWorkloadKeys.isEmpty()) {
             return
         }
 
         captureAvailablePacer.observeDraftStart(
-            WorkloadSequenceKey(plannedWorkloadKeys.drop(leadingIndex)),
+            WorkloadSequenceKey(plannedWorkloadKeys),
             readBudgetMs(),
         )
     }
@@ -67,10 +67,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     /**
      * Profiles one predictable node execution.
      *
-     * OPTIONAL workloads are admitted by their remaining suffix UB. JPEG-path Decoding, Filter, and Overlay
-     * Watermark are a dependent enhancement chain: rejecting Decoding or Filter rejects downstream optional effects.
-     * REQUIRED workloads (DynamicFunction / Frame Watermark) always run but are not reserve-protected; RESERVED
-     * workload is the mandatory tail.
+     * OPTIONAL workloads are admitted by their remaining suffix UB. JPEG-path Decoding is forced when required by
+     * Frame Watermark; otherwise, rejecting Decoding or Filter rejects downstream YUV effects. REQUIRED workloads
+     * (DynamicFunction / Frame Watermark) always run but are not reserve-protected; RESERVED workload is the
+     * mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
@@ -83,7 +83,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
 
         val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
-        val effectiveAdmit = effectiveAdmit(workloadKey, decision.executionPrediction.admit)
+        val effectiveAdmit = effectiveAdmit(workloadSequenceKey, decision.executionPrediction.admit)
         val effectiveDecision = decision.copy(
             executionPrediction = decision.executionPrediction.copy(admit = effectiveAdmit),
         )
@@ -100,12 +100,23 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
     }
 
-    private fun effectiveAdmit(workloadKey: WorkloadKey, modelAdmit: Boolean): Boolean {
-        val admit = modelAdmit &&
-                !(optionalEnhancementChainRejected && workloadKey.dependsOnOptionalEnhancementChain())
-        if (!admit && workloadKey.rejectsDownstreamOptionalEnhancements()) {
-            optionalEnhancementChainRejected = true
+    private fun effectiveAdmit(workloadSequenceKey: WorkloadSequenceKey, modelAdmit: Boolean): Boolean {
+        val workloadKey = workloadSequenceKey.headWorkloadKey
+        if (workloadKey is WorkloadKey.Decoding && workloadSequenceKey.hasFrameWatermark()) {
+            return true
         }
+        // TODO : Refactoring
+        val admit = when {
+            skipRemainingYuvEffects && workloadKey is WorkloadKey.Filter -> false
+            skipRemainingYuvEffects && workloadKey is WorkloadKey.Watermark ->
+                workloadKey.watermarkType == WatermarkType.FRAME
+            else -> modelAdmit
+        }
+
+        if (!admit && (workloadKey is WorkloadKey.Decoding || workloadKey is WorkloadKey.Filter)) {
+            skipRemainingYuvEffects = true
+        }
+
         return admit
     }
 
@@ -217,22 +228,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun deinitializeDraftNodeChain() {
         nodeChainLifecycle.deinitializeWhenIdle()
     }
-}
-
-// Dependent optional enhancement chain, in fixed pipeline order: Decoding -> Filter -> Overlay Watermark.
-// Rejecting an upstream link (its own budget reject or an inherited one) skips every dependent link after it;
-// Frame Watermark is REQUIRED and never participates.
-
-private fun WorkloadKey.dependsOnOptionalEnhancementChain(): Boolean = when (this) {
-    is WorkloadKey.Filter -> true
-    is WorkloadKey.Watermark -> watermarkType == WatermarkType.OVERLAY
-    else -> false
-}
-
-private fun WorkloadKey.rejectsDownstreamOptionalEnhancements(): Boolean = when (this) {
-    is WorkloadKey.Decoding,
-    is WorkloadKey.Filter -> true
-    else -> false
 }
 
 /**

@@ -1,5 +1,7 @@
 package com.samsung.android.camera.core2.ml
 
+import com.samsung.android.camera.watermark.Watermark.WatermarkType
+
 /** Key identifying the ordered workload suffix of a decision, e.g. [Bokeh, DynamicFunction, Filter, Watermark, Encoding]. */
 data class WorkloadSequenceKey(val workloadKeys: List<WorkloadKey>) {
 
@@ -13,6 +15,12 @@ data class WorkloadSequenceKey(val workloadKeys: List<WorkloadKey>) {
      */
     val headWorkloadKey: WorkloadKey
         get() = workloadKeys.first()
+
+    fun hasFrameWatermark(): Boolean {
+        return workloadKeys.any { workloadKey ->
+            workloadKey is WorkloadKey.Watermark && workloadKey.watermarkType == WatermarkType.FRAME
+        }
+    }
 }
 
 /** Decision-time sequence in replay format, e.g. "BOKEH(...)>FILTER(...)>ENCODING(...)". */
