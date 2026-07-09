@@ -260,11 +260,12 @@ class CaptureMetricsExcelExporter(
         ),
         MetricNote(
             metric = "Pacing simulation",
-            note = "Budget-deficit pacing delay = mandatoryReserveDeficitMs + MIN(optionalAdmissionDeficitMs, optionalHeadroomMs). " +
-                    "mandatoryReserveDeficitMs = CEIL(MAX(0, encodingReserveUpperBoundMs - firstLeadingBudgetMs)); " +
-                    "optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - firstLeadingBudgetMs)); " +
-                    "optionalHeadroomMs = FLOOR(MAX(0, firstLeadingBudgetMs - encodingReserveUpperBoundMs)). " +
-                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching runtime observeCaptureAvailablePacing. " +
+            note = "Runtime pacing delay = MAX(level deficit, admitted-backlog deficit vs CAPTURE_TIMEOUT); the backlog " +
+                    "term needs runtime admission times that CaptureMetrics does not persist, so this sheet reproduces the " +
+                    "level term only: optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - MAX(0, firstLeadingBudgetMs))). " +
+                    "mandatoryReserveDeficitMs and optionalHeadroomMs remain as diagnostics; " +
+                    "encodingReserveUpperBoundMs only classifies log severity (mandatory reserve at risk when budget < reserve). " +
+                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching runtime updateCaptureAvailablePacing. " +
                     "simulatedBudgetAfterPacingMs assumes 1ms callback delay contributes 1ms budget runway in the counterfactual replay. " +
                     "The policy has no prior callback-delay input, threshold, or device-tuned constant.",
         ),
@@ -355,7 +356,7 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
 
         /**
-         * First leading node of the capture - the node whose budget the runtime observeCaptureAvailablePacing records. Leading =
+         * First leading node of the capture - the node whose budget the runtime updateCaptureAvailablePacing records. Leading =
          * any predicted node before the encoding tail (Bokeh/Filter/Watermark/DynamicFunction), so a REQUIRED-only
          * capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
          */
@@ -390,10 +391,13 @@ class CaptureMetricsExcelExporter(
                 val budgetMs = leadingRow.node.preExecutionMetrics.budgetMs
                 val reserveUpperBoundMs = mandatoryReserveUpperBoundMs ?: return null
                 val targetUpperBoundMs = pacingTargetUpperBoundMs ?: return null
-                val mandatoryDeficitMs = positiveCeilMs(reserveUpperBoundMs - budgetMs)
-                val optionalDeficitMs = positiveCeilMs(targetUpperBoundMs - budgetMs)
-                val optionalHeadroomMs = positiveFloorMs(budgetMs - reserveUpperBoundMs)
-                val appliedDelayMs = mandatoryDeficitMs + minOf(optionalDeficitMs, optionalHeadroomMs)
+                val clampedBudgetMs = budgetMs.coerceAtLeast(0L)
+                val mandatoryDeficitMs = positiveCeilMs(reserveUpperBoundMs - clampedBudgetMs)
+                val optionalDeficitMs = positiveCeilMs(targetUpperBoundMs - clampedBudgetMs)
+                val optionalHeadroomMs = positiveFloorMs(clampedBudgetMs - reserveUpperBoundMs)
+                // Mirrors CaptureAvailableApmPolicy monotone pacing: delay = full preferred-path deficit.
+                // mandatoryDeficitMs / optionalHeadroomMs stay as diagnostic columns only.
+                val appliedDelayMs = optionalDeficitMs
                 val simulatedBudgetAfterPacingMs = budgetMs + appliedDelayMs
 
                 return PacingSimulation(
@@ -475,11 +479,8 @@ class CaptureMetricsExcelExporter(
             val mandatoryReserveShortageMs = positiveCeilMs(requiredReserveMs - availableBudgetMs)
             val preferredBudgetShortageMs = positiveCeilMs(preferredDraftPathBudgetMs - availableBudgetMs)
             val optionalBudgetHeadroomMs = positiveFloorMs(availableBudgetMs - requiredReserveMs)
-            val appliedDelayMs = if (mandatoryReserveShortageMs > 0L) {
-                mandatoryReserveShortageMs
-            } else {
-                minOf(preferredBudgetShortageMs, optionalBudgetHeadroomMs)
-            }
+            // Mirrors CaptureAvailableApmPolicy monotone pacing: delay = full preferred-path deficit.
+            val appliedDelayMs = preferredBudgetShortageMs
             val simulatedBudgetAfterPacingMs = availableBudgetMs + appliedDelayMs
 
             return PacingSimulation(

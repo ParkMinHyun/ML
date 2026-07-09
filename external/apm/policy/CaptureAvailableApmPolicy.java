@@ -23,6 +23,7 @@ import androidx.annotation.NonNull;
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingPrediction;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.util.PLog;
@@ -31,13 +32,17 @@ import java.util.List;
 
 /**
  * <div class="camera_en">
- * Policy that schedules captureAvailable callbacks from draft budget deficits: callbacks are sent immediately when
- * budget is enough, or delayed only within the mandatory reserve / preferred draft-path budget gap.
+ * Policy that paces captureAvailable callbacks by learned deficits only: the delay is the larger of the observed
+ * budget deficit and the admitted-backlog deficit against the capture timeout. An empty draft pipeline is never
+ * delayed, so burst responsiveness is preserved until the timeout allowance is genuinely spent; no tuned constant
+ * or threshold is involved. The mandatory reserve upper bound only classifies log severity.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
- * draft budget 부족분을 기준으로 captureAvailable 콜백을 스케줄링합니다. budget이 충분하면 즉시 보내고,
- * 부족하면 mandatory reserve / preferred draft-path budget 범위 안에서만 지연합니다.
+ * 학습된 부족분만으로 captureAvailable 콜백을 pacing합니다. 관측 budget 부족분과 admission backlog 부족분
+ * (capture timeout 대비) 중 큰 값을 지연으로 사용합니다. draft 파이프라인이 비어 있으면 지연하지 않아
+ * 연속 촬영 반응성이 유지되며, 튜닝 상수나 임계값을 쓰지 않습니다.
+ * mandatory reserve 상한은 로그 심각도 분류에만 사용합니다.
  * </div>
  */
 public class CaptureAvailableApmPolicy extends ApmPolicy {
@@ -76,60 +81,55 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Calculates a budget-deficit captureAvailable delay, then schedules the provided {@code runnable}.
+     * Delegates the pacing decision to the predictor, then schedules the provided {@code runnable} after the
+     * decided delay.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * draft budget 부족분을 기준으로 지연을 구하고, 제공된 {@code runnable}을 스케줄링합니다.
+     * pacing 결정을 predictor에 위임하고, 결정된 지연 후 {@code runnable}을 스케줄링합니다.
      * </div>
      *
      * @param sequenceId sequenceId
-     * @param runnable The task to be executed after the calculated delay.
+     * @param runnable The task to be executed after the decided delay.
      * @return {@code false} indicating the policy does not repeat automatically.
      */
     @Override
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
-        final CaptureAvailablePacingPrediction pacingPrediction = DraftSequenceExecutionPredictor.getInstance().captureAvailablePacingPrediction();
+        final CaptureAvailablePacingDecision pacingDecision = DraftSequenceExecutionPredictor.getInstance().decideCaptureAvailablePacing();
 
         long appliedDelayMs = 0L;
         boolean warning = false;
         String reason = "captureAvailable pacing waits for the first draft prediction";
         String pacingDetails = "";
 
-        if (pacingPrediction != null) {
-            final long firstLeadingBudgetMs = pacingPrediction.getFirstLeadingBudgetMs();
-            final double mandatoryReserveUpperBoundMs = pacingPrediction.getMandatoryReserveUpperBoundMs();
-            final double preferredDraftPathUpperBoundMs = pacingPrediction.getPreferredDraftPathUpperBoundMs();
+        if (pacingDecision != null) {
+            final CaptureAvailablePacingPrediction pacingPrediction = pacingDecision.getPrediction();
 
-            final long mandatoryReserveShortageMs = Math.max(0L, (long) Math.ceil(mandatoryReserveUpperBoundMs - firstLeadingBudgetMs));
-            final long preferredBudgetShortageMs = Math.max(0L, (long) Math.ceil(preferredDraftPathUpperBoundMs - firstLeadingBudgetMs));
-            final long optionalBudgetHeadroomMs = Math.max(0L, (long) Math.floor(firstLeadingBudgetMs - mandatoryReserveUpperBoundMs));
+            appliedDelayMs = pacingDecision.getDelayMs();
+            warning = pacingPrediction.getFirstLeadingBudgetMs() < pacingPrediction.getMandatoryReserveUpperBoundMs();
 
-            if (mandatoryReserveShortageMs > 0L) {
-                appliedDelayMs = mandatoryReserveShortageMs;
-                warning = true;
-                reason = "protect mandatory reserve by " + mandatoryReserveShortageMs + "ms";
-            } else if (preferredBudgetShortageMs > 0L) {
-                appliedDelayMs = Math.min(preferredBudgetShortageMs, optionalBudgetHeadroomMs);
-                reason = appliedDelayMs > 0L
-                        ? "pace optional draft path by " + appliedDelayMs + "ms"
-                        : "optional draft path lacks budget but mandatory reserve has no headroom";
+            if (warning) {
+                reason = "mandatory reserve at risk - pace preferred draft path by " + appliedDelayMs + "ms";
+            } else if (appliedDelayMs > pacingDecision.getLevelDeficitMs()) {
+                reason = "pace admitted draft backlog by " + appliedDelayMs + "ms";
+            } else if (appliedDelayMs > 0L) {
+                reason = "pace preferred draft path by " + appliedDelayMs + "ms";
             } else {
                 reason = "budget is enough";
             }
 
-            pacingDetails = ", firstLeadingBudget=" + firstLeadingBudgetMs + "ms"
-                    + ", mandatoryReserveUpperBound=" + mandatoryReserveUpperBoundMs + "ms"
-                    + ", preferredDraftPathUpperBound=" + preferredDraftPathUpperBoundMs + "ms"
-                    + ", mandatoryReserveShortage=" + mandatoryReserveShortageMs + "ms"
-                    + ", preferredBudgetShortage=" + preferredBudgetShortageMs + "ms"
-                    + ", optionalBudgetHeadroom=" + optionalBudgetHeadroomMs + "ms"
+            pacingDetails = ", firstLeadingBudget=" + pacingPrediction.getFirstLeadingBudgetMs() + "ms"
+                    + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
+                    + ", preferredDraftPathPredicted=" + pacingPrediction.getPreferredDraftPathPredictedMs() + "ms"
+                    + ", preferredDraftPathUpperBound=" + pacingPrediction.getPreferredDraftPathUpperBoundMs() + "ms"
+                    + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
+                    + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
                     + ", workloadSequenceKey=" + pacingPrediction.getWorkloadSequenceKey();
         }
 
         final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, appliedDelayMs);
         final String message = "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
-                + ", pacingPredictionAvailable=" + (pacingPrediction != null)
+                + ", pacingPredictionAvailable=" + (pacingDecision != null)
                 + ", appliedDelay=" + appliedDelayMs + "ms"
                 + pacingDetails
                 + ", scheduled=" + scheduled;
