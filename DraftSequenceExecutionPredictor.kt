@@ -13,15 +13,15 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated at
  * decision-sequence level from positive residual ratios captured before workload EWMA updates.
  *
- * Besides admission, it feeds captureAvailable pacing: [observeCaptureAvailableSlack] caches the first leading-node
- * budget's headroom above the RESERVE tail, exposed via [captureAvailableSlackMs].
+ * Besides admission, it feeds captureAvailable pacing: [updateCaptureAvailablePacing] updates the latest
+ * captureAvailable pacing prediction exposed via [captureAvailablePacingPrediction].
  */
 class DraftSequenceExecutionPredictor {
 
-    private val durationTrendByWorkload = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
-    private val residualsBySequence = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
-    private val residualsByShape = mutableMapOf<WorkloadSequenceShape, MutableList<ResidualSample>>()
-    private var observedSlackMs: Long? = null
+    private val workloadKeyDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
+    private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
+    private val workloadSequenceShapeResidualMap = mutableMapOf<WorkloadSequenceShape, MutableList<ResidualSample>>()
+    private var captureAvailablePacingPrediction: CaptureAvailablePacingPrediction? = null
 
     @Synchronized
     fun predictAdmission(
@@ -34,12 +34,12 @@ class DraftSequenceExecutionPredictor {
         val sequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
-            WorkloadPolicy.ADMIT -> fitsUpperBoundBudget(
+            WorkloadPolicy.OPTIONAL -> fitsUpperBoundBudget(
                 sequencePredictedMs,
                 sequenceUpperBoundMs,
                 preExecutionMetrics.budgetMs,
             )
-            WorkloadPolicy.OBSERVE, WorkloadPolicy.RESERVE -> true
+            WorkloadPolicy.REQUIRED, WorkloadPolicy.RESERVED -> true
         }
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
@@ -54,8 +54,8 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * ADMIT gate. Admission is bounded by the learned sequence upper bound only; budget slack is observed separately
-     * and consumed by [captureAvailableSlackMs] as captureAvailable pacing.
+     * OPTIONAL gate. Admission is bounded by the learned sequence upper bound only; budget slack is observed separately
+     * and consumed by [captureAvailablePacingPrediction] as captureAvailable pacing.
      */
     private fun fitsUpperBoundBudget(
         sequencePredictedMs: Double,
@@ -81,7 +81,7 @@ class DraftSequenceExecutionPredictor {
         // used as-is, never scaled down (a heavy MP24 bounds MP12 at its full value, not halved) - the ratio floors at
         // 1.0. max() over siblings only raises the estimate; the ratio-1.0 sibling is the workload's own model.
         // Predict-time only: the scaled value is never fed back into any model, so buckets never learn from each other.
-        return durationTrendByWorkload.entries
+        return workloadKeyDurationTrendMap.entries
             .filter { it.key.javaClass == workloadKey.javaClass }
             .maxOfOrNull { (siblingKey, model) ->
                 model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
@@ -129,8 +129,8 @@ class DraftSequenceExecutionPredictor {
 
     private fun residualScoreFor(workloadSequenceKey: WorkloadSequenceKey): Double {
         return selectResidualScore(
-            sequenceSamples = residualsBySequence[workloadSequenceKey].orEmpty(),
-            compatibleSamples = residualsByShape[workloadSequenceKey.shape].orEmpty(),
+            sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey].orEmpty(),
+            compatibleSamples = workloadSequenceShapeResidualMap[workloadSequenceKey.shape].orEmpty(),
         )
     }
 
@@ -185,8 +185,8 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Watchdog budget for the ADMIT workload at the head of [workloadSequenceKey]: the time left after reserving
-     * the sequence's mandatory RESERVE tail. OBSERVE workloads are measured but not reserved for.
+     * Watchdog budget for the OPTIONAL workload at the head of [workloadSequenceKey]: the time left after reserving
+     * the sequence's mandatory RESERVED tail. REQUIRED workloads are measured but not reserved for.
      * [WatchdogTimeoutDecision.decision] is null when the sequence has no mandatory tail - the whole budget is
      * granted and there is nothing to calibrate.
      */
@@ -195,12 +195,12 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val tailKeys = reserveTailKeys(workloadSequenceKey)
+        val tailKeys = reservedTailWorkloadKeys(workloadSequenceKey)
         if (tailKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
-        // The tail is RESERVE-only, so this internal decision's admit bit is unused.
+        // The tail is RESERVED-only, so this internal decision's admit bit is unused.
         val decision = predictAdmission(WorkloadSequenceKey(tailKeys), preExecutionMetrics)
         val remainingBudgetMs = preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs
         val timeoutMs = when {
@@ -212,11 +212,11 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    /** RESERVE workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
-    private fun reserveTailKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+    /** RESERVED workloads after the head - the mandatory tail that both the watchdog and pacing reserve against. */
+    private fun reservedTailWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
             .drop(1)
-            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVE }
+            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
     }
 
     @Synchronized
@@ -229,7 +229,7 @@ class DraftSequenceExecutionPredictor {
         addResidualSamples(validWorkloadDurations, admissionDecisions)
 
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            durationTrendByWorkload.getOrPut(workloadKey) { WorkloadDurationTrend() }
+            workloadKeyDurationTrendMap.getOrPut(workloadKey) { WorkloadDurationTrend() }
                 .observeDurationMs(durationMs.toDouble())
         }
     }
@@ -253,8 +253,8 @@ class DraftSequenceExecutionPredictor {
 
         decayResidualWeights()
         samples.forEach { (workloadSequenceKey, sample) ->
-            residualsBySequence.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
-            residualsByShape.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
+            workloadSequenceKeyResidualMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
+            workloadSequenceShapeResidualMap.getOrPut(workloadSequenceKey.shape) { mutableListOf() } += sample
         }
     }
 
@@ -285,8 +285,8 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun decayResidualWeights() {
-        residualsBySequence.values.forEach { it.decayAndPrune() }
-        residualsByShape.values.forEach { it.decayAndPrune() }
+        workloadSequenceKeyResidualMap.values.forEach { it.decayAndPrune() }
+        workloadSequenceShapeResidualMap.values.forEach { it.decayAndPrune() }
     }
 
     private fun MutableList<ResidualSample>.decayAndPrune() {
@@ -299,38 +299,44 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Caches captureAvailable pacing slack from the draft sequence's first leading-node budget: the headroom left
-     * above the learned RESERVE tail (encoding) - the same reserve [predictWatchdogTimeout] grants against.
-     * The head is any leading workload (ADMIT Bokeh/Filter or OBSERVE Watermark/DynamicFunction); a RESERVE head is
+     * Updates the latest captureAvailable pacing prediction from the draft sequence's first leading-node budget:
+     * first-leading budget, mandatory RESERVED-tail upper bound, and preferred draft-path upper bound.
+     * The head is any leading workload (OPTIONAL Bokeh/Filter or REQUIRED Watermark/DynamicFunction); a RESERVED head is
      * rejected because the encoding would already be the first node, leaving no pre-encoding budget to pace from.
-     * A heavy OBSERVE-only capture (e.g. Watermark + encoding, no Bokeh/Filter) is paced through this path too.
+     * A heavy REQUIRED-only capture (e.g. Watermark + encoding, no Bokeh/Filter) is paced through this path too.
      * Level-based on purpose: every capture overwrites it, so a fresh burst paces from its own budget instead of a
      * stale trend carried over from the previous burst.
      */
     @Synchronized
-    fun observeCaptureAvailableSlack(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
-        if (workloadSequenceKey.headWorkloadKey.policy == WorkloadPolicy.RESERVE) {
-            return
-        }
-
-        val tailKeys = reserveTailKeys(workloadSequenceKey)
-        val reserveUpperBoundMs = if (tailKeys.isEmpty()) {
+    fun updateCaptureAvailablePacing(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
+        val preferredDraftPathUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
+        val tailWorkloadKeys = reservedTailWorkloadKeys(workloadSequenceKey)
+        val mandatoryReserveUpperBoundMs = if (tailWorkloadKeys.isEmpty()) {
             0.0
         } else {
-            estimateUpperBoundMs(WorkloadSequenceKey(tailKeys), tailKeys.associateWith(::estimateWorkloadMs))
+            estimateUpperBoundMs(WorkloadSequenceKey(tailWorkloadKeys), tailWorkloadKeys.associateWith(::estimateWorkloadMs))
         }
-        observedSlackMs = (budgetMs - reserveUpperBoundMs).roundToLong()
+        captureAvailablePacingPrediction = CaptureAvailablePacingPrediction(
+            firstLeadingBudgetMs = budgetMs,
+            mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
+            preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
+            workloadSequenceKey = workloadSequenceKey.toReplayString(),
+        )
     }
 
     /**
-     * CaptureAvailable pacing slack: budget headroom above the RESERVE tail of the latest observed sequence.
-     * Consumers spend it 1:1 as an advance on legacy service-rate pacing - 1ms of slack is 1ms of advance, no tuning
-     * constant - so the budget parks at the reserve instead of draining until the admission gate rejects. Negative
-     * means the budget is already below the reserve (full pacing; admission is rejecting in the same state).
-     * Null until the first ADMIT sequence is observed - callers keep legacy pacing until then.
+     * Latest captureAvailable pacing prediction. Null until the first leading sequence is observed, so callers do not
+     * pace the first capture of a fresh process before the model has runtime context.
      */
     @Synchronized
-    fun captureAvailableSlackMs(): Long? = observedSlackMs
+    fun captureAvailablePacingPrediction(): CaptureAvailablePacingPrediction? = captureAvailablePacingPrediction
+
+    /** Clears captureAvailable pacing state when the draft task queue is fully drained. */
+    @Synchronized
+    fun clearCaptureAvailablePacing() {
+        captureAvailablePacingPrediction = null
+    }
 
     /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
     private class WorkloadDurationTrend {
@@ -394,4 +400,14 @@ data class WatchdogTimeoutDecision(
     val timeoutMs: Long,
     /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
     val decision: AdmissionDecision?,
+)
+
+/**
+ * Latest runtime prediction for captureAvailable pacing. The policy converts it to a callback delay from budget deficits.
+ */
+data class CaptureAvailablePacingPrediction(
+    val firstLeadingBudgetMs: Long,
+    val mandatoryReserveUpperBoundMs: Double,
+    val preferredDraftPathUpperBoundMs: Double,
+    val workloadSequenceKey: String,
 )

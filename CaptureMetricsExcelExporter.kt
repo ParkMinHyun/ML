@@ -9,6 +9,8 @@ import org.apache.poi.ss.usermodel.Workbook
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.ceil
+import kotlin.math.floor
 
 class CaptureMetricsExcelExporter(
     private val context: Context,
@@ -18,7 +20,22 @@ class CaptureMetricsExcelExporter(
     private class EnrichedCaptureRow(
         val row: CaptureRow,
         val sessionSummary: SessionSummary,
-    )
+    ) {
+        val queueAwareCaptureAvailableElapsedProxyMs: Long
+            get() = QUEUE_AWARE_CAPTURE_AVAILABLE_ELAPSED_PROXY_MS
+
+        val queueAwareQueuedDraftCountProxy: Int
+            get() = (sessionSummary.sessionCaptureIndex - 1).coerceAtLeast(0)
+
+        val queueAwarePacing: PacingSimulation?
+            get() = row.queueAwarePacing(
+                captureAvailableElapsedMs = queueAwareCaptureAvailableElapsedProxyMs,
+                queuedDraftCount = queueAwareQueuedDraftCountProxy,
+            )
+
+        val queueAwarePacingInputSource: String
+            get() = "proxy: captureAvailableElapsed=0ms, queuedDraftCount=sessionCaptureIndex-1"
+    }
 
     suspend fun export(): File {
         val outputDir = context.getExternalFilesDir(DIR_NAME)
@@ -61,6 +78,7 @@ class CaptureMetricsExcelExporter(
             writeSheet(workbook, styles, "PolicyOutcome", buildPolicyOutcomeSummaries(enrichedNormalCaptures), buildPolicyOutcomeColumns())
             writeSheet(workbook, styles, "ReviewMetrics", buildReviewMetricSummaries(enrichedNormalCaptures), buildReviewMetricColumns())
             writeSheet(workbook, styles, "SimulationScenarios", buildSimulationScenarioSummaries(enrichedNormalCaptures), buildSimulationScenarioColumns())
+            writeSheet(workbook, styles, "PacingSimulation", buildPacingSimulationSummaries(enrichedNormalCaptures), buildPacingSimulationColumns())
             writeSheet(workbook, styles, "MetricNotes", buildMetricNotes(), buildMetricNoteColumns())
 
             // Write main sheet
@@ -109,7 +127,7 @@ class CaptureMetricsExcelExporter(
                 it.metrics.draftSequenceMetrics?.isTimeout == true
             }.takeIf { it >= 0 }?.let { it + 1 }
 
-            group.forEach { groupMember ->
+            group.forEachIndexed { indexInSession, groupMember ->
                 val bokehRows = groupMember.nodeRows.filter { it.isBokehWorkload && it.prediction != null }
                 val filterRows = groupMember.nodeRows.filter { it.isFilterWorkload && it.prediction != null }
                 bokehAdmitCount += bokehRows.count { it.prediction?.admit == true }
@@ -120,6 +138,7 @@ class CaptureMetricsExcelExporter(
                 val sessionSummary = SessionSummary(
                     sessionId = sessionId,
                     sessionShotCount = group.size,
+                    sessionCaptureIndex = indexInSession + 1,
                     sessionTimeoutShotCount = sessionTimeoutShotCount,
                     sessionBokehAdmitCount = bokehAdmitCount,
                     sessionBokehTotalCount = bokehTotalCount,
@@ -177,13 +196,33 @@ class CaptureMetricsExcelExporter(
         }
     }
 
-    private fun captureGroups(captures: List<CaptureRow>): List<CaptureGroup> {
+    private fun buildPacingSimulationSummaries(captures: List<EnrichedCaptureRow>): List<PacingSimulationSummary> {
+        return enrichedCaptureGroups(captures).flatMap { group ->
+            PacingSimulationSummary.from(group.name, group.captures)
+        }
+    }
+
+    private fun captureGroups(captures: List<CaptureRow>): List<CaptureGroup<CaptureRow>> {
         if (captures.isEmpty()) {
             return listOf(CaptureGroup("All", captures))
         }
 
         val groups = mutableListOf(CaptureGroup("All", captures))
         captures.groupBy { it.firstNodeLowMemoryLabel() }
+            .toSortedMap()
+            .forEach { (name, groupCaptures) ->
+                groups += CaptureGroup(name, groupCaptures)
+            }
+        return groups
+    }
+
+    private fun enrichedCaptureGroups(captures: List<EnrichedCaptureRow>): List<CaptureGroup<EnrichedCaptureRow>> {
+        if (captures.isEmpty()) {
+            return listOf(CaptureGroup("All", captures))
+        }
+
+        val groups = mutableListOf(CaptureGroup("All", captures))
+        captures.groupBy { it.row.firstNodeLowMemoryLabel() }
             .toSortedMap()
             .forEach { (name, groupCaptures) ->
                 groups += CaptureGroup(name, groupCaptures)
@@ -221,15 +260,21 @@ class CaptureMetricsExcelExporter(
         ),
         MetricNote(
             metric = "Pacing simulation",
-            note = "Slack-policy delay = MAX(0, MIN(legacyDelay, legacyDelay - pacingSlackMs)). " +
-                    "Trend-policy delay: EWMA(alpha=0.3) over firstLeadingBudgetMs deltas between consecutive same-session rows; " +
-                    "negative trend * 1.43 capped at legacyDelay, positive trend * 0.3 subtracted from legacyDelay. " +
-                    "legacyDelay = MAX(0, AVERAGE(last 3 draftNodeDurationMs) - captureAvailableTime); captureAvailableTime is " +
-                    "not stored in capture metrics - take it per capture from CaptureAvailableApmPolicy logs. " +
-                    "firstLeadingBudgetMs is the budget at the first leading node (Bokeh/Filter/Watermark/DynamicFunction), " +
-                    "so OBSERVE-only captures are paced too, matching the runtime. encodingReserveUpperBoundMs is the encoding " +
-                    "tail's suffix UB (= runtime reserve over the RESERVE tail); pacingSlackMs is signed while the runtime watchdog " +
-                    "value clamps at 0.",
+            note = "Budget-deficit pacing delay = mandatoryReserveDeficitMs + MIN(optionalAdmissionDeficitMs, optionalHeadroomMs). " +
+                    "mandatoryReserveDeficitMs = CEIL(MAX(0, encodingReserveUpperBoundMs - firstLeadingBudgetMs)); " +
+                    "optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - firstLeadingBudgetMs)); " +
+                    "optionalHeadroomMs = FLOOR(MAX(0, firstLeadingBudgetMs - encodingReserveUpperBoundMs)). " +
+                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching runtime observeCaptureAvailablePacing. " +
+                    "simulatedBudgetAfterPacingMs assumes 1ms callback delay contributes 1ms budget runway in the counterfactual replay. " +
+                    "The policy has no prior callback-delay input, threshold, or device-tuned constant.",
+        ),
+        MetricNote(
+            metric = "Queue-aware pacing simulation",
+            note = "Queue-aware pacing uses availableBudgetMs = firstLeadingBudgetMs - queuedDraftWorkMs; " +
+                    "queuedDraftWorkMs = MAX(0, CEIL(predictedDraftDurationMs - captureAvailableElapsedProxyMs)) * queuedDraftCountProxy. " +
+                    "CaptureMetrics currently does not persist runtime captureAvailable elapsed time or runtime draft queue depth, " +
+                    "so this exporter uses captureAvailableElapsedProxyMs=0 and queuedDraftCountProxy=sessionCaptureIndex-1 as a conservative burst proxy. " +
+                    "Add runtime fields later to replace these proxy columns without changing the derived columns.",
         ),
     )
 
@@ -310,27 +355,62 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.isFilterWorkload && it.prediction != null }
 
         /**
-         * First leading node of the capture - the node whose budget the runtime observeCaptureAvailableSlack records. Leading =
-         * any predicted node before the encoding tail (Bokeh/Filter/Watermark/DynamicFunction), so an OBSERVE-only
+         * First leading node of the capture - the node whose budget the runtime observeCaptureAvailablePacing records. Leading =
+         * any predicted node before the encoding tail (Bokeh/Filter/Watermark/DynamicFunction), so a REQUIRED-only
          * capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
          */
         val firstLeadingRow: NodeRow?
             get() = nodeRows.firstOrNull { it.prediction != null }?.takeIf { it != encodingReserveRow }
 
         /**
-         * Encoding reserve node - the RESERVE tail, i.e. the last predicted node. Its suffix UB is exactly the
-         * runtime's reserve over the RESERVE tail (UB[Encoding]), so encodingReserveUpperBoundMs no longer over-counts the
-         * intervening OBSERVE stages the old "first non-admission node" proxy included.
+         * Encoding reserve node - the RESERVED tail, i.e. the last predicted node. Its suffix UB is exactly the
+         * runtime's reserve over the RESERVED tail (UB[Encoding]), so encodingReserveUpperBoundMs no longer over-counts the
+         * intervening REQUIRED stages the old "first non-admission node" proxy included.
          */
         val encodingReserveRow: NodeRow?
             get() = nodeRows.lastOrNull { it.prediction != null }
 
-        /** Signed pacing slack the slack policy consumes: first leading budget minus the encoding reserve UB. */
+        /** Signed headroom above the mandatory reserve: first leading budget minus the encoding reserve UB. */
         val pacingSlackMs: Double?
             get() {
                 val budgetMs = firstLeadingRow?.node?.preExecutionMetrics?.budgetMs ?: return null
-                val reserveMs = encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs ?: return null
+                val reserveMs = mandatoryReserveUpperBoundMs ?: return null
                 return budgetMs - reserveMs
+            }
+
+        val mandatoryReserveUpperBoundMs: Double?
+            get() = encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs
+
+        val pacingTargetUpperBoundMs: Double?
+            get() = firstLeadingRow?.prediction?.sequencePredictedUpperBoundMs
+
+        val budgetDeficitPacing: PacingSimulation?
+            get() {
+                val leadingRow = firstLeadingRow ?: return null
+                val budgetMs = leadingRow.node.preExecutionMetrics.budgetMs
+                val reserveUpperBoundMs = mandatoryReserveUpperBoundMs ?: return null
+                val targetUpperBoundMs = pacingTargetUpperBoundMs ?: return null
+                val mandatoryDeficitMs = positiveCeilMs(reserveUpperBoundMs - budgetMs)
+                val optionalDeficitMs = positiveCeilMs(targetUpperBoundMs - budgetMs)
+                val optionalHeadroomMs = positiveFloorMs(budgetMs - reserveUpperBoundMs)
+                val appliedDelayMs = mandatoryDeficitMs + minOf(optionalDeficitMs, optionalHeadroomMs)
+                val simulatedBudgetAfterPacingMs = budgetMs + appliedDelayMs
+
+                return PacingSimulation(
+                    targetStage = pacingTargetStage(leadingRow),
+                    budgetMs = budgetMs,
+                    mandatoryReserveUpperBoundMs = reserveUpperBoundMs,
+                    targetUpperBoundMs = targetUpperBoundMs,
+                    mandatoryDeficitMs = mandatoryDeficitMs,
+                    optionalDeficitMs = optionalDeficitMs,
+                    optionalHeadroomMs = optionalHeadroomMs,
+                    appliedDelayMs = appliedDelayMs,
+                    simulatedBudgetAfterPacingMs = simulatedBudgetAfterPacingMs,
+                    mandatorySafeBeforePacing = reserveUpperBoundMs <= budgetMs,
+                    mandatorySafeAfterPacing = reserveUpperBoundMs <= simulatedBudgetAfterPacingMs,
+                    targetAdmitBeforePacing = targetUpperBoundMs <= budgetMs,
+                    targetAdmitAfterPacing = targetUpperBoundMs <= simulatedBudgetAfterPacingMs,
+                )
             }
 
         val hasTimeoutFailure: Boolean
@@ -379,6 +459,53 @@ class CaptureMetricsExcelExporter(
                 }
                 return decisionRows.any { predictedBudgetOverrun(it) == true }
             }
+
+        fun queueAwarePacing(captureAvailableElapsedMs: Long, queuedDraftCount: Int): PacingSimulation? {
+            val leadingRow = firstLeadingRow ?: return null
+            val timeoutBudgetMs = leadingRow.node.preExecutionMetrics.budgetMs
+            val requiredReserveMs = mandatoryReserveUpperBoundMs ?: return null
+            val predictedDraftDurationMs = leadingRow.prediction?.sequencePredictedDurationMs ?: return null
+            val preferredDraftPathBudgetMs = pacingTargetUpperBoundMs ?: return null
+            val captureAvailableElapsedProxyMs = captureAvailableElapsedMs.coerceAtLeast(0L)
+            val queuedDraftCountProxy = queuedDraftCount.coerceAtLeast(0)
+
+            val unservedDraftWorkMs = positiveCeilMs(predictedDraftDurationMs - captureAvailableElapsedProxyMs)
+            val queuedDraftWorkMs = unservedDraftWorkMs * queuedDraftCountProxy.toLong()
+            val availableBudgetMs = (timeoutBudgetMs - queuedDraftWorkMs).coerceAtLeast(0L)
+            val mandatoryReserveShortageMs = positiveCeilMs(requiredReserveMs - availableBudgetMs)
+            val preferredBudgetShortageMs = positiveCeilMs(preferredDraftPathBudgetMs - availableBudgetMs)
+            val optionalBudgetHeadroomMs = positiveFloorMs(availableBudgetMs - requiredReserveMs)
+            val appliedDelayMs = if (mandatoryReserveShortageMs > 0L) {
+                mandatoryReserveShortageMs
+            } else {
+                minOf(preferredBudgetShortageMs, optionalBudgetHeadroomMs)
+            }
+            val simulatedBudgetAfterPacingMs = availableBudgetMs + appliedDelayMs
+
+            return PacingSimulation(
+                targetStage = pacingTargetStage(leadingRow),
+                budgetMs = timeoutBudgetMs,
+                mandatoryReserveUpperBoundMs = requiredReserveMs,
+                targetUpperBoundMs = preferredDraftPathBudgetMs,
+                mandatoryDeficitMs = mandatoryReserveShortageMs,
+                optionalDeficitMs = preferredBudgetShortageMs,
+                optionalHeadroomMs = optionalBudgetHeadroomMs,
+                appliedDelayMs = appliedDelayMs,
+                simulatedBudgetAfterPacingMs = simulatedBudgetAfterPacingMs,
+                mandatorySafeBeforePacing = requiredReserveMs <= availableBudgetMs,
+                mandatorySafeAfterPacing = requiredReserveMs <= simulatedBudgetAfterPacingMs,
+                targetAdmitBeforePacing = preferredDraftPathBudgetMs <= availableBudgetMs,
+                targetAdmitAfterPacing = preferredDraftPathBudgetMs <= simulatedBudgetAfterPacingMs,
+                method = QUEUE_AWARE_PACING_METHOD,
+                note = QUEUE_AWARE_PACING_NOTE,
+                captureAvailableElapsedMs = captureAvailableElapsedProxyMs,
+                queuedDraftCount = queuedDraftCountProxy,
+                predictedDraftDurationMs = predictedDraftDurationMs,
+                unservedDraftWorkMs = unservedDraftWorkMs,
+                queuedDraftWorkMs = queuedDraftWorkMs,
+                availableBudgetMs = availableBudgetMs,
+            )
+        }
 
         fun firstNodeLowMemoryLabel(): String {
             val isLowMemory = nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
@@ -431,6 +558,7 @@ class CaptureMetricsExcelExporter(
     private class SessionSummary(
         val sessionId: Int,
         val sessionShotCount: Int,
+        val sessionCaptureIndex: Int,
         val sessionTimeoutShotCount: Int?,
         val sessionBokehAdmitCount: Int,
         val sessionBokehTotalCount: Int,
@@ -577,9 +705,33 @@ class CaptureMetricsExcelExporter(
         }
     }
 
-    private class CaptureGroup(
+    private class CaptureGroup<T>(
         val name: String,
-        val captures: List<CaptureRow>,
+        val captures: List<T>,
+    )
+
+    private class PacingSimulation(
+        val targetStage: String,
+        val budgetMs: Long,
+        val mandatoryReserveUpperBoundMs: Double,
+        val targetUpperBoundMs: Double,
+        val mandatoryDeficitMs: Long,
+        val optionalDeficitMs: Long,
+        val optionalHeadroomMs: Long,
+        val appliedDelayMs: Long,
+        val simulatedBudgetAfterPacingMs: Long,
+        val mandatorySafeBeforePacing: Boolean,
+        val mandatorySafeAfterPacing: Boolean,
+        val targetAdmitBeforePacing: Boolean,
+        val targetAdmitAfterPacing: Boolean,
+        val method: String = BUDGET_DEFICIT_PACING_METHOD,
+        val note: String = BUDGET_DEFICIT_PACING_NOTE,
+        val captureAvailableElapsedMs: Long? = null,
+        val queuedDraftCount: Int? = null,
+        val predictedDraftDurationMs: Double? = null,
+        val unservedDraftWorkMs: Long? = null,
+        val queuedDraftWorkMs: Long? = null,
+        val availableBudgetMs: Long? = null,
     )
 
     private class DecisionQualitySummary(
@@ -1017,6 +1169,98 @@ class CaptureMetricsExcelExporter(
         }
     }
 
+    private class PacingSimulationSummary(
+        val group: String,
+        val targetStage: String,
+        val method: String,
+        val captureCount: Int,
+        val evaluatedCount: Int,
+        val targetAdmitBeforeCount: Int,
+        val targetAdmitBeforeRate: Double?,
+        val targetAdmitAfterCount: Int,
+        val targetAdmitAfterRate: Double?,
+        val targetAdmitGainCount: Int,
+        val mandatoryRiskBeforeCount: Int,
+        val mandatoryRiskBeforeRate: Double?,
+        val mandatoryRiskAfterCount: Int,
+        val mandatoryRiskAfterRate: Double?,
+        val zeroDelayCount: Int,
+        val zeroDelayRate: Double?,
+        val totalAppliedDelayMs: Long,
+        val averageAppliedDelayMs: Double?,
+        val maxAppliedDelayMs: Long?,
+        val note: String,
+    ) {
+        companion object {
+            fun from(group: String, captures: List<EnrichedCaptureRow>): List<PacingSimulationSummary> {
+                val simulations = captures.flatMap { capture ->
+                    listOfNotNull(capture.row.budgetDeficitPacing, capture.queueAwarePacing)
+                }
+                val stages = listOf(PACING_TARGET_ALL, ADMISSION_STAGE_BOKEH, ADMISSION_STAGE_FILTER)
+
+                return simulations.groupBy { it.method }
+                    .toSortedMap()
+                    .flatMap { (_, methodSimulations) ->
+                        stages.mapNotNull { stage ->
+                            val stageSimulations = if (stage == PACING_TARGET_ALL) {
+                                methodSimulations
+                            } else {
+                                methodSimulations.filter { it.targetStage == stage }
+                            }
+                            if (stage != PACING_TARGET_ALL && stageSimulations.isEmpty()) {
+                                return@mapNotNull null
+                            }
+                            fromSimulations(group, stage, captures.size, stageSimulations)
+                        }
+                    }
+            }
+
+            private fun fromSimulations(
+                group: String,
+                targetStage: String,
+                captureCount: Int,
+                simulations: List<PacingSimulation>,
+            ): PacingSimulationSummary {
+                val evaluatedCount = simulations.size
+                val targetAdmitBeforeCount = simulations.count { it.targetAdmitBeforePacing }
+                val targetAdmitAfterCount = simulations.count { it.targetAdmitAfterPacing }
+                val mandatoryRiskBeforeCount = simulations.count { !it.mandatorySafeBeforePacing }
+                val mandatoryRiskAfterCount = simulations.count { !it.mandatorySafeAfterPacing }
+                val zeroDelayCount = simulations.count { it.appliedDelayMs == 0L }
+                val totalAppliedDelayMs = simulations.sumOf { it.appliedDelayMs }
+
+                return PacingSimulationSummary(
+                    group = group,
+                    targetStage = targetStage,
+                    method = simulations.firstOrNull()?.method.orEmpty(),
+                    captureCount = captureCount,
+                    evaluatedCount = evaluatedCount,
+                    targetAdmitBeforeCount = targetAdmitBeforeCount,
+                    targetAdmitBeforeRate = rate(targetAdmitBeforeCount, evaluatedCount),
+                    targetAdmitAfterCount = targetAdmitAfterCount,
+                    targetAdmitAfterRate = rate(targetAdmitAfterCount, evaluatedCount),
+                    targetAdmitGainCount = simulations.count {
+                        !it.targetAdmitBeforePacing && it.targetAdmitAfterPacing
+                    },
+                    mandatoryRiskBeforeCount = mandatoryRiskBeforeCount,
+                    mandatoryRiskBeforeRate = rate(mandatoryRiskBeforeCount, evaluatedCount),
+                    mandatoryRiskAfterCount = mandatoryRiskAfterCount,
+                    mandatoryRiskAfterRate = rate(mandatoryRiskAfterCount, evaluatedCount),
+                    zeroDelayCount = zeroDelayCount,
+                    zeroDelayRate = rate(zeroDelayCount, evaluatedCount),
+                    totalAppliedDelayMs = totalAppliedDelayMs,
+                    averageAppliedDelayMs = if (evaluatedCount > 0) {
+                        totalAppliedDelayMs.toDouble() / evaluatedCount.toDouble()
+                    } else {
+                        null
+                    },
+                    maxAppliedDelayMs = simulations.maxOfOrNull { it.appliedDelayMs },
+                    note = simulations.firstOrNull()?.note.orEmpty(),
+                )
+            }
+        }
+    }
+
     private class MetricNote(
         val metric: String,
         val note: String,
@@ -1073,6 +1317,12 @@ class CaptureMetricsExcelExporter(
         private const val ADMIT_FILTER_PREFIX = "FILTER("
         private const val ADMISSION_STAGE_BOKEH = "Bokeh"
         private const val ADMISSION_STAGE_FILTER = "Filter"
+        private const val PACING_TARGET_ALL = "All"
+        private const val BUDGET_DEFICIT_PACING_METHOD = "Budget-deficit predicted UB proxy"
+        private const val QUEUE_AWARE_PACING_METHOD = "Queue-aware burst proxy"
+        private const val BUDGET_DEFICIT_PACING_NOTE = "Counterfactual assumes applied delay converts to equal budget runway; validate with runtime logs."
+        private const val QUEUE_AWARE_PACING_NOTE = "Uses CaptureMetrics proxy inputs: captureAvailableElapsed=0ms and queuedDraftCount=sessionCaptureIndex-1. Replace proxy columns with runtime fields when persisted."
+        private const val QUEUE_AWARE_CAPTURE_AVAILABLE_ELAPSED_PROXY_MS = 0L
         private const val ADMISSION_SKIP_REASON_UPPER_BOUND = "upper bound"
         private const val ADMISSION_SKIP_REASON_BUDGET_RUNWAY = "budget runway"
 
@@ -1081,6 +1331,30 @@ class CaptureMetricsExcelExporter(
                 return null
             }
             return numerator.toDouble() / denominator.toDouble()
+        }
+
+        private fun positiveCeilMs(valueMs: Double): Long {
+            if (valueMs <= 0.0 || valueMs.isNaN()) {
+                return 0L
+            }
+            return ceil(valueMs).toLong().coerceAtLeast(0L)
+        }
+
+        private fun positiveFloorMs(valueMs: Double): Long {
+            if (valueMs <= 0.0 || valueMs.isNaN()) {
+                return 0L
+            }
+            return floor(valueMs).toLong().coerceAtLeast(0L)
+        }
+
+        private fun pacingTargetStage(leadingRow: NodeRow): String {
+            leadingRow.admissionStage()?.let { return it }
+            val workloadSequenceKey = leadingRow.prediction?.workloadSequenceKey.orEmpty()
+            return when {
+                workloadSequenceKey.contains(ADMIT_BOKEH_PREFIX) -> ADMISSION_STAGE_BOKEH
+                workloadSequenceKey.contains(ADMIT_FILTER_PREFIX) -> ADMISSION_STAGE_FILTER
+                else -> "ObserveOnly"
+            }
         }
 
         private fun nodeSheetRows(captures: List<CaptureRow>): List<NodeSheetRow> {
@@ -1133,11 +1407,38 @@ class CaptureMetricsExcelExporter(
             Column("filterPredictedBudgetOverrun") { it.row.filterPredictedBudgetOverrun },
             Column("filterObservedBudgetOverrun") { it.row.filterObservedBudgetOverrun },
             Column("firstLeadingBudgetMs") { it.row.firstLeadingRow?.node?.preExecutionMetrics?.budgetMs },
-            Column("encodingReserveUpperBoundMs") { it.row.encodingReserveRow?.prediction?.sequencePredictedUpperBoundMs },
+            Column("encodingReserveUpperBoundMs") { it.row.mandatoryReserveUpperBoundMs },
+            Column("pacingTargetUpperBoundMs") { it.row.pacingTargetUpperBoundMs },
             Column("pacingSlackMs") { it.row.pacingSlackMs },
+            Column("mandatoryReserveDeficitMs") { it.row.budgetDeficitPacing?.mandatoryDeficitMs },
+            Column("optionalAdmissionDeficitMs") { it.row.budgetDeficitPacing?.optionalDeficitMs },
+            Column("optionalHeadroomMs") { it.row.budgetDeficitPacing?.optionalHeadroomMs },
+            Column("budgetDeficitPacingDelayMs") { it.row.budgetDeficitPacing?.appliedDelayMs },
+            Column("simulatedBudgetAfterPacingMs") { it.row.budgetDeficitPacing?.simulatedBudgetAfterPacingMs },
+            Column("targetAdmitBeforePacing") { it.row.budgetDeficitPacing?.targetAdmitBeforePacing },
+            Column("targetAdmitAfterPacing") { it.row.budgetDeficitPacing?.targetAdmitAfterPacing },
+            Column("mandatorySafeBeforePacing") { it.row.budgetDeficitPacing?.mandatorySafeBeforePacing },
+            Column("mandatorySafeAfterPacing") { it.row.budgetDeficitPacing?.mandatorySafeAfterPacing },
+            Column("queueAwarePacingInputSource") { it.queueAwarePacingInputSource },
+            Column("queueAwareCaptureAvailableElapsedProxyMs") { it.queueAwareCaptureAvailableElapsedProxyMs },
+            Column("queueAwareQueuedDraftCountProxy") { it.queueAwareQueuedDraftCountProxy },
+            Column("queueAwarePredictedDraftDurationMs") { it.queueAwarePacing?.predictedDraftDurationMs },
+            Column("queueAwareUnservedDraftWorkMs") { it.queueAwarePacing?.unservedDraftWorkMs },
+            Column("queueAwareQueuedDraftWorkMs") { it.queueAwarePacing?.queuedDraftWorkMs },
+            Column("queueAwareAvailableBudgetMs") { it.queueAwarePacing?.availableBudgetMs },
+            Column("queueAwareMandatoryReserveShortageMs") { it.queueAwarePacing?.mandatoryDeficitMs },
+            Column("queueAwarePreferredBudgetShortageMs") { it.queueAwarePacing?.optionalDeficitMs },
+            Column("queueAwareOptionalBudgetHeadroomMs") { it.queueAwarePacing?.optionalHeadroomMs },
+            Column("queueAwarePacingDelayMs") { it.queueAwarePacing?.appliedDelayMs },
+            Column("queueAwareSimulatedBudgetAfterPacingMs") { it.queueAwarePacing?.simulatedBudgetAfterPacingMs },
+            Column("queueAwareTargetAdmitBeforePacing") { it.queueAwarePacing?.targetAdmitBeforePacing },
+            Column("queueAwareTargetAdmitAfterPacing") { it.queueAwarePacing?.targetAdmitAfterPacing },
+            Column("queueAwareMandatorySafeBeforePacing") { it.queueAwarePacing?.mandatorySafeBeforePacing },
+            Column("queueAwareMandatorySafeAfterPacing") { it.queueAwarePacing?.mandatorySafeAfterPacing },
             Column("draftNodeDurationMs") { it.row.encodingReserveRow?.nodeActualDurationMs },
             Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
+            Column("sessionCaptureIndex") { it.sessionSummary.sessionCaptureIndex },
             Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
             Column("timeoutShotCount") { it.sessionSummary.sessionTimeoutShotCount?.let { count -> "#" + count } },
             Column("bokehAdmitCount") { it.sessionSummary.sessionBokehAdmitCount },
@@ -1258,6 +1559,29 @@ class CaptureMetricsExcelExporter(
             Column("fullFeatureSuccessCount") { it.fullFeatureSuccessCount },
             Column("fullFeatureSuccessRate") { it.fullFeatureSuccessRate },
             Column("offlineOracleRequired") { it.offlineOracleRequired },
+            Column("note") { it.note },
+        )
+
+        private fun buildPacingSimulationColumns(): List<Column<PacingSimulationSummary>> = listOf(
+            Column("group") { it.group },
+            Column("targetStage") { it.targetStage },
+            Column("method") { it.method },
+            Column("captureCount") { it.captureCount },
+            Column("evaluatedCount") { it.evaluatedCount },
+            Column("targetAdmitBeforeCount") { it.targetAdmitBeforeCount },
+            Column("targetAdmitBeforeRate") { it.targetAdmitBeforeRate },
+            Column("targetAdmitAfterCount") { it.targetAdmitAfterCount },
+            Column("targetAdmitAfterRate") { it.targetAdmitAfterRate },
+            Column("targetAdmitGainCount") { it.targetAdmitGainCount },
+            Column("mandatoryRiskBeforeCount") { it.mandatoryRiskBeforeCount },
+            Column("mandatoryRiskBeforeRate") { it.mandatoryRiskBeforeRate },
+            Column("mandatoryRiskAfterCount") { it.mandatoryRiskAfterCount },
+            Column("mandatoryRiskAfterRate") { it.mandatoryRiskAfterRate },
+            Column("zeroDelayCount") { it.zeroDelayCount },
+            Column("zeroDelayRate") { it.zeroDelayRate },
+            Column("totalAppliedDelayMs") { it.totalAppliedDelayMs },
+            Column("averageAppliedDelayMs") { it.averageAppliedDelayMs },
+            Column("maxAppliedDelayMs") { it.maxAppliedDelayMs },
             Column("note") { it.note },
         )
 

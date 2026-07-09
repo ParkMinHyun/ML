@@ -16,19 +16,19 @@ sealed interface WorkloadKey {
     val sizeBucket: SizeBucket
 
     data class Bokeh(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
+        override val policy: WorkloadPolicy = WorkloadPolicy.OPTIONAL
     }
 
     data class DynamicFunction(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
+        override val policy: WorkloadPolicy = WorkloadPolicy.REQUIRED
     }
 
     data class Filter(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.ADMIT
+        override val policy: WorkloadPolicy = WorkloadPolicy.OPTIONAL
     }
 
     data class Watermark(override val sizeBucket: SizeBucket) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.OBSERVE
+        override val policy: WorkloadPolicy = WorkloadPolicy.REQUIRED
     }
 
     /** Mandatory tail from ImageCodec entry through saved draft task completion. */
@@ -37,7 +37,7 @@ sealed interface WorkloadKey {
         val imageFormat: Int,
         val isPendingRequest: Boolean,
     ) : WorkloadKey {
-        override val policy: WorkloadPolicy = WorkloadPolicy.RESERVE
+        override val policy: WorkloadPolicy = WorkloadPolicy.RESERVED
     }
 }
 
@@ -50,9 +50,14 @@ fun WorkloadKey.toReplayString(): String = when (this) {
 }
 
 enum class WorkloadPolicy {
-    ADMIT,
-    OBSERVE,
-    RESERVE,
+    /** Can be skipped by admission control when budget is tight. */
+    OPTIONAL,
+
+    /** Always runs, but does not receive protected reserve budget. */
+    REQUIRED,
+
+    /** Always runs and is protected by mandatory reserve budget. */
+    RESERVED,
 }
 
 /** Stable megapixel tiers a frame snaps to - the size axis of the workload taxonomy. */

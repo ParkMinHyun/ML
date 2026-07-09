@@ -9,6 +9,7 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
@@ -164,6 +165,7 @@ public class SavingDraftImageTaskManager {
     public synchronized void close() {
         shutDownThreadPool();
         savingDraftImageTaskMap.clear();
+        DraftSequenceExecutionPredictor.getInstance().clearCaptureAvailablePacing();
         reservedSkipSaveDraftImageIdSet.clear();
         waitForSavingDraftImageTaskMapDrain = false;
         isWatchdogDrainInCurrentSession = false;
@@ -199,6 +201,7 @@ public class SavingDraftImageTaskManager {
                 waitForSavingDraftImageTaskMapDrain = false;
                 isWatchdogDrainInCurrentSession = false;
                 hasCaptureTimeoutInCurrentSession = false;
+                DraftSequenceExecutionPredictor.getInstance().clearCaptureAvailablePacing();
             }
         }
     }
@@ -240,8 +243,7 @@ public class SavingDraftImageTaskManager {
     private void insertCaptureMetrics(@NonNull CaptureMetrics captureMetrics) {
         CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics E - ppSequenceId=%d", captureMetrics.getPpSequenceId());
         CaptureMetricsRepository.getInstance(context).insertAsync(captureMetrics);
-        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - %s",
-                captureMetrics.getPpSequenceId(), captureMetrics.getDraftSequenceMetrics());
+        CLog.w(TAG, "[mhyun2.park] onTaskFinished : insert captureMetrics X - %s", captureMetrics.getDraftSequenceMetrics());
     }
 
     private boolean hasWatchdogTimeout(@NonNull ExtraBundle extraBundle) {

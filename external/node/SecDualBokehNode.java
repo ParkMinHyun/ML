@@ -51,6 +51,7 @@ import com.samsung.android.camera.core2.util.DynamicShotUtils;
 import com.samsung.android.camera.core2.util.ImageBuffer;
 import com.samsung.android.camera.core2.util.ImageInfo;
 import com.samsung.android.camera.core2.util.ImageUtils;
+import com.samsung.android.camera.core2.util.QuramResizer;
 import com.samsung.android.camera.core2.util.StrideInfo;
 
 import java.nio.file.Path;
@@ -263,29 +264,25 @@ public class SecDualBokehNode extends SecDualBokehNodeBase {
     @NonNull
     @Override
     protected ImageBuffer getSkippedImageBuffer(@NonNull ImageBuffer picture, @NonNull ExtraBundle bundle) {
-        final ImageInfo inputImageInfo = picture.getImageInfo();
-        final Size inputImageSize = Objects.requireNonNull(inputImageInfo.getSize(), "inputImageSize");
-        final Size resultImageSize = Optional.ofNullable(bundle.get(ExtraBundle.INFO_RESULT_CAPTURE_SIZE))
-                .orElse(mMainPictureSize);
+        CLog.i(getNodeTag(), "[mhyun2.park] getSkippedImageBuffer E");
 
-        CLog.i(getNodeTag(), "[mhyun2.park] getSkippedImageBuffer E: resultImageSize" + resultImageSize);
         final ImageBuffer skippedImageBuffer;
-        if (inputImageSize.equals(resultImageSize) && inputImageInfo.getImageComesFrom() == ImageInfo.CameraUsage.MAIN_CAM) {
-            skippedImageBuffer = picture;
+        if (mMainImageBuffer != null && mMainPictureImageInfo != null) {
+            skippedImageBuffer = ImageBuffer.wrap(mMainImageBuffer, mMainPictureImageInfo);
         } else {
-            if (null == mBokehResultBuffer || mBokehResultBuffer.capacity() != ImageUtils.getNV21BufferSize(resultImageSize)) {
-                Optional.ofNullable(mBokehResultBuffer).ifPresent(DirectBuffer::release);
-                mBokehResultBuffer = DirectBuffer.allocate(ImageUtils.getNV21BufferSize(resultImageSize));
-            }
-
-            mBokehResultBuffer.rewind();
-            skippedImageBuffer = ImageBuffer.allocate(mBokehResultBuffer.capacity(), Objects.requireNonNullElse(mMainPictureImageInfo, inputImageInfo));
-            skippedImageBuffer.put(mBokehResultBuffer);
-            skippedImageBuffer.rewind();
-            mBokehResultBuffer.rewind();
+            skippedImageBuffer = picture;
         }
-        CLog.i(getNodeTag(), "[mhyun2.park] getSkippedImageBuffer X");
-        return skippedImageBuffer;
+
+        final Size inputImageSize = Objects.requireNonNull(picture.getImageInfo().getSize(), "skippedImageSize");
+        final Size resultImageSize = Objects.requireNonNull(bundle.get(ExtraBundle.INFO_RESULT_CAPTURE_SIZE), "resultImageSize");
+
+        if (inputImageSize.equals(resultImageSize)) {
+            CLog.i(getNodeTag(), "[mhyun2.park] getSkippedImageBuffer X - return main input");
+            return skippedImageBuffer;
+        }
+
+        CLog.i(getNodeTag(), "[mhyun2.park] getSkippedImageBuffer X - resize to " + resultImageSize);
+        return QuramResizer.resizeNV21ToPackedNV21(skippedImageBuffer, resultImageSize);
     }
 
     /**

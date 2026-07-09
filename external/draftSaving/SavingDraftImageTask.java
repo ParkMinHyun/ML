@@ -13,6 +13,8 @@ import androidx.annotation.Nullable;
 
 import com.samsung.android.camera.core2.CamCapability;
 import com.samsung.android.camera.core2.MakerPrivateKey;
+import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;
+import com.samsung.android.camera.core2.apm.data.DraftTimeApmData;
 import com.samsung.android.camera.core2.container.CodecConfiguration;
 import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
@@ -99,6 +101,8 @@ public abstract class SavingDraftImageTask implements Runnable {
 
     @Override
     public final void run() {
+        final DraftTimeApmData.DraftTimeApmDataBuilder draftTimeApmDataBuilder = new DraftTimeApmData.DraftTimeApmDataBuilder();
+        draftTimeApmDataBuilder.setStartTime();
         processLock.lock();
         PLog.i(getTag(), "run(ppSequenceId:%d, sequenceId:%d) E", ppSequenceId, sequenceId);
         try {
@@ -117,6 +121,8 @@ public abstract class SavingDraftImageTask implements Runnable {
             releaseBuffers();
             finishedTaskConsumer.accept(ppSequenceId);
             processLock.unlock();
+            draftTimeApmDataBuilder.setEndTime();
+            AdaptivePerformanceManager.getInstance().updateData(draftTimeApmDataBuilder.build());
             PLog.i(getTag(), "run(ppSequenceId:%d, sequenceId:%d) X", ppSequenceId, sequenceId);
         }
     }

@@ -22,10 +22,8 @@ import androidx.annotation.NonNull;
 
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
-import com.samsung.android.camera.core2.apm.repository.ApmDataProvider;
-import com.samsung.android.camera.core2.apm.repository.ApmResultDataSelector;
-import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacingPrediction;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.util.PLog;
 
@@ -33,22 +31,17 @@ import java.util.List;
 
 /**
  * <div class="camera_en">
- * Policy that schedules captureAvailable callbacks using draft-sequence budget slack: the headroom above the
- * learned encoding reserve is spent 1:1 as an advance on legacy service-rate pacing.
+ * Policy that schedules captureAvailable callbacks from draft budget deficits: callbacks are sent immediately when
+ * budget is enough, or delayed only within the mandatory reserve / preferred draft-path budget gap.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
- * draft sequence budget slack에 따라 captureAvailable 콜백을 스케줄링하는 정책입니다. 학습된 encoding
- * reserve 위의 여유를 legacy service-rate 지연에서 1:1로 차감합니다.
+ * draft budget 부족분을 기준으로 captureAvailable 콜백을 스케줄링합니다. budget이 충분하면 즉시 보내고,
+ * 부족하면 mandatory reserve / preferred draft-path budget 범위 안에서만 지연합니다.
  * </div>
  */
 public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static final String TAG = "CaptureAvailableApmPolicy";
-    private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
-            new CaptureAvailableData(
-                    resultData.getDraftTimes(),
-                    resultData.getCaptureAvailableTime()
-            );
 
     private SingleThreadDelayedScheduler singleThreadDelayedScheduler;
 
@@ -64,7 +57,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      * @param apmDataRepositoryStore Store for accessing APM data repositories.
      */
     public CaptureAvailableApmPolicy(@NonNull ApmDataRepositoryStore apmDataRepositoryStore) {
-        super(apmDataRepositoryStore, List.of(ProcessingResultData.class));
+        super(apmDataRepositoryStore, List.of());
     }
 
     /**
@@ -83,12 +76,11 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Executes calculating the delay from the draft-sequence budget slack,
-     * then schedules the provided {@code runnable}.
+     * Calculates a budget-deficit captureAvailable delay, then schedules the provided {@code runnable}.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * draft sequence budget slack으로 지연을 구하고, 제공된 {@code runnable}을 스케줄링합니다.
+     * draft budget 부족분을 기준으로 지연을 구하고, 제공된 {@code runnable}을 스케줄링합니다.
      * </div>
      *
      * @param sequenceId sequenceId
@@ -97,43 +89,57 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      */
     @Override
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
-        final CaptureAvailableData data = getCaptureAvailableData(sequenceId);
-        final CaptureAvailableDelay delay = createCaptureAvailableDelay(data);
-        final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, delay.appliedDelayMs());
+        final CaptureAvailablePacingPrediction pacingPrediction = DraftSequenceExecutionPredictor.getInstance().captureAvailablePacingPrediction();
 
-        logCaptureAvailableDelay(sequenceId, data, delay, scheduled);
-        return scheduled;
-    }
+        long appliedDelayMs = 0L;
+        boolean warning = false;
+        String reason = "captureAvailable pacing waits for the first draft prediction";
+        String pacingDetails = "";
 
-    private CaptureAvailableData getCaptureAvailableData(int sequenceId) {
-        ApmDataProvider<ProcessingResultData> provider = getApmDataProvider(ProcessingResultData.class);
-        if (provider == null) {
-            PLog.w(TAG, "executeInternal(id:" + sequenceId + ") - No provider available");
-            return CaptureAvailableData.EMPTY;
+        if (pacingPrediction != null) {
+            final long firstLeadingBudgetMs = pacingPrediction.getFirstLeadingBudgetMs();
+            final double mandatoryReserveUpperBoundMs = pacingPrediction.getMandatoryReserveUpperBoundMs();
+            final double preferredDraftPathUpperBoundMs = pacingPrediction.getPreferredDraftPathUpperBoundMs();
+
+            final long mandatoryReserveShortageMs = Math.max(0L, (long) Math.ceil(mandatoryReserveUpperBoundMs - firstLeadingBudgetMs));
+            final long preferredBudgetShortageMs = Math.max(0L, (long) Math.ceil(preferredDraftPathUpperBoundMs - firstLeadingBudgetMs));
+            final long optionalBudgetHeadroomMs = Math.max(0L, (long) Math.floor(firstLeadingBudgetMs - mandatoryReserveUpperBoundMs));
+
+            if (mandatoryReserveShortageMs > 0L) {
+                appliedDelayMs = mandatoryReserveShortageMs;
+                warning = true;
+                reason = "protect mandatory reserve by " + mandatoryReserveShortageMs + "ms";
+            } else if (preferredBudgetShortageMs > 0L) {
+                appliedDelayMs = Math.min(preferredBudgetShortageMs, optionalBudgetHeadroomMs);
+                reason = appliedDelayMs > 0L
+                        ? "pace optional draft path by " + appliedDelayMs + "ms"
+                        : "optional draft path lacks budget but mandatory reserve has no headroom";
+            } else {
+                reason = "budget is enough";
+            }
+
+            pacingDetails = ", firstLeadingBudget=" + firstLeadingBudgetMs + "ms"
+                    + ", mandatoryReserveUpperBound=" + mandatoryReserveUpperBoundMs + "ms"
+                    + ", preferredDraftPathUpperBound=" + preferredDraftPathUpperBoundMs + "ms"
+                    + ", mandatoryReserveShortage=" + mandatoryReserveShortageMs + "ms"
+                    + ", preferredBudgetShortage=" + preferredBudgetShortageMs + "ms"
+                    + ", optionalBudgetHeadroom=" + optionalBudgetHeadroomMs + "ms"
+                    + ", workloadSequenceKey=" + pacingPrediction.getWorkloadSequenceKey();
         }
-        return provider.getSelectedApmResultData(sequenceId, SELECTOR);
-    }
 
-    private CaptureAvailableDelay createCaptureAvailableDelay(@NonNull CaptureAvailableData data) {
-        final long legacyDelayMs = Math.max(0, data.getAverageDraftTime() - data.getCaptureAvailableTime());
-        final Long slackMs = DraftSequenceExecutionPredictor.getInstance().captureAvailableSlackMs();
+        final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, appliedDelayMs);
+        final String message = "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
+                + ", pacingPredictionAvailable=" + (pacingPrediction != null)
+                + ", appliedDelay=" + appliedDelayMs + "ms"
+                + pacingDetails
+                + ", scheduled=" + scheduled;
 
-        if (slackMs == null) {
-            return CaptureAvailableDelay.useLegacy(legacyDelayMs,
-                    "legacy average delay is used until budget slack is observed");
-        }
-
-        return CaptureAvailableDelay.useBudgetSlack(legacyDelayMs, slackMs);
-    }
-
-    private void logCaptureAvailableDelay(int sequenceId, @NonNull CaptureAvailableData data,
-                                          @NonNull CaptureAvailableDelay delay, boolean scheduled) {
-        final String message = delay.formatLogMessage(sequenceId, data, scheduled);
-        if (delay.warning()) {
+        if (warning) {
             PLog.e(TAG, message);
         } else {
             PLog.d(TAG, message);
         }
+        return scheduled;
     }
 
     /**
@@ -167,67 +173,4 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
         return TAG;
     }
 
-    private record CaptureAvailableDelay(long legacyDelayMs,
-                                         long slackMs,
-                                         long appliedDelayMs,
-                                         boolean slackObserved,
-                                         boolean warning,
-                                         @NonNull String reason) {
-
-        static CaptureAvailableDelay useLegacy(long legacyDelayMs, @NonNull String reason) {
-            return new CaptureAvailableDelay(legacyDelayMs, 0L, legacyDelayMs, false, false, reason);
-        }
-
-        static CaptureAvailableDelay useBudgetSlack(long legacyDelayMs, long slackMs) {
-            // Slack is spent 1:1 as an advance on legacy pacing: 1ms of headroom above the encoding reserve
-            // releases the next capture 1ms earlier, so the budget parks at the reserve instead of draining.
-            final long appliedDelayMs = Math.min(legacyDelayMs, Math.max(0L, legacyDelayMs - slackMs));
-            if (slackMs < 0L) {
-                // Below the encoding reserve: full legacy pacing while the admission gate is rejecting.
-                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, true,
-                        "budget is " + (-slackMs) + "ms below the encoding reserve - full legacy pacing");
-            }
-            if (appliedDelayMs == 0L) {
-                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
-                        "budget slack covers the full legacy delay");
-            }
-            if (appliedDelayMs == legacyDelayMs) {
-                return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
-                        "budget is parked at the encoding reserve - full legacy pacing");
-            }
-            return new CaptureAvailableDelay(legacyDelayMs, slackMs, appliedDelayMs, true, false,
-                    "budget slack advances legacy delay by " + slackMs + "ms");
-        }
-
-        String formatLogMessage(int sequenceId, @NonNull CaptureAvailableData data, boolean scheduled) {
-            return "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
-                    + ", slackObserved=" + slackObserved
-                    + ", slack=" + slackMs + "ms"
-                    + ", legacyDelay=" + legacyDelayMs + "ms"
-                    + ", appliedDelay=" + appliedDelayMs + "ms"
-                    + ", scheduled=" + scheduled
-                    + ", averageDraftTime=" + data.getAverageDraftTime() + "ms"
-                    + ", captureAvailableTime=" + data.getCaptureAvailableTime() + "ms";
-        }
-    }
-
-    private static class CaptureAvailableData {
-        private static final CaptureAvailableData EMPTY = new CaptureAvailableData(List.of(), 0L);
-
-        private final long averageDraftTime;
-        private final long captureAvailableTime;
-
-        CaptureAvailableData(List<Long> draftTimes, long captureAvailableTime) {
-            this.averageDraftTime = (long) draftTimes.stream().mapToLong(Long::longValue).average().orElse(0L);
-            this.captureAvailableTime = captureAvailableTime;
-        }
-
-        long getAverageDraftTime() {
-            return averageDraftTime;
-        }
-
-        long getCaptureAvailableTime() {
-            return captureAvailableTime;
-        }
-    }
 }

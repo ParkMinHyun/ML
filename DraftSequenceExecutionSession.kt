@@ -118,8 +118,8 @@ class DraftSequenceExecutionSession private constructor(
     }
 
     companion object {
-        /** [WorkloadPolicy.ADMIT]: skippable by the admission decision and guarded by a watchdog. */
-        internal fun forAdmitWorkload(
+        /** [WorkloadPolicy.OPTIONAL]: skippable by the admission decision and guarded by a watchdog. */
+        internal fun forOptionalWorkload(
             shouldRun: Boolean,
             watchdogTimeoutMs: Long,
             onTimedOutTask: (CompletableFuture<*>) -> Unit,
@@ -131,13 +131,13 @@ class DraftSequenceExecutionSession private constructor(
             onComplete = onComplete,
         )
 
-        /** [WorkloadPolicy.OBSERVE]: always runs, measured only. */
-        internal fun forObserveWorkload(
+        /** [WorkloadPolicy.REQUIRED]: always runs, measured only. */
+        internal fun forRequiredWorkload(
             onComplete: (PostExecutionMetrics) -> Unit,
         ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(onComplete = onComplete)
 
-        /** [WorkloadPolicy.RESERVE]: runs now; completion is deferred to the profiler's capture-end call. */
-        internal fun forReserveWorkload(
+        /** [WorkloadPolicy.RESERVED]: runs now; completion is deferred to the profiler's capture-end call. */
+        internal fun forReservedWorkload(
             onCancel: () -> Unit,
             onComplete: (PostExecutionMetrics) -> Unit,
         ): DraftSequenceExecutionSession = DraftSequenceExecutionSession(
