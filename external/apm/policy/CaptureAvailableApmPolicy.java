@@ -23,9 +23,9 @@ import androidx.annotation.NonNull;
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingPrediction;
-import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.util.PLog;
 
 import java.util.List;
@@ -81,12 +81,12 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Delegates the pacing decision to the predictor, then schedules the provided {@code runnable} after the
+     * Delegates the pacing decision to the pacer, then schedules the provided {@code runnable} after the
      * decided delay.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * pacing 결정을 predictor에 위임하고, 결정된 지연 후 {@code runnable}을 스케줄링합니다.
+     * pacing 결정을 pacer에 위임하고, 결정된 지연 후 {@code runnable}을 스케줄링합니다.
      * </div>
      *
      * @param sequenceId sequenceId
@@ -95,7 +95,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      */
     @Override
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
-        final CaptureAvailablePacingDecision pacingDecision = DraftSequenceExecutionPredictor.getInstance().decideCaptureAvailablePacing();
+        final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay();
 
         long appliedDelayMs = 0L;
         boolean warning = false;

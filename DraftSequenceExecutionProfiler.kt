@@ -25,9 +25,10 @@ private const val TAG = "DraftSequenceExecutionProfiler"
  * - [nodeChainLifecycle] owns the draft node chain's deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
-    private val deviceStateReader: DeviceStateReader,
-    private val captureMetrics: CaptureMetrics,
     private val isPendingRequest: Boolean,
+    private val captureMetrics: CaptureMetrics,
+    private val deviceStateReader: DeviceStateReader,
+    private val captureAvailablePacer: CaptureAvailablePacer = CaptureAvailablePacer.instance,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
     draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
 ) {
@@ -57,7 +58,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             return
         }
 
-        predictor.updateCaptureAvailablePacing(
+        captureAvailablePacer.observeDraftStart(
             WorkloadSequenceKey(plannedWorkloadKeys.drop(leadingIndex)),
             readBudgetMs(),
         )

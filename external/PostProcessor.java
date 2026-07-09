@@ -646,7 +646,7 @@ public class PostProcessor extends ProcessorBase implements IEventHandler, PostP
         }
 
         final CaptureMetrics captureMetrics = Objects.requireNonNull(extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS), "captureMetrics");
-        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(mDeviceStateReader, captureMetrics, isPendingRequest);
+        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(isPendingRequest, captureMetrics, mDeviceStateReader);
         extraBundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER, draftSequenceExecutionProfiler);
 
         mSavingDraftImageTaskManager.addRequest(processRequest,

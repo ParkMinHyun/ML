@@ -1,9 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
-import android.os.SystemClock
-import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.util.CLog
-import kotlin.math.ceil
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToLong
@@ -17,16 +14,14 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  * from positive residual ratios captured before workload EWMA updates; exact decision-sequence residuals win, with
  * global residuals as the cold-sequence fallback.
  *
- * Besides admission, it feeds captureAvailable pacing: [updateCaptureAvailablePacing] refreshes the pacing prediction
- * and [decideCaptureAvailablePacing] converts it into a callback delay per admission.
+ * Besides admission, [estimateDraftPath] snapshots the model for [CaptureAvailablePacer], which owns
+ * captureAvailable pacing and only consumes these estimates.
  */
 class DraftSequenceExecutionPredictor {
 
     private val workloadKeyDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
     private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
     private val globalResidualSamples = mutableListOf<ResidualSample>()
-    private var captureAvailablePacingPrediction: CaptureAvailablePacingPrediction? = null
-    private val backlogClock = AdmittedBacklogClock()
 
     @Synchronized
     fun predictAdmission(
@@ -60,7 +55,7 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * OPTIONAL gate. Admission is bounded by the learned sequence upper bound only; budget deficits are observed
-     * separately and consumed by [decideCaptureAvailablePacing] as the captureAvailable pacing delay.
+     * separately and consumed by [CaptureAvailablePacer] as the captureAvailable pacing delay.
      */
     private fun fitsUpperBoundBudget(
         sequencePredictedMs: Double,
@@ -246,8 +241,8 @@ class DraftSequenceExecutionPredictor {
 
         decayResidualWeights()
         samples.forEach { (workloadSequenceKey, sample) ->
-            workloadSequenceKeyResidualMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
             globalResidualSamples += sample
+            workloadSequenceKeyResidualMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
         }
     }
 
@@ -278,8 +273,8 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun decayResidualWeights() {
-        workloadSequenceKeyResidualMap.values.forEach { it.decayAndPrune() }
         globalResidualSamples.decayAndPrune()
+        workloadSequenceKeyResidualMap.values.forEach { it.decayAndPrune() }
     }
 
     private fun MutableList<ResidualSample>.decayAndPrune() {
@@ -292,117 +287,22 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Updates the latest captureAvailable pacing prediction from the draft sequence's first leading-node budget:
-     * first-leading budget, mandatory RESERVED-tail upper bound, and preferred draft-path upper bound.
-     * The head is any leading workload (OPTIONAL Bokeh/Filter or REQUIRED Watermark/DynamicFunction); a RESERVED head is
-     * rejected because the encoding would already be the first node, leaving no pre-encoding budget to pace from.
-     * A heavy REQUIRED-only capture (e.g. Watermark + encoding, no Bokeh/Filter) is paced through this path too.
-     * Level-based on purpose: every capture overwrites it, so a fresh burst paces from its own budget instead of a
-     * stale trend carried over from the previous burst.
+     * Point/upper-bound estimates for [workloadSequenceKey] plus its mandatory RESERVED-tail upper bound, read in
+     * one consistent model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with.
      */
     @Synchronized
-    fun updateCaptureAvailablePacing(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+    fun estimateDraftPath(workloadSequenceKey: WorkloadSequenceKey): DraftPathEstimate {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
-        val preferredDraftPathUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
         val tailWorkloadKeys = reservedTailWorkloadKeys(workloadSequenceKey)
-        val mandatoryReserveUpperBoundMs = if (tailWorkloadKeys.isEmpty()) {
-            0.0
-        } else {
-            estimateUpperBoundMs(WorkloadSequenceKey(tailWorkloadKeys), tailWorkloadKeys.associateWith(::estimateWorkloadMs))
-        }
-        val preferredDraftPathPredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
-        captureAvailablePacingPrediction = CaptureAvailablePacingPrediction(
-            firstLeadingBudgetMs = budgetMs,
-            mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
-            preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
-            preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
-            workloadSequenceKey = workloadSequenceKey.toReplayString(),
+        return DraftPathEstimate(
+            predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
+            upperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs),
+            mandatoryReserveUpperBoundMs = if (tailWorkloadKeys.isEmpty()) {
+                0.0
+            } else {
+                estimateUpperBoundMs(WorkloadSequenceKey(tailWorkloadKeys), tailWorkloadKeys.associateWith(::estimateWorkloadMs))
+            },
         )
-
-        backlogClock.rebaseOnDraftStart(preferredDraftPathPredictedMs)
-    }
-
-    /**
-     * Decides the captureAvailable pacing delay for one admission. Null until the first leading sequence is observed,
-     * so a fresh process' first capture is never paced.
-     *
-     * The delay is the larger of two deficits against the preferred draft-path upper bound:
-     * - Level deficit: how short the last observed draft start was - the observation-anchored floor.
-     * - Backlog deficit: admitted-but-undrained draft work measured against the capture timeout. The timeout itself
-     *   is the burst allowance, so an empty pipeline always paces 0 and delays start only once the allowance is
-     *   genuinely spent; from there each admission also advances the clock by its own predicted duration, which is
-     *   what spaces callbacks arriving mid-draft out to the service rate instead of re-applying one stale level
-     *   correction. No tuned constant or threshold: only learned predictions and the existing capture timeout.
-     */
-    @Synchronized
-    fun decideCaptureAvailablePacing(): CaptureAvailablePacingDecision? {
-        val prediction = captureAvailablePacingPrediction ?: return null
-
-        val levelDeficitMs = positiveCeilMs(
-            prediction.preferredDraftPathUpperBoundMs - prediction.firstLeadingBudgetMs.coerceAtLeast(0L),
-        )
-        val backlogMs = backlogClock.backlogMs()
-        // Delaying the callback lets the backlog drain before the next capture's timeout clock starts, so the
-        // admitted capture keeps its full preferred-path budget once backlog - delay fits the capture timeout.
-        val backlogDeficitMs = positiveCeilMs(
-            backlogMs + prediction.preferredDraftPathUpperBoundMs - MakerFeature.CAPTURE_TIMEOUT_MS,
-        )
-        val delayMs = maxOf(levelDeficitMs, backlogDeficitMs)
-
-        backlogClock.onCallbackAdmitted(prediction.preferredDraftPathPredictedMs, delayMs)
-
-        return CaptureAvailablePacingDecision(
-            delayMs = delayMs,
-            backlogMs = backlogMs,
-            levelDeficitMs = levelDeficitMs,
-            prediction = prediction,
-        )
-    }
-
-    private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
-
-    /** Clears captureAvailable pacing state when the draft task queue is fully drained. */
-    @Synchronized
-    fun clearCaptureAvailablePacing() {
-        captureAvailablePacingPrediction = null
-        backlogClock.clear()
-    }
-
-    /**
-     * Admitted-backlog clock for captureAvailable pacing: predicted durations of captures whose callback was
-     * released but whose draft has not started yet, plus the uptime when the pipeline is predicted to go idle.
-     * Not self-synchronized - only touched under the predictor's monitor.
-     */
-    private class AdmittedBacklogClock {
-        private val waitingPredictedMsQueue = ArrayDeque<Double>()
-        private var busyUntilUptimeMs = 0L
-
-        /** Admitted-but-undrained draft work left, measured from now. */
-        fun backlogMs(): Long = (busyUntilUptimeMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
-
-        /** One callback released: its capture joins the waiting backlog and extends the busy horizon by its prediction. */
-        fun onCallbackAdmitted(predictedMs: Double, delayMs: Long) {
-            waitingPredictedMsQueue.addLast(predictedMs)
-            busyUntilUptimeMs = maxOf(SystemClock.uptimeMillis() + delayMs, busyUntilUptimeMs) +
-                ceil(predictedMs).toLong()
-        }
-
-        /**
-         * A draft actually started: rebase on observation. The oldest waiting admission is the capture starting
-         * now; the pipeline stays busy for its fresh prediction plus the admissions still waiting behind it.
-         * Push/pop mismatches (skipped callbacks, RESERVED-head captures) do not accumulate - every draft start
-         * recomputes the clock from scratch.
-         */
-        fun rebaseOnDraftStart(startingPredictedMs: Double) {
-            waitingPredictedMsQueue.removeFirstOrNull()
-            busyUntilUptimeMs = SystemClock.uptimeMillis() +
-                ceil(startingPredictedMs + waitingPredictedMsQueue.sum()).toLong()
-        }
-
-        fun clear() {
-            waitingPredictedMsQueue.clear()
-            busyUntilUptimeMs = 0L
-        }
     }
 
     /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
@@ -469,23 +369,9 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/**
- * Latest runtime prediction for captureAvailable pacing, refreshed at every draft start. The policy delays the
- * callback by learned deficits only; [mandatoryReserveUpperBoundMs] only classifies log severity when the reserve
- * itself is at risk.
- */
-data class CaptureAvailablePacingPrediction(
-    val firstLeadingBudgetMs: Long,
+/** One consistent model snapshot for a draft path: point sum, sequence upper bound, mandatory RESERVED-tail upper bound. */
+data class DraftPathEstimate(
+    val predictedMs: Double,
+    val upperBoundMs: Double,
     val mandatoryReserveUpperBoundMs: Double,
-    val preferredDraftPathPredictedMs: Double,
-    val preferredDraftPathUpperBoundMs: Double,
-    val workloadSequenceKey: String,
-)
-
-/** One captureAvailable pacing decision: the callback delay plus the inputs that produced it, for policy logging. */
-data class CaptureAvailablePacingDecision(
-    val delayMs: Long,
-    val backlogMs: Long,
-    val levelDeficitMs: Long,
-    val prediction: CaptureAvailablePacingPrediction,
 )

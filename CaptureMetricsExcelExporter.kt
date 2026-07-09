@@ -267,7 +267,7 @@ class CaptureMetricsExcelExporter(
                     "level term only: optionalAdmissionDeficitMs = CEIL(MAX(0, pacingTargetUpperBoundMs - MAX(0, firstLeadingBudgetMs))). " +
                     "mandatoryReserveDeficitMs and optionalHeadroomMs remain as diagnostics; " +
                     "encodingReserveUpperBoundMs only classifies log severity (mandatory reserve at risk when budget < reserve). " +
-                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching runtime updateCaptureAvailablePacing. " +
+                    "pacingTargetUpperBoundMs is the first leading node's suffix UB, matching the runtime CaptureAvailablePacer draft-start observation. " +
                     "simulatedBudgetAfterPacingMs assumes 1ms callback delay contributes 1ms budget runway in the counterfactual replay. " +
                     "The policy has no prior callback-delay input, threshold, or device-tuned constant.",
         ),
@@ -364,9 +364,10 @@ class CaptureMetricsExcelExporter(
             get() = nodeRows.firstOrNull { it.isOverlayWatermarkWorkload && it.prediction != null }
 
         /**
-         * First leading node of the capture - the node whose budget the runtime updateCaptureAvailablePacing records. Leading =
-         * any predicted node before the encoding tail (Bokeh/Decoding/Filter/Watermark/DynamicFunction), so a
-         * REQUIRED-only capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring the runtime.
+         * First leading node of the capture - the node whose budget the runtime CaptureAvailablePacer records at
+         * draft start. Leading = any predicted node before the encoding tail (Bokeh/Decoding/Filter/Watermark/
+         * DynamicFunction), so a REQUIRED-only capture (heavy Watermark, no Bokeh/Filter) is covered too, mirroring
+         * the runtime.
          */
         val firstLeadingRow: NodeRow?
             get() = nodeRows.firstOrNull { it.prediction != null }?.takeIf { it != encodingReserveRow }
