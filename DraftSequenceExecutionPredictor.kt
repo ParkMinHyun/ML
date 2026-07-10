@@ -98,21 +98,23 @@ class DraftSequenceExecutionPredictor {
         // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
         val workloadKeys = workloadSequenceKey.workloadKeys
         var corrected = 0.0
+        var suffixPredictedMs = 0.0
         for (index in workloadKeys.indices.reversed()) {
+            val workloadEstimateMs = workloadPredictedMs.getValue(workloadKeys[index])
+            suffixPredictedMs += workloadEstimateMs
             val suffixRawUpperBoundMs = estimateRawUpperBoundMs(
-                WorkloadSequenceKey(workloadKeys.drop(index)),
-                workloadPredictedMs,
+                WorkloadSequenceKey(workloadKeys.subList(index, workloadKeys.size)),
+                suffixPredictedMs,
             )
-            corrected = maxOf(suffixRawUpperBoundMs, workloadPredictedMs.getValue(workloadKeys[index]) + corrected)
+            corrected = maxOf(suffixRawUpperBoundMs, workloadEstimateMs + corrected)
         }
         return corrected
     }
 
     private fun estimateRawUpperBoundMs(
         workloadSequenceKey: WorkloadSequenceKey,
-        workloadPredictedMs: Map<WorkloadKey, Double>,
+        predictedMs: Double,
     ): Double {
-        val predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         if (predictedMs <= 0.0) {
             return 0.0
         }

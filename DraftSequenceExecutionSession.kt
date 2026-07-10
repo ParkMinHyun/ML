@@ -9,6 +9,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "DraftSequenceExecutionSession"
 
@@ -58,7 +59,9 @@ class DraftSequenceExecutionSession private constructor(
     private fun <T> executeOnWorker(task: Callable<T>, timeoutMs: Long): T? {
         val executor = Executors.newSingleThreadExecutor()
         val result = CompletableFuture<T?>()
+        val workerStarted = AtomicBoolean(false)
         val future = executor.submit<T?> {
+            workerStarted.set(true)
             try {
                 task.call().also(result::complete)
             } catch (t: Throwable) {
@@ -75,7 +78,10 @@ class DraftSequenceExecutionSession private constructor(
             onTimedOutTask(result)
             throw e
         } finally {
-            future.cancel(true)
+            if (future.cancel(true) && !workerStarted.get()) {
+                // A zero watchdog can cancel before the executor runs the lambda; complete the lifecycle future.
+                result.cancel(false)
+            }
             executor.shutdownNow()
         }
     }

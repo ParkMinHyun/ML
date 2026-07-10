@@ -90,6 +90,7 @@ class CaptureAvailablePacer(
      */
     private class AdmittedBacklogClock {
         private val waitingPredictedMsQueue = ArrayDeque<Double>()
+        private var waitingPredictedMsTotal = 0.0
         private var busyUntilUptimeMs = 0L
 
         /** Admitted-but-undrained draft work left, measured from now. */
@@ -98,6 +99,7 @@ class CaptureAvailablePacer(
         /** One callback released: its capture joins the waiting backlog and extends the busy horizon by its prediction. */
         fun onCallbackAdmitted(predictedMs: Double, delayMs: Long) {
             waitingPredictedMsQueue.addLast(predictedMs)
+            waitingPredictedMsTotal += predictedMs
             busyUntilUptimeMs = maxOf(SystemClock.uptimeMillis() + delayMs, busyUntilUptimeMs) +
                 ceil(predictedMs).toLong()
         }
@@ -109,13 +111,19 @@ class CaptureAvailablePacer(
          * from scratch.
          */
         fun rebaseOnDraftStart(startingPredictedMs: Double) {
-            waitingPredictedMsQueue.removeFirstOrNull()
+            waitingPredictedMsQueue.removeFirstOrNull()?.let { admittedPredictedMs ->
+                waitingPredictedMsTotal = (waitingPredictedMsTotal - admittedPredictedMs).coerceAtLeast(0.0)
+            }
+            if (waitingPredictedMsQueue.isEmpty()) {
+                waitingPredictedMsTotal = 0.0
+            }
             busyUntilUptimeMs = SystemClock.uptimeMillis() +
-                ceil(startingPredictedMs + waitingPredictedMsQueue.sum()).toLong()
+                ceil(startingPredictedMs + waitingPredictedMsTotal).toLong()
         }
 
         fun clear() {
             waitingPredictedMsQueue.clear()
+            waitingPredictedMsTotal = 0.0
             busyUntilUptimeMs = 0L
         }
     }
