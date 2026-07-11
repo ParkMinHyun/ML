@@ -58,13 +58,14 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             return
         }
 
-        captureAvailablePacer.observeDraftStart(
+        val gatingPacingDecision = captureAvailablePacer.observeDraftStart(
             WorkloadSequenceKey(plannedWorkloadKeys),
             readBudgetMs(),
         )
         metricsRecorder.onDraftStart(
             draftStartUptimeMs = SystemClock.uptimeMillis(),
             pacerSessionId = captureAvailablePacer.currentSessionId(),
+            gatingPacingDecision = gatingPacingDecision,
         )
     }
 
@@ -191,7 +192,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         metricsRecorder.onCaptureEnd(
             isTimeout = isTimeout,
             draftEndUptimeMs = SystemClock.uptimeMillis(),
-            pacingDecision = captureAvailablePacer.takeDecision(captureMetrics.ppSequenceId),
         )
         return isTimeout
     }
@@ -292,10 +292,17 @@ private class MetricsRecorder(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    fun onDraftStart(draftStartUptimeMs: Long, pacerSessionId: Int) {
+    fun onDraftStart(
+        draftStartUptimeMs: Long,
+        pacerSessionId: Int,
+        gatingPacingDecision: CaptureAvailablePacingDecision?,
+    ) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.draftStartUptimeMs = draftStartUptimeMs
             draftSequenceMetrics.pacerSessionId = pacerSessionId
+            if (gatingPacingDecision != null) {
+                draftSequenceMetrics.captureAvailablePacing = gatingPacingDecision.toCaptureAvailablePacingMetrics()
+            }
         }
     }
 
@@ -342,13 +349,10 @@ private class MetricsRecorder(
         }
     }
 
-    fun onCaptureEnd(isTimeout: Boolean, draftEndUptimeMs: Long, pacingDecision: CaptureAvailablePacingDecision?) {
+    fun onCaptureEnd(isTimeout: Boolean, draftEndUptimeMs: Long) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.isTimeout = isTimeout
             draftSequenceMetrics.draftEndUptimeMs = draftEndUptimeMs
-            if (pacingDecision != null) {
-                draftSequenceMetrics.captureAvailablePacing = pacingDecision.toCaptureAvailablePacingMetrics()
-            }
         }
     }
 }

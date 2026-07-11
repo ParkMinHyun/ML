@@ -25,7 +25,10 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
     var draftEndUptimeMs: Long? = null,
     /** Burst-session ordinal from [CaptureAvailablePacer]; increments each time the drained pipeline clears it. */
     var pacerSessionId: Int? = null,
-    /** Runtime captureAvailable pacing decision observed for this capture, if one was made. */
+    /**
+     * Runtime pacing decision consumed at this capture's draft start - the captureAvailable delay that gated this
+     * capture. Null when nothing gated it (first capture of a burst, or fresh process).
+     */
     var captureAvailablePacing: CaptureAvailablePacingMetrics? = null,
 )
 

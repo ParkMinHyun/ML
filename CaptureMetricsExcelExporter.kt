@@ -311,10 +311,12 @@ class CaptureMetricsExcelExporter(
             note = "Capture sheet persists the runtime state offline replay needs: pacerSessionId (burst boundary; " +
                     "pacer clear() on pipeline drain increments it), draftStartUptimeMs/draftEndUptimeMs/timeoutDeadlineUptimeMs " +
                     "(interarrival and deadline reconstruction), nodeStartUptimeMs per node row (real per-node timeline), and " +
-                    "runtimePacing* (the applied captureAvailable delay with every backlog-clock input that produced it: " +
-                    "level/backlog deficits, backlog, queued count/work, budget, preferred-path prediction/UB). " +
-                    "Skip and pacing counterfactuals can re-run the policy from these fields instead of the proxy columns; " +
-                    "runtimePacing* is null when the capture had no pacing decision (first capture of a fresh process).",
+                    "runtimePacing* (the pacing decision consumed at this capture's draft start - the captureAvailable delay " +
+                    "that gated this capture - with every backlog-clock input that produced it: level/backlog deficits, " +
+                    "backlog, queued count/work, budget, preferred-path prediction/UB; FIFO pairing mirrors the pacer's " +
+                    "backlog clock, no cross-id mapping involved). Skip and pacing counterfactuals can re-run the policy " +
+                    "from these fields instead of the proxy columns; runtimePacing* is null when nothing gated the capture " +
+                    "(first capture of a burst or fresh process).",
         ),
     )
 

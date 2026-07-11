@@ -15,7 +15,7 @@ class CaptureAvailablePacer(
 
     private var pacingPrediction: CaptureAvailablePacingPrediction? = null
     private val backlogClock = AdmittedBacklogClock()
-    private val decisionsBySequenceId = mutableMapOf<Int, CaptureAvailablePacingDecision>()
+    private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
     private var sessionId = 0
 
     /**
@@ -25,9 +25,13 @@ class CaptureAvailablePacer(
      * Watermark/DynamicFunction, or RESERVED Encoding for encoding-only captures. Level-based on purpose: every
      * capture overwrites it, so a fresh burst paces from its own budget instead of a stale trend carried over from
      * the previous burst.
+     *
+     * Returns the pending pacing decision this draft start consumes - the callback delay that gated this capture -
+     * for the metrics store. Same FIFO discipline as the backlog clock: the capture starting now is the oldest
+     * waiting admission, and mismatches from skipped callbacks do not accumulate past [clear].
      */
     @Synchronized
-    fun observeDraftStart(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long) {
+    fun observeDraftStart(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long): CaptureAvailablePacingDecision? {
         val estimate = predictor.estimateDraftPath(workloadSequenceKey)
         pacingPrediction = CaptureAvailablePacingPrediction(
             draftStartBudgetMs = budgetMs,
@@ -37,6 +41,7 @@ class CaptureAvailablePacer(
             workloadSequenceKey = workloadSequenceKey.toReplayString(),
         )
         backlogClock.rebaseOnDraftStart(estimate.predictedMs)
+        return pendingDecisions.removeFirstOrNull()
     }
 
     /**
@@ -51,9 +56,8 @@ class CaptureAvailablePacer(
      *   what spaces callbacks arriving mid-draft out to the service rate instead of re-applying one stale level
      *   correction. No tuned constant or threshold: only learned predictions and the existing capture timeout.
      */
-    @JvmOverloads
     @Synchronized
-    fun decideDelay(sequenceId: Int? = null): CaptureAvailablePacingDecision? {
+    fun decideDelay(): CaptureAvailablePacingDecision? {
         val prediction = pacingPrediction ?: return null
 
         val levelDeficitMs = positiveCeilMs(
@@ -81,16 +85,8 @@ class CaptureAvailablePacer(
             decisionUptimeMs = SystemClock.uptimeMillis(),
             prediction = prediction,
         )
-        if (sequenceId != null) {
-            decisionsBySequenceId[sequenceId] = decision
-        }
+        pendingDecisions.addLast(decision)
         return decision
-    }
-
-    /** Hands the recorded pacing decision for one capture to the metrics store; at most once per sequence. */
-    @Synchronized
-    fun takeDecision(sequenceId: Int): CaptureAvailablePacingDecision? {
-        return decisionsBySequenceId.remove(sequenceId)
     }
 
     /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
@@ -102,7 +98,7 @@ class CaptureAvailablePacer(
     fun clear() {
         pacingPrediction = null
         backlogClock.clear()
-        decisionsBySequenceId.clear()
+        pendingDecisions.clear()
         sessionId++
     }
 
