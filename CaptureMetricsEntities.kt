@@ -63,6 +63,56 @@ data class DraftSequenceMetricsEntity(
 
     @ColumnInfo(name = "is_timeout")
     val isTimeout: Boolean?,
+
+    @ColumnInfo(name = "draft_start_uptime_ms")
+    val draftStartUptimeMs: Long?,
+
+    @ColumnInfo(name = "draft_end_uptime_ms")
+    val draftEndUptimeMs: Long?,
+
+    @ColumnInfo(name = "pacer_session_id")
+    val pacerSessionId: Int?,
+
+    @Embedded(prefix = "pacing_")
+    val pacingSnapshot: CaptureAvailablePacingMetricsEntity?,
+)
+
+data class CaptureAvailablePacingMetricsEntity(
+    @ColumnInfo(name = "decision_uptime_ms")
+    val decisionUptimeMs: Long,
+
+    @ColumnInfo(name = "applied_delay_ms")
+    val appliedDelayMs: Long,
+
+    @ColumnInfo(name = "level_deficit_ms")
+    val levelDeficitMs: Long,
+
+    @ColumnInfo(name = "backlog_deficit_ms")
+    val backlogDeficitMs: Long,
+
+    @ColumnInfo(name = "backlog_ms")
+    val backlogMs: Long,
+
+    @ColumnInfo(name = "queued_draft_count")
+    val queuedDraftCount: Int,
+
+    @ColumnInfo(name = "queued_predicted_work_ms")
+    val queuedPredictedWorkMs: Double,
+
+    @ColumnInfo(name = "draft_start_budget_ms")
+    val draftStartBudgetMs: Long,
+
+    @ColumnInfo(name = "mandatory_reserve_upper_bound_ms")
+    val mandatoryReserveUpperBoundMs: Double,
+
+    @ColumnInfo(name = "preferred_draft_path_predicted_ms")
+    val preferredDraftPathPredictedMs: Double,
+
+    @ColumnInfo(name = "preferred_draft_path_upper_bound_ms")
+    val preferredDraftPathUpperBoundMs: Double,
+
+    @ColumnInfo(name = "workload_sequence_key")
+    val workloadSequenceKey: String,
 )
 
 @Entity(
@@ -123,6 +173,9 @@ data class NodeExecutionMetricsEntity(
 
     @ColumnInfo(name = "watchdog_timed_out")
     var watchdogTimedOut: Boolean?,
+
+    @ColumnInfo(name = "start_uptime_ms")
+    val startUptimeMs: Long?,
 )
 
 @Entity(

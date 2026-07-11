@@ -21,6 +21,27 @@ fun DraftSequenceMetrics.toEntity(captureMetricsId: Int): DraftSequenceMetricsEn
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
+        draftStartUptimeMs = draftStartUptimeMs,
+        draftEndUptimeMs = draftEndUptimeMs,
+        pacerSessionId = pacerSessionId,
+        pacingSnapshot = captureAvailablePacing?.toEntity(),
+    )
+}
+
+fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntity {
+    return CaptureAvailablePacingMetricsEntity(
+        decisionUptimeMs = decisionUptimeMs,
+        appliedDelayMs = appliedDelayMs,
+        levelDeficitMs = levelDeficitMs,
+        backlogDeficitMs = backlogDeficitMs,
+        backlogMs = backlogMs,
+        queuedDraftCount = queuedDraftCount,
+        queuedPredictedWorkMs = queuedPredictedWorkMs,
+        draftStartBudgetMs = draftStartBudgetMs,
+        mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
+        preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
+        preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
+        workloadSequenceKey = workloadSequenceKey,
     )
 }
 
@@ -55,6 +76,7 @@ fun NodeExecutionMetrics.toEntity(
         durationMs = postExecution.durationMs,
         watchdogTimeoutMs = watchdogTimeoutMs,
         watchdogTimedOut = watchdogTimedOut,
+        startUptimeMs = startUptimeMs,
     )
 }
 
@@ -156,6 +178,27 @@ fun DraftSequenceMetricsEntity.toModel(
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
+        draftStartUptimeMs = draftStartUptimeMs,
+        draftEndUptimeMs = draftEndUptimeMs,
+        pacerSessionId = pacerSessionId,
+        captureAvailablePacing = pacingSnapshot?.toModel(),
+    )
+}
+
+fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics {
+    return CaptureAvailablePacingMetrics(
+        decisionUptimeMs = decisionUptimeMs,
+        appliedDelayMs = appliedDelayMs,
+        levelDeficitMs = levelDeficitMs,
+        backlogDeficitMs = backlogDeficitMs,
+        backlogMs = backlogMs,
+        queuedDraftCount = queuedDraftCount,
+        queuedPredictedWorkMs = queuedPredictedWorkMs,
+        draftStartBudgetMs = draftStartBudgetMs,
+        mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
+        preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
+        preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
+        workloadSequenceKey = workloadSequenceKey,
     )
 }
 
@@ -167,6 +210,7 @@ fun NodeExecutionMetricsEntity.toModel(): NodeExecutionMetrics {
         workloadKey = workloadKey,
         watchdogTimeoutMs = watchdogTimeoutMs,
         watchdogTimedOut = watchdogTimedOut,
+        startUptimeMs = startUptimeMs,
     )
 }
 

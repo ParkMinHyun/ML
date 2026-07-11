@@ -94,24 +94,7 @@ class CaptureMetricsExcelExporter(
     }
 
     private fun processCaptures(captures: List<CaptureRow>): List<EnrichedCaptureRow> {
-        val groups = mutableListOf<List<CaptureRow>>()
-        var currentGroup = mutableListOf<CaptureRow>()
-        for (capture in captures) {
-            val isTimeout = capture.metrics.draftSequenceMetrics?.isTimeout == true
-            if (currentGroup.isEmpty() && isTimeout) {
-                continue
-            }
-
-            currentGroup.add(capture)
-
-            if (isTimeout) {
-                groups.add(currentGroup)
-                currentGroup = mutableListOf()
-            }
-        }
-        if (currentGroup.isNotEmpty()) {
-            groups.add(currentGroup)
-        }
+        val groups = groupCaptures(captures)
 
         val sortedGroups = groups.sortedBy { group ->
             group.firstOrNull()?.nodeRows?.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel ?: Int.MAX_VALUE
@@ -151,6 +134,50 @@ class CaptureMetricsExcelExporter(
             }
         }
         return enriched
+    }
+
+    /**
+     * Groups captures into burst sessions. Prefers the runtime pacer session id (increments each time the drained
+     * pipeline clears the pacer); rows recorded before that field existed fall back to the legacy
+     * timeout-delimited grouping.
+     */
+    private fun groupCaptures(captures: List<CaptureRow>): List<List<CaptureRow>> {
+        val groups = mutableListOf<List<CaptureRow>>()
+        var currentGroup = mutableListOf<CaptureRow>()
+
+        if (captures.isNotEmpty() && captures.all { it.metrics.draftSequenceMetrics?.pacerSessionId != null }) {
+            for (capture in captures) {
+                val previousSessionId = currentGroup.lastOrNull()?.metrics?.draftSequenceMetrics?.pacerSessionId
+                val sessionId = capture.metrics.draftSequenceMetrics?.pacerSessionId
+                if (currentGroup.isNotEmpty() && previousSessionId != sessionId) {
+                    groups.add(currentGroup)
+                    currentGroup = mutableListOf()
+                }
+                currentGroup.add(capture)
+            }
+            if (currentGroup.isNotEmpty()) {
+                groups.add(currentGroup)
+            }
+            return groups
+        }
+
+        for (capture in captures) {
+            val isTimeout = capture.metrics.draftSequenceMetrics?.isTimeout == true
+            if (currentGroup.isEmpty() && isTimeout) {
+                continue
+            }
+
+            currentGroup.add(capture)
+
+            if (isTimeout) {
+                groups.add(currentGroup)
+                currentGroup = mutableListOf()
+            }
+        }
+        if (currentGroup.isNotEmpty()) {
+            groups.add(currentGroup)
+        }
+        return groups
     }
 
     private fun generateSubSheets(
@@ -278,6 +305,16 @@ class CaptureMetricsExcelExporter(
                     "CaptureMetrics currently does not persist runtime captureAvailable elapsed time or runtime draft queue depth, " +
                     "so this exporter uses captureAvailableElapsedProxyMs=0 and queuedDraftCountProxy=sessionCaptureIndex-1 as a conservative burst proxy. " +
                     "Add runtime fields later to replace these proxy columns without changing the derived columns.",
+        ),
+        MetricNote(
+            metric = "Offline replay columns",
+            note = "Capture sheet persists the runtime state offline replay needs: pacerSessionId (burst boundary; " +
+                    "pacer clear() on pipeline drain increments it), draftStartUptimeMs/draftEndUptimeMs/timeoutDeadlineUptimeMs " +
+                    "(interarrival and deadline reconstruction), nodeStartUptimeMs per node row (real per-node timeline), and " +
+                    "runtimePacing* (the applied captureAvailable delay with every backlog-clock input that produced it: " +
+                    "level/backlog deficits, backlog, queued count/work, budget, preferred-path prediction/UB). " +
+                    "Skip and pacing counterfactuals can re-run the policy from these fields instead of the proxy columns; " +
+                    "runtimePacing* is null when the capture had no pacing decision (first capture of a fresh process).",
         ),
     )
 
@@ -1474,6 +1511,23 @@ class CaptureMetricsExcelExporter(
             Column("queueAwareMandatorySafeAfterPacing") { it.queueAwarePacing?.mandatorySafeAfterPacing },
             Column("draftNodeDurationMs") { it.row.encodingReserveRow?.nodeActualDurationMs },
             Column("") { "" },
+            Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
+            Column("draftStartUptimeMs") { it.row.metrics.draftSequenceMetrics?.draftStartUptimeMs },
+            Column("draftEndUptimeMs") { it.row.metrics.draftSequenceMetrics?.draftEndUptimeMs },
+            Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
+            Column("runtimePacingDecisionUptimeMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.decisionUptimeMs },
+            Column("runtimePacingAppliedDelayMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.appliedDelayMs },
+            Column("runtimePacingLevelDeficitMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.levelDeficitMs },
+            Column("runtimePacingBacklogDeficitMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.backlogDeficitMs },
+            Column("runtimePacingBacklogMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.backlogMs },
+            Column("runtimePacingQueuedDraftCount") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.queuedDraftCount },
+            Column("runtimePacingQueuedPredictedWorkMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.queuedPredictedWorkMs },
+            Column("runtimePacingDraftStartBudgetMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.draftStartBudgetMs },
+            Column("runtimePacingMandatoryReserveUpperBoundMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.mandatoryReserveUpperBoundMs },
+            Column("runtimePacingPreferredPathPredictedMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.preferredDraftPathPredictedMs },
+            Column("runtimePacingPreferredPathUpperBoundMs") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.preferredDraftPathUpperBoundMs },
+            Column("runtimePacingWorkloadSequenceKey") { it.row.metrics.draftSequenceMetrics?.captureAvailablePacing?.workloadSequenceKey },
+            Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("sessionCaptureIndex") { it.sessionSummary.sessionCaptureIndex },
             Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
@@ -1506,6 +1560,7 @@ class CaptureMetricsExcelExporter(
             Column("budgetMs") { it.nodeRow.node.preExecutionMetrics.budgetMs },
             Column("admit") { it.nodeRow.prediction?.admit },
             Column("admissionSkipReason") { it.admissionSkipReason() },
+            Column("nodeStartUptimeMs") { it.nodeRow.node.startUptimeMs },
             Column("durationMs") { it.nodeRow.nodeActualDurationMs },
             Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
             Column("watchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },

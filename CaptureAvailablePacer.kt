@@ -15,6 +15,8 @@ class CaptureAvailablePacer(
 
     private var pacingPrediction: CaptureAvailablePacingPrediction? = null
     private val backlogClock = AdmittedBacklogClock()
+    private val decisionsBySequenceId = mutableMapOf<Int, CaptureAvailablePacingDecision>()
+    private var sessionId = 0
 
     /**
      * Observes a draft start: refreshes the pacing prediction from the draft sequence's current budget
@@ -49,14 +51,17 @@ class CaptureAvailablePacer(
      *   what spaces callbacks arriving mid-draft out to the service rate instead of re-applying one stale level
      *   correction. No tuned constant or threshold: only learned predictions and the existing capture timeout.
      */
+    @JvmOverloads
     @Synchronized
-    fun decideDelay(): CaptureAvailablePacingDecision? {
+    fun decideDelay(sequenceId: Int? = null): CaptureAvailablePacingDecision? {
         val prediction = pacingPrediction ?: return null
 
         val levelDeficitMs = positiveCeilMs(
             prediction.preferredDraftPathUpperBoundMs - prediction.draftStartBudgetMs.coerceAtLeast(0L),
         )
         val backlogMs = backlogClock.backlogMs()
+        val queuedDraftCount = backlogClock.queuedCount()
+        val queuedPredictedWorkMs = backlogClock.queuedPredictedWorkMs()
         // Delaying the callback lets the backlog drain before the next capture's timeout clock starts, so the
         // admitted capture keeps its full preferred-path budget once backlog - delay fits the capture timeout.
         val backlogDeficitMs = positiveCeilMs(
@@ -66,19 +71,39 @@ class CaptureAvailablePacer(
 
         backlogClock.onCallbackAdmitted(prediction.preferredDraftPathPredictedMs, delayMs)
 
-        return CaptureAvailablePacingDecision(
+        val decision = CaptureAvailablePacingDecision(
             delayMs = delayMs,
             backlogMs = backlogMs,
             levelDeficitMs = levelDeficitMs,
+            backlogDeficitMs = backlogDeficitMs,
+            queuedDraftCount = queuedDraftCount,
+            queuedPredictedWorkMs = queuedPredictedWorkMs,
+            decisionUptimeMs = SystemClock.uptimeMillis(),
             prediction = prediction,
         )
+        if (sequenceId != null) {
+            decisionsBySequenceId[sequenceId] = decision
+        }
+        return decision
     }
+
+    /** Hands the recorded pacing decision for one capture to the metrics store; at most once per sequence. */
+    @Synchronized
+    fun takeDecision(sequenceId: Int): CaptureAvailablePacingDecision? {
+        return decisionsBySequenceId.remove(sequenceId)
+    }
+
+    /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
+    @Synchronized
+    fun currentSessionId(): Int = sessionId
 
     /** Clears pacing state when the draft task queue is fully drained. */
     @Synchronized
     fun clear() {
         pacingPrediction = null
         backlogClock.clear()
+        decisionsBySequenceId.clear()
+        sessionId++
     }
 
     private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
@@ -95,6 +120,12 @@ class CaptureAvailablePacer(
 
         /** Admitted-but-undrained draft work left, measured from now. */
         fun backlogMs(): Long = (busyUntilUptimeMs - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+
+        /** Callbacks released whose draft has not started yet. */
+        fun queuedCount(): Int = waitingPredictedMsQueue.size
+
+        /** Predicted work of the waiting callbacks, for metrics. */
+        fun queuedPredictedWorkMs(): Double = waitingPredictedMsTotal
 
         /** One callback released: its capture joins the waiting backlog and extends the busy horizon by its prediction. */
         fun onCallbackAdmitted(predictedMs: Double, delayMs: Long) {
@@ -153,5 +184,27 @@ data class CaptureAvailablePacingDecision(
     val delayMs: Long,
     val backlogMs: Long,
     val levelDeficitMs: Long,
+    val backlogDeficitMs: Long,
+    val queuedDraftCount: Int,
+    val queuedPredictedWorkMs: Double,
+    val decisionUptimeMs: Long,
     val prediction: CaptureAvailablePacingPrediction,
 )
+
+/** Snapshot of one runtime pacing decision for the [CaptureMetrics] observability store. */
+fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAvailablePacingMetrics {
+    return CaptureAvailablePacingMetrics(
+        decisionUptimeMs = decisionUptimeMs,
+        appliedDelayMs = delayMs,
+        levelDeficitMs = levelDeficitMs,
+        backlogDeficitMs = backlogDeficitMs,
+        backlogMs = backlogMs,
+        queuedDraftCount = queuedDraftCount,
+        queuedPredictedWorkMs = queuedPredictedWorkMs,
+        draftStartBudgetMs = prediction.draftStartBudgetMs,
+        mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
+        preferredDraftPathPredictedMs = prediction.preferredDraftPathPredictedMs,
+        preferredDraftPathUpperBoundMs = prediction.preferredDraftPathUpperBoundMs,
+        workloadSequenceKey = prediction.workloadSequenceKey,
+    )
+}

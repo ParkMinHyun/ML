@@ -12,7 +12,7 @@ import androidx.room.RoomDatabase
         NodeExecutionMetricsEntity::class,
         ExecutionPredictionEntity::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = true,
 )
 abstract class CaptureMetricsDatabase : RoomDatabase() {
@@ -33,6 +33,7 @@ abstract class CaptureMetricsDatabase : RoomDatabase() {
                     CaptureMetricsDatabase::class.java,
                     DATABASE_NAME,
                 )
+                    .fallbackToDestructiveMigration()
                     .build()
                     .also { INSTANCE = it }
             }

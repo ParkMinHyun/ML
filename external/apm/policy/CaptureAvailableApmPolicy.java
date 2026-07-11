@@ -95,7 +95,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      */
     @Override
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
-        final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay();
+        final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay(sequenceId);
 
         long appliedDelayMs = 0L;
         boolean warning = false;
