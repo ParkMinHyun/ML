@@ -5,6 +5,26 @@ import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import kotlin.math.ceil
 
+internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, preferredUpperBoundMs: Double): Long {
+    return positiveCeilMs(preferredUpperBoundMs - draftStartBudgetMs.coerceAtLeast(0L))
+}
+
+internal fun captureAvailableBacklogDeficitMs(
+    backlogMs: Long,
+    observedSojournMs: Long,
+    preferredUpperBoundMs: Double,
+): Long {
+    return positiveCeilMs(
+        backlogMs + observedSojournMs + preferredUpperBoundMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+    )
+}
+
+internal fun captureAvailableDelayMs(levelDeficitMs: Long, backlogDeficitMs: Long): Long {
+    return maxOf(levelDeficitMs, backlogDeficitMs)
+}
+
+private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
+
 /**
  * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current reserve, APM timings
  * update the observed session maxima, and each admission is paired with the next draft start through one FIFO.
@@ -69,13 +89,16 @@ class CaptureAvailablePacer(
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
         val reservedMs = prediction.preferredDraftPathUpperBoundMs
         val queuedReservedWorkMs = sumQueuedReservedWorkMs()
-        val levelDeficitMs = positiveCeilMs(
-            reservedMs - prediction.draftStartBudgetMs.coerceAtLeast(0L),
+        val levelDeficitMs = captureAvailableLevelDeficitMs(
+            draftStartBudgetMs = prediction.draftStartBudgetMs,
+            preferredUpperBoundMs = reservedMs,
         )
-        val backlogDeficitMs = positiveCeilMs(
-            backlogMs + observedSojournMs + reservedMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+        val backlogDeficitMs = captureAvailableBacklogDeficitMs(
+            backlogMs = backlogMs,
+            observedSojournMs = observedSojournMs,
+            preferredUpperBoundMs = reservedMs,
         )
-        val delayMs = maxOf(levelDeficitMs, backlogDeficitMs)
+        val delayMs = captureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
 
         val decision = CaptureAvailablePacingDecision(
             delayMs = delayMs,
@@ -157,8 +180,6 @@ class CaptureAvailablePacer(
             decision.prediction.preferredDraftPathUpperBoundMs
         }
     }
-
-    private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
 
     companion object {
         @JvmStatic

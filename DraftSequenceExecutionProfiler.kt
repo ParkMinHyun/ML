@@ -15,6 +15,30 @@ import java.util.concurrent.CompletableFuture
 
 private const val TAG = "DraftSequenceExecutionProfiler"
 
+/** Effective admission rule shared by runtime execution and session-ordered offline replay. */
+internal fun applySessionAdmissionPolicy(
+    captureAvailablePacer: CaptureAvailablePacer,
+    workloadKey: WorkloadKey,
+    hasFrameWatermark: Boolean,
+    modelAdmit: Boolean,
+): Boolean {
+    if (workloadKey is WorkloadKey.Decoding && hasFrameWatermark) {
+        return true
+    }
+    return when (workloadKey) {
+        is WorkloadKey.Bokeh ->
+            captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
+        is WorkloadKey.Decoding, is WorkloadKey.Filter ->
+            captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
+        is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
+            modelAdmit
+        } else {
+            modelAdmit && !captureAvailablePacer.isSessionDemoted(SessionDemotion.YUV_EFFECTS)
+        }
+        is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
+    }
+}
+
 /**
  * Drives one draft sequence's node lifecycle: classifies each executing node into a [WorkloadKey], asks the
  * Predictor for an admission decision, and feeds the observed outcome back at capture end.
@@ -103,23 +127,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun effectiveAdmit(workloadSequenceKey: WorkloadSequenceKey, modelAdmit: Boolean): Boolean {
-        val workloadKey = workloadSequenceKey.headWorkloadKey
-        if (workloadKey is WorkloadKey.Decoding && workloadSequenceKey.hasFrameWatermark()) {
-            return true
-        }
-        return when (workloadKey) {
-            is WorkloadKey.Bokeh ->
-                captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
-            is WorkloadKey.Decoding, is WorkloadKey.Filter ->
-                captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
-            is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
-                modelAdmit
-            } else {
-                // Overlay Watermark follows the YUV chain's demotion but its own model rejection does not trigger it.
-                modelAdmit && !captureAvailablePacer.isSessionDemoted(SessionDemotion.YUV_EFFECTS)
-            }
-            is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
-        }
+        return applySessionAdmissionPolicy(
+            captureAvailablePacer = captureAvailablePacer,
+            workloadKey = workloadSequenceKey.headWorkloadKey,
+            hasFrameWatermark = workloadSequenceKey.hasFrameWatermark(),
+            modelAdmit = modelAdmit,
+        )
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {

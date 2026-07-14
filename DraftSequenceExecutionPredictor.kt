@@ -7,6 +7,15 @@ import kotlin.math.roundToLong
 
 private const val TAG = "DraftSequenceExecutionPredictor"
 
+/** Pure OPTIONAL gate shared by runtime prediction and fixed-prediction offline replay. */
+internal fun shouldAdmitOptionalWorkload(
+    sequencePredictedMs: Double,
+    sequenceUpperBoundMs: Double,
+    budgetMs: Long,
+): Boolean {
+    return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
+}
+
 /**
  * Sequence-aware, phase-aware, adaptive upper bound.
  *
@@ -62,12 +71,7 @@ class DraftSequenceExecutionPredictor {
         sequenceUpperBoundMs: Double,
         budgetMs: Long,
     ): Boolean {
-        // Cold start: nothing learned for this sequence yet, so admit and let the models start learning.
-        if (sequencePredictedMs <= 0.0) {
-            return true
-        }
-
-        val admit = sequenceUpperBoundMs <= budgetMs
+        val admit = shouldAdmitOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         if (!admit) {
             CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         }
