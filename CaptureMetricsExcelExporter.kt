@@ -112,30 +112,10 @@ class CaptureMetricsExcelExporter(
         return enriched
     }
 
-    /**
-     * Groups captures into burst sessions. Prefers the runtime pacer session id (increments each time the drained
-     * pipeline clears the pacer); rows recorded before that field existed fall back to the legacy
-     * timeout-delimited grouping.
-     */
+    /** Groups captures into timeout-delimited sessions. */
     private fun groupCaptures(captures: List<CaptureRow>): List<List<CaptureRow>> {
         val groups = mutableListOf<List<CaptureRow>>()
         var currentGroup = mutableListOf<CaptureRow>()
-
-        if (captures.isNotEmpty() && captures.all { it.metrics.draftSequenceMetrics?.pacerSessionId != null }) {
-            for (capture in captures) {
-                val previousSessionId = currentGroup.lastOrNull()?.metrics?.draftSequenceMetrics?.pacerSessionId
-                val sessionId = capture.metrics.draftSequenceMetrics?.pacerSessionId
-                if (currentGroup.isNotEmpty() && previousSessionId != sessionId) {
-                    groups.add(currentGroup)
-                    currentGroup = mutableListOf()
-                }
-                currentGroup.add(capture)
-            }
-            if (currentGroup.isNotEmpty()) {
-                groups.add(currentGroup)
-            }
-            return groups
-        }
 
         for (capture in captures) {
             val isTimeout = capture.metrics.draftSequenceMetrics?.isTimeout == true

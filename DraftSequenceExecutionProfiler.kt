@@ -62,11 +62,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             WorkloadSequenceKey(plannedWorkloadKeys),
             readBudgetMs(),
         )
-        metricsRecorder.onDraftStart(
-            draftStartUptimeMs = SystemClock.uptimeMillis(),
-            pacerSessionId = captureAvailablePacer.currentSessionId(),
-            gatingPacingDecision = gatingPacingDecision,
-        )
+        metricsRecorder.onDraftStart(gatingPacingDecision)
     }
 
     /**
@@ -112,9 +108,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             return true
         }
         return when (workloadKey) {
-            is WorkloadKey.Bokeh -> admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
+            is WorkloadKey.Bokeh ->
+                captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
             is WorkloadKey.Decoding, is WorkloadKey.Filter ->
-                admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
+                captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
             is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
                 modelAdmit
             } else {
@@ -123,21 +120,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             }
             is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
         }
-    }
-
-    /**
-     * Session-sticky OPTIONAL gate: once this group is rejected it stays rejected until the pipeline drains (pacer
-     * [clear]), so effects cannot alternate on/off between consecutive captures of one burst. The pacer only holds
-     * the demotion state; the sticky decision is made here.
-     */
-    private fun admitWithSessionDemotion(demotion: SessionDemotion, modelAdmit: Boolean): Boolean {
-        if (captureAvailablePacer.isSessionDemoted(demotion)) {
-            return false
-        }
-        if (!modelAdmit) {
-            captureAvailablePacer.demoteForSession(demotion)
-        }
-        return modelAdmit
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {
@@ -204,10 +186,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
-        metricsRecorder.onCaptureEnd(
-            isTimeout = isTimeout,
-            draftEndUptimeMs = SystemClock.uptimeMillis(),
-        )
+        metricsRecorder.onCaptureEnd(isTimeout)
         return isTimeout
     }
 
@@ -307,14 +286,8 @@ private class MetricsRecorder(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    fun onDraftStart(
-        draftStartUptimeMs: Long,
-        pacerSessionId: Int,
-        gatingPacingDecision: CaptureAvailablePacingDecision?,
-    ) {
+    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?) {
         synchronized(draftSequenceMetrics) {
-            draftSequenceMetrics.draftStartUptimeMs = draftStartUptimeMs
-            draftSequenceMetrics.pacerSessionId = pacerSessionId
             if (gatingPacingDecision != null) {
                 draftSequenceMetrics.captureAvailablePacing = gatingPacingDecision.toCaptureAvailablePacingMetrics()
             }
@@ -364,10 +337,9 @@ private class MetricsRecorder(
         }
     }
 
-    fun onCaptureEnd(isTimeout: Boolean, draftEndUptimeMs: Long) {
+    fun onCaptureEnd(isTimeout: Boolean) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.isTimeout = isTimeout
-            draftSequenceMetrics.draftEndUptimeMs = draftEndUptimeMs
         }
     }
 }

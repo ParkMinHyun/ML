@@ -116,8 +116,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             final CaptureAvailableData captureAvailableData = provider.getSelectedApmResultData(sequenceId, SELECTOR);
             maxDraftTimeMs = captureAvailableData.getMaxDraftTime();
             captureAvailableTimeMs = captureAvailableData.getCaptureAvailableTime();
-            CaptureAvailablePacer.getInstance().observeDraftMeasured(maxDraftTimeMs);
-            CaptureAvailablePacer.getInstance().observeSojourn(captureAvailableTimeMs);
+            CaptureAvailablePacer.getInstance().observeDraftTimings(maxDraftTimeMs, captureAvailableTimeMs);
         }
 
         final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay();

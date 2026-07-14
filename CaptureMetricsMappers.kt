@@ -21,9 +21,9 @@ fun DraftSequenceMetrics.toEntity(captureMetricsId: Int): DraftSequenceMetricsEn
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
-        draftStartUptimeMs = draftStartUptimeMs,
-        draftEndUptimeMs = draftEndUptimeMs,
-        pacerSessionId = pacerSessionId,
+        legacyDraftStartUptimeMs = null,
+        legacyDraftEndUptimeMs = null,
+        legacyPacerSessionId = null,
         pacingSnapshot = captureAvailablePacing?.toEntity(),
     )
 }
@@ -178,9 +178,6 @@ fun DraftSequenceMetricsEntity.toModel(
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
-        draftStartUptimeMs = draftStartUptimeMs,
-        draftEndUptimeMs = draftEndUptimeMs,
-        pacerSessionId = pacerSessionId,
         captureAvailablePacing = pacingSnapshot?.toModel(),
     )
 }
