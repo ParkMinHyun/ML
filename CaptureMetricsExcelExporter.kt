@@ -385,7 +385,9 @@ class CaptureMetricsExcelExporter(
             return if (prediction.sequencePredictedUpperBoundMs > nodeRow.node.preExecutionMetrics.budgetMs) {
                 ADMISSION_SKIP_REASON_UPPER_BOUND
             } else {
-                ADMISSION_SKIP_REASON_BUDGET_RUNWAY
+                // The model only rejects when UB exceeds budget, so a skip with UB within budget was forced by
+                // session-sticky demotion (or the per-capture chain forcing that preceded it in older rows).
+                ADMISSION_SKIP_REASON_SESSION_DEMOTION
             }
         }
 
@@ -564,7 +566,7 @@ class CaptureMetricsExcelExporter(
         private const val ADMISSION_STAGE_FILTER = "Filter"
         private const val ADMISSION_STAGE_OVERLAY_WATERMARK = "OverlayWatermark"
         private const val ADMISSION_SKIP_REASON_UPPER_BOUND = "upper bound"
-        private const val ADMISSION_SKIP_REASON_BUDGET_RUNWAY = "budget runway"
+        private const val ADMISSION_SKIP_REASON_SESSION_DEMOTION = "session demotion"
 
         private fun nodeSheetRows(captures: List<CaptureRow>): List<NodeSheetRow> {
             return captures.flatMap { capture ->

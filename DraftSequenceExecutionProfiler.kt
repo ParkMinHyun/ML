@@ -40,12 +40,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
-    private var skipRemainingYuvEffects = false
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
-     * Bokeh pacing uses the full planned suffix even before the second input arrives; encoding-only captures pace
-     * the RESERVED Encoding sequence so captureAvailable admission and draft-start observations stay balanced.
+     * Passes the full planned suffix (even before Bokeh's second input arrives); the pacer subtracts any
+     * session-demoted workloads itself, since it owns that state. Encoding-only captures pace the RESERVED Encoding
+     * sequence so captureAvailable admission and draft-start observations stay balanced.
      */
     fun initializeDraftNodeChain(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -72,10 +72,11 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     /**
      * Profiles one predictable node execution.
      *
-     * OPTIONAL workloads are admitted by their remaining suffix UB. JPEG-path Decoding is forced when required by
-     * Frame Watermark; otherwise, rejecting Decoding or Filter rejects downstream YUV effects. REQUIRED workloads
-     * (DynamicFunction / Frame Watermark) always run but are not reserve-protected; RESERVED workload is the
-     * mandatory tail.
+     * OPTIONAL workloads are admitted by their remaining suffix UB, hardened by session-sticky demotion: the first
+     * in-session rejection of Bokeh, or of the Decoding-Filter-Overlay Watermark chain, forces rejection until the
+     * draft pipeline drains ([CaptureAvailablePacer.clear]), so one burst never alternates effects between shots.
+     * JPEG-path Decoding is forced when required by Frame Watermark. REQUIRED workloads (DynamicFunction / Frame
+     * Watermark) always run but are not reserve-protected; RESERVED workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
@@ -110,19 +111,33 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         if (workloadKey is WorkloadKey.Decoding && workloadSequenceKey.hasFrameWatermark()) {
             return true
         }
-        // TODO : Refactoring
-        val admit = when {
-            skipRemainingYuvEffects && workloadKey is WorkloadKey.Filter -> false
-            skipRemainingYuvEffects && workloadKey is WorkloadKey.Watermark ->
-                workloadKey.watermarkType == WatermarkType.FRAME
-            else -> modelAdmit
+        return when (workloadKey) {
+            is WorkloadKey.Bokeh -> admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
+            is WorkloadKey.Decoding, is WorkloadKey.Filter ->
+                admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
+            is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
+                modelAdmit
+            } else {
+                // Overlay Watermark follows the YUV chain's demotion but its own model rejection does not trigger it.
+                modelAdmit && !captureAvailablePacer.isSessionDemoted(SessionDemotion.YUV_EFFECTS)
+            }
+            is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
         }
+    }
 
-        if (!admit && (workloadKey is WorkloadKey.Decoding || workloadKey is WorkloadKey.Filter)) {
-            skipRemainingYuvEffects = true
+    /**
+     * Session-sticky OPTIONAL gate: once this group is rejected it stays rejected until the pipeline drains (pacer
+     * [clear]), so effects cannot alternate on/off between consecutive captures of one burst. The pacer only holds
+     * the demotion state; the sticky decision is made here.
+     */
+    private fun admitWithSessionDemotion(demotion: SessionDemotion, modelAdmit: Boolean): Boolean {
+        if (captureAvailablePacer.isSessionDemoted(demotion)) {
+            return false
         }
-
-        return admit
+        if (!modelAdmit) {
+            captureAvailablePacer.demoteForSession(demotion)
+        }
+        return modelAdmit
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {

@@ -47,11 +47,9 @@ import java.util.function.BiConsumer;
  */
 public class ProcessingDataRepository extends ApmDataRepository<ProcessingResultData> {
     private static final String TAG = "ProcessingDataRepository";
-    private static final int MAX_DRAFT_TIME_SIZE = 3;
-    private static final int MAX_CAN_TIME_SIZE = 10;
 
     private final Object lock = new Object();
-    private final Deque<Long> draftTimeDeque = new ArrayDeque<>(MAX_DRAFT_TIME_SIZE);
+    private final Deque<Long> draftTimeDeque = new ArrayDeque<>();
     private final LinkedHashMap</*sequenceId*/Integer, /*time*/Long> canTimeMap = new LinkedHashMap<>();
 
     /**
@@ -95,10 +93,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
 
     private void addDraftTaskProcessingTime(@NonNull DraftTimeApmData time) {
         synchronized (lock) {
-            if (draftTimeDeque.size() == MAX_DRAFT_TIME_SIZE) {
-                draftTimeDeque.removeFirst();
-            }
-
             draftTimeDeque.addLast(time.getElapsedTime());
         }
         PLog.i(TAG, "addDraftTaskProcessingTime: " + time);
@@ -114,9 +108,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
         }
 
         synchronized (lock) {
-            if (canTimeMap.size() == MAX_CAN_TIME_SIZE) {
-                canTimeMap.remove(canTimeMap.firstEntry().getKey());
-            }
             canTimeMap.put(time.getSequenceId(), elapsedTime);
         }
         PLog.i(TAG, "addCaptureAvailableTime: " + time);

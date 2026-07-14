@@ -22,6 +22,9 @@ import androidx.annotation.NonNull;
 
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
+import com.samsung.android.camera.core2.apm.repository.ApmDataProvider;
+import com.samsung.android.camera.core2.apm.repository.ApmResultDataSelector;
+import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
@@ -48,6 +51,17 @@ import java.util.List;
 public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static final String TAG = "CaptureAvailableApmPolicy";
 
+    /**
+     * Reads the whole draft-task times and capture-available latency the {@link ProcessingResultData} repository
+     * collected. The max draft time (not a mean) feeds the pacer's observed reserve; a mean would lag a rising
+     * thermal trend and let the queue overrun.
+     */
+    private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
+            new CaptureAvailableData(
+                    resultData.getDraftTimes(),
+                    resultData.getCaptureAvailableTime()
+            );
+
     private SingleThreadDelayedScheduler singleThreadDelayedScheduler;
 
     /**
@@ -62,7 +76,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      * @param apmDataRepositoryStore Store for accessing APM data repositories.
      */
     public CaptureAvailableApmPolicy(@NonNull ApmDataRepositoryStore apmDataRepositoryStore) {
-        super(apmDataRepositoryStore, List.of());
+        super(apmDataRepositoryStore, List.of(ProcessingResultData.class));
     }
 
     /**
@@ -95,12 +109,23 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      */
     @Override
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
+        long maxDraftTimeMs = 0L;
+        long captureAvailableTimeMs = 0L;
+        final ApmDataProvider<ProcessingResultData> provider = getApmDataProvider(ProcessingResultData.class);
+        if (provider != null) {
+            final CaptureAvailableData captureAvailableData = provider.getSelectedApmResultData(sequenceId, SELECTOR);
+            maxDraftTimeMs = captureAvailableData.getMaxDraftTime();
+            captureAvailableTimeMs = captureAvailableData.getCaptureAvailableTime();
+            CaptureAvailablePacer.getInstance().observeDraftMeasured(maxDraftTimeMs);
+            CaptureAvailablePacer.getInstance().observeSojourn(captureAvailableTimeMs);
+        }
+
         final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay();
 
         long appliedDelayMs = 0L;
         boolean warning = false;
         String reason = "captureAvailable pacing waits for the first draft prediction";
-        String pacingDetails = "";
+        String pacingDetails = ", maxDraftTime=" + maxDraftTimeMs + "ms, captureAvailableTime=" + captureAvailableTimeMs + "ms";
 
         if (pacingDecision != null) {
             final CaptureAvailablePacingPrediction pacingPrediction = pacingDecision.getPrediction();
@@ -118,7 +143,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 reason = "budget is enough";
             }
 
-            pacingDetails = ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
+            pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
                     + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
                     + ", preferredDraftPathPredicted=" + pacingPrediction.getPreferredDraftPathPredictedMs() + "ms"
                     + ", preferredDraftPathUpperBound=" + pacingPrediction.getPreferredDraftPathUpperBoundMs() + "ms"
@@ -171,6 +196,36 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     @Override
     protected String getTag() {
         return TAG;
+    }
+
+    /**
+     * <div class="camera_en">
+     * Snapshot the pacer reads each callback: the max of the recorded whole draft-task times (measured outside the
+     * draft process lock) and the capture-available latency. Max, not mean, so a rising thermal trend is not
+     * averaged away.
+     * </div>
+     *
+     * <div class="camera_kr" style="display:none;">
+     * pacer가 콜백마다 읽는 스냅샷: 기록된 draft task 전체 시간(draft process lock 밖 측정)의 최댓값과
+     * capture-available 지연. 평균이 아니라 max라 상승하는 thermal 추세가 평균으로 희석되지 않습니다.
+     * </div>
+     */
+    private static class CaptureAvailableData {
+        private final long maxDraftTime;
+        private final long captureAvailableTime;
+
+        CaptureAvailableData(@NonNull List<Long> draftTimes, long captureAvailableTime) {
+            this.maxDraftTime = draftTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
+            this.captureAvailableTime = captureAvailableTime;
+        }
+
+        long getMaxDraftTime() {
+            return maxDraftTime;
+        }
+
+        long getCaptureAvailableTime() {
+            return captureAvailableTime;
+        }
     }
 
 }
