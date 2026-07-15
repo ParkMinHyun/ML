@@ -1016,7 +1016,7 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
-            Column("beforeQueuedReservedWorkMs") {
+            Column("beforeQueuedPredictedWorkMs") {
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
             },
             Column("beforeObservedSojournMs") { it.row.pacingReplay?.before?.observedSojournMs },

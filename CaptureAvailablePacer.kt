@@ -40,6 +40,14 @@ class CaptureAvailablePacer(
 
     private var observedMaxDraftMs = 0L
     private var observedSojournMs = 0L
+
+    /**
+     * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
+     * capture's point prediction, never by its reserve. Summing k reserves would price a queue at k times the session
+     * worst case, which no observed burst reaches, and the over-pricing compounds with queue depth. The timeout
+     * margin comes from the reserve that [decideDelay] adds for the single capture being paced; underruns here do not
+     * accumulate because every draft start rebases this clock onto the real one.
+     */
     private var busyUntilUptimeMs = 0L
 
     /** Refreshes the pacing prediction and consumes the oldest admitted callback. */
@@ -65,7 +73,7 @@ class CaptureAvailablePacer(
             preferredDraftPathUpperBoundMs = draftReserveMs,
             workloadSequenceKey = preferredSequenceKey.toReplayString(),
         )
-        return rebaseBacklogOnDraftStart(draftReserveMs)
+        return rebaseBacklogOnDraftStart(preferredEstimate.predictedMs)
     }
 
     /** Records the APM timings observed together for one capture. */
@@ -89,7 +97,7 @@ class CaptureAvailablePacer(
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
         val reservedMs = prediction.preferredDraftPathUpperBoundMs
-        val queuedReservedWorkMs = sumQueuedReservedWorkMs()
+        val queuedPredictedWorkMs = sumQueuedPredictedWorkMs()
         val levelDeficitMs = captureAvailableLevelDeficitMs(
             draftStartBudgetMs = prediction.draftStartBudgetMs,
             preferredUpperBoundMs = reservedMs,
@@ -107,7 +115,7 @@ class CaptureAvailablePacer(
             levelDeficitMs = levelDeficitMs,
             backlogDeficitMs = backlogDeficitMs,
             queuedDraftCount = pendingDecisions.size,
-            queuedPredictedWorkMs = queuedReservedWorkMs,
+            queuedPredictedWorkMs = queuedPredictedWorkMs,
             observedSojournMs = observedSojournMs,
             observedMaxDraftMs = observedMaxDraftMs,
             decisionUptimeMs = nowUptimeMs,
@@ -115,7 +123,7 @@ class CaptureAvailablePacer(
         )
         pendingDecisions.addLast(decision)
         busyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, busyUntilUptimeMs) +
-            ceil(reservedMs).toLong()
+            ceil(prediction.preferredDraftPathPredictedMs).toLong()
         return decision
     }
 
@@ -175,17 +183,17 @@ class CaptureAvailablePacer(
         }
     }
 
-    /** Reuses the decision FIFO as the admitted-reserve FIFO instead of maintaining a second queue. */
-    private fun rebaseBacklogOnDraftStart(startingReservedMs: Double): CaptureAvailablePacingDecision? {
+    /** Reuses the decision FIFO as the admitted-work FIFO instead of maintaining a second queue. */
+    private fun rebaseBacklogOnDraftStart(startingPredictedMs: Double): CaptureAvailablePacingDecision? {
         val gatingDecision = pendingDecisions.removeFirstOrNull()
         busyUntilUptimeMs = SystemClock.uptimeMillis() +
-            ceil(startingReservedMs + sumQueuedReservedWorkMs()).toLong()
+            ceil(startingPredictedMs + sumQueuedPredictedWorkMs()).toLong()
         return gatingDecision
     }
 
-    private fun sumQueuedReservedWorkMs(): Double {
+    private fun sumQueuedPredictedWorkMs(): Double {
         return pendingDecisions.sumOf { decision ->
-            decision.prediction.preferredDraftPathUpperBoundMs
+            decision.prediction.preferredDraftPathPredictedMs
         }
     }
 
