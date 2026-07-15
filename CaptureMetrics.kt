@@ -1,5 +1,6 @@
 package com.samsung.android.camera.core2.ml
 
+import android.os.SystemClock
 import android.util.Size
 
 data class CaptureMetrics @JvmOverloads constructor(
@@ -11,7 +12,11 @@ data class CaptureMetrics @JvmOverloads constructor(
     val resultImageFileName: String,
     var timeoutTimestampMs: Long? = null,
     var draftSequenceMetrics: DraftSequenceMetrics? = null,
-)
+    /** Gap from the previous capture's creation; the burst interarrival the pacer's delay actually produced. */
+    var shotToShotTimeMs: Long? = null,
+) {
+    val creationTimestampMs: Long = SystemClock.uptimeMillis()
+}
 
 data class DraftSequenceMetrics @JvmOverloads constructor(
     val nodeExecutionMetricsList: MutableList<NodeExecutionMetrics> = mutableListOf(),

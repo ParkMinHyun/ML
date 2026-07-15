@@ -12,6 +12,7 @@ fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
         resultImageFormat = resultImageFormat,
         resultImageFileName = resultImageFileName,
         timeoutTimestampMs = timeoutTimestampMs,
+        shotToShotTimeMs = shotToShotTimeMs,
     )
 }
 
@@ -158,6 +159,7 @@ fun CaptureMetricsAggregate.toModel(): CaptureMetrics {
         resultImageFormat = capture.resultImageFormat,
         resultImageFileName = capture.resultImageFileName,
         timeoutTimestampMs = capture.timeoutTimestampMs,
+        shotToShotTimeMs = capture.shotToShotTimeMs,
         draftSequenceMetrics = draftSequenceMetrics?.toModel(
             nodeExecutionMetricsList = nodeExecutionMetrics
                 .sortedBy { it.order }

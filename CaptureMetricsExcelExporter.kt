@@ -1106,6 +1106,7 @@ class CaptureMetricsExcelExporter(
             Column("resultImageWidth") { it.row.metrics.resultImageSize.width },
             Column("resultImageHeight") { it.row.metrics.resultImageSize.height },
             Column("resultImageFileName") { it.row.metrics.resultImageFileName },
+            Column("shotToShotTimeMs") { it.row.metrics.shotToShotTimeMs },
             Column("draftSequenceNodeCount") { it.row.nodeRows.size.takeIf { nodeCount -> nodeCount > 0 } },
             Column("draftSequenceDurationMs") {
                 it.row.nodeRows.sumOf { nodeRow -> nodeRow.node.postExecutionMetrics.durationMs }

@@ -36,6 +36,9 @@ data class CaptureMetricsEntity(
 
     @ColumnInfo(name = "timeout_timestamp_ms")
     val timeoutTimestampMs: Long?,
+
+    @ColumnInfo(name = "shot_to_shot_time_ms")
+    val shotToShotTimeMs: Long?,
 )
 
 @Entity(

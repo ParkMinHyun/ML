@@ -139,6 +139,8 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
 
     protected boolean mDelayedShutter;
 
+    private Long mPreviousCaptureMetricsCreationTimestampMs;
+
     private final ProcessorManagerInterface.ImmediateProcessCallback mImmediateProcessCallback
             = new ProcessorManagerInterface.ImmediateProcessCallback() {
 
@@ -1147,6 +1149,12 @@ abstract class ProcessingPhotoMakerBase extends PhotoMakerBase {
                 sequence.getResultSize(),
                 sequence.getResultFormat(),
                 sequence.get(ExtraBundle.MULTI_PICTURE_DATA_RESULT_FILE).getName()); // TODO : change when ExtraBundle.MULTI_PICTURE_DATA_RESULT_FILE is null
+
+        final long creationTimestampMs = captureMetrics.getCreationTimestampMs();
+        if (null != mPreviousCaptureMetricsCreationTimestampMs) {
+            captureMetrics.setShotToShotTimeMs(creationTimestampMs - mPreviousCaptureMetricsCreationTimestampMs);
+        }
+        mPreviousCaptureMetricsCreationTimestampMs = creationTimestampMs;
         sequence.set(ExtraBundle.DATA_CAPTURE_METRICS, captureMetrics);
 
         final int sceneOptimizerMode = Optional.ofNullable(SemCaptureRequest.get(mPreviewRequestBuilderMap, mCamDevice.getId(), SemCaptureRequest.CONTROL_SCENE_DETECTION_INFO))
