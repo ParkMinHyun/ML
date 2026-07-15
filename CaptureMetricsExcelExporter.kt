@@ -81,7 +81,14 @@ class CaptureMetricsExcelExporter(
     }
 
     private fun processCaptures(captures: List<CaptureRow>): List<EnrichedCaptureRow> {
-        val groups = groupCaptures(captures)
+        val usesPacerSessionBoundary = captures.isNotEmpty() &&
+            captures.all { it.metrics.draftSequenceMetrics?.pacerSessionId != null }
+        val sessionBoundarySource = if (usesPacerSessionBoundary) {
+            SESSION_BOUNDARY_PACER
+        } else {
+            SESSION_BOUNDARY_TIMEOUT_PROXY
+        }
+        val groups = groupCaptures(captures, usesPacerSessionBoundary)
         groups.forEach(::simulateAdmissionAfter)
 
         val sortedGroups = groups.sortedBy { group ->
@@ -108,6 +115,7 @@ class CaptureMetricsExcelExporter(
 
                 val sessionSummary = SessionSummary(
                     sessionId = sessionId,
+                    sessionBoundarySource = sessionBoundarySource,
                     sessionShotCount = group.size,
                     sessionCaptureIndex = indexInSession + 1,
                     sessionTimeoutShotCount = sessionTimeoutShotCount,
@@ -158,10 +166,30 @@ class CaptureMetricsExcelExporter(
         }
     }
 
-    /** Groups captures into timeout-delimited sessions. */
-    private fun groupCaptures(captures: List<CaptureRow>): List<List<CaptureRow>> {
+    /**
+     * Groups captures into burst sessions. Prefers the recorded runtime pacer session id (increments each time the
+     * drained pipeline clears the pacer); rows persisted before that field existed fall back to the legacy
+     * timeout-delimited grouping.
+     */
+    private fun groupCaptures(captures: List<CaptureRow>, usesPacerSessionBoundary: Boolean): List<List<CaptureRow>> {
         val groups = mutableListOf<List<CaptureRow>>()
         var currentGroup = mutableListOf<CaptureRow>()
+
+        if (usesPacerSessionBoundary) {
+            for (capture in captures) {
+                val previousSessionId = currentGroup.lastOrNull()?.metrics?.draftSequenceMetrics?.pacerSessionId
+                val sessionId = capture.metrics.draftSequenceMetrics?.pacerSessionId
+                if (currentGroup.isNotEmpty() && previousSessionId != sessionId) {
+                    groups.add(currentGroup)
+                    currentGroup = mutableListOf()
+                }
+                currentGroup.add(capture)
+            }
+            if (currentGroup.isNotEmpty()) {
+                groups.add(currentGroup)
+            }
+            return groups
+        }
 
         for (capture in captures) {
             val isTimeout = capture.metrics.draftSequenceMetrics?.isTimeout == true
@@ -278,6 +306,28 @@ class CaptureMetricsExcelExporter(
         val firstNodeStartUptimeMs: Long?
             get() = nodeRows.firstOrNull()?.node?.startUptimeMs
 
+        val draftStartUptimeMs: Long?
+            get() = metrics.draftSequenceMetrics?.draftStartUptimeMs
+
+        val draftEndUptimeMs: Long?
+            get() = metrics.draftSequenceMetrics?.draftEndUptimeMs
+
+        /** Whole-draft wall time; the offline counterpart of the pacer's observed draft timing input. */
+        val draftWallMs: Long?
+            get() {
+                val startMs = draftStartUptimeMs ?: return null
+                val endMs = draftEndUptimeMs ?: return null
+                return endMs - startMs
+            }
+
+        /** Deadline minus draft end: positive = finished with margin, negative = blew the capture timeout. */
+        val timeoutMarginMs: Long?
+            get() {
+                val endMs = draftEndUptimeMs ?: return null
+                val deadlineMs = metrics.timeoutTimestampMs ?: return null
+                return deadlineMs - endMs
+            }
+
         val draftSequenceDurationMs: Long?
             get() = nodeRows.sumOf { row -> row.node.postExecutionMetrics.durationMs }
                 .takeIf { durationMs -> durationMs > 0L }
@@ -390,6 +440,7 @@ class CaptureMetricsExcelExporter(
 
     private class SessionSummary(
         val sessionId: Int,
+        val sessionBoundarySource: String,
         val sessionShotCount: Int,
         val sessionCaptureIndex: Int,
         val sessionTimeoutShotCount: Int?,
@@ -423,14 +474,17 @@ class CaptureMetricsExcelExporter(
         } else {
             null
         }
-        val observedSojournMinMs: Long = inferredObservedSojournMs ?: 0L
-        val observedSojournMaxMs: Long = inferredObservedSojournMs ?: floor(
+
+        /** Recorded runtime input wins; inference only covers rows persisted before the field existed. */
+        private val knownObservedSojournMs: Long? = before.observedSojournMs ?: inferredObservedSojournMs
+        val observedSojournMinMs: Long = knownObservedSojournMs ?: 0L
+        val observedSojournMaxMs: Long = knownObservedSojournMs ?: floor(
             (captureTimeoutMs - before.backlogMs - before.preferredDraftPathUpperBoundMs).coerceAtLeast(0.0),
         ).toLong()
-        val observedSojournInference: String = if (inferredObservedSojournMs != null) {
-            PACING_SOJOURN_EXACT
-        } else {
-            PACING_SOJOURN_BOUNDED
+        val observedSojournInference: String = when {
+            before.observedSojournMs != null -> PACING_SOJOURN_RECORDED
+            inferredObservedSojournMs != null -> PACING_SOJOURN_EXACT
+            else -> PACING_SOJOURN_BOUNDED
         }
 
         val afterLevelDeficitMs: Long = captureAvailableLevelDeficitMs(
@@ -464,7 +518,7 @@ class CaptureMetricsExcelExporter(
         val delayDeltaMs: Long? = afterAppliedDelayMs?.minus(before.appliedDelayMs)
         val pacingChanged: Boolean? = afterAppliedDelayMs?.let { delayMs -> delayMs != before.appliedDelayMs }
         val replayStatus: String = when {
-            inferredObservedSojournMs != null -> PACING_REPLAY_EXACT
+            knownObservedSojournMs != null -> PACING_REPLAY_EXACT
             afterAppliedDelayMs != null -> PACING_REPLAY_BOUNDED_DETERMINISTIC
             else -> PACING_REPLAY_BOUNDED
         }
@@ -745,7 +799,9 @@ class CaptureMetricsExcelExporter(
         private const val AFTER_SKIP_EVALUATED_FROM_RECORDED_ADMIT = "After Skip Evaluated from Recorded Admit"
         private const val AFTER_UNNECESSARY_SKIP = "Unnecessary Skip"
         private const val AFTER_CORRECT_SKIP = "Correct Skip"
-        private const val ADMISSION_SESSION_BOUNDARY_SOURCE = "timeout-delimited proxy"
+        private const val SESSION_BOUNDARY_PACER = "runtime pacer session id"
+        private const val SESSION_BOUNDARY_TIMEOUT_PROXY = "timeout-delimited proxy"
+        private const val PACING_SOJOURN_RECORDED = "Recorded runtime input"
         private const val PACING_SOJOURN_EXACT = "Exact from positive backlog deficit"
         private const val PACING_SOJOURN_BOUNDED = "Bounded because backlog deficit was zero"
         private const val PACING_REPLAY_EXACT = "Exact"
@@ -772,7 +828,7 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        fun replayWorkloadKey(): WorkloadKey? {
+        private fun NodeRow.replayWorkloadKey(): WorkloadKey? {
             val workloadKey = node.workloadKey ?: return null
             val sizeBucketName = workloadKey.substringAfter("sizeBucket=", missingDelimiterValue = "")
                 .substringBefore(',')
@@ -798,7 +854,7 @@ class CaptureMetricsExcelExporter(
             Column("resultImageHeight") { it.capture.metrics.resultImageSize.height },
             Column("sessionId") { it.sessionSummary?.sessionId },
             Column("sessionCaptureIndex") { it.sessionSummary?.sessionCaptureIndex },
-            Column("afterSessionBoundarySource") { ADMISSION_SESSION_BOUNDARY_SOURCE },
+            Column("afterSessionBoundarySource") { it.sessionSummary?.sessionBoundarySource },
             Column("nodeOrder") { it.nodeOrder },
             Column("nodeStartUptimeMs") { it.nodeRow.node.startUptimeMs },
             Column("timeoutDeadlineUptimeMs") { it.capture.metrics.timeoutTimestampMs },
@@ -813,6 +869,13 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeSequencePredictedUpperBoundMs") {
                 it.nodeRow.prediction?.sequencePredictedUpperBoundMs
+            },
+            // Decision margin (budget - predicted UB): >0 quantifies admit headroom, <0 the rejection magnitude,
+            // so near-threshold decisions can be scored separately from clear-cut ones.
+            Column("beforeAdmissionMarginMs") { sheetRow ->
+                sheetRow.nodeRow.prediction?.let { prediction ->
+                    sheetRow.nodeRow.node.preExecutionMetrics.budgetMs - prediction.sequencePredictedUpperBoundMs
+                }
             },
             Column("inferredBeforeModelAdmit") { it.inferredBeforeModelAdmit() },
             Column("beforeEffectiveAdmit") { it.nodeRow.prediction?.admit },
@@ -869,6 +932,15 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeWatchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
             Column("beforeWatchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },
+            // Post-execution contention/GC attribution: separates unsafe admits caused by CPU starvation or
+            // blocking GC pauses from systematic prediction misses.
+            Column("beforeCpuTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
+            Column("beforeWallTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
+            Column("beforeRunQueueWaitMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
+            Column("beforeCpuUtilizationRatio") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuUtilizationRatio },
+            Column("beforeNonvoluntaryCtxSwitches") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
+            Column("beforeBlockingGcCount") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcCount },
+            Column("beforeBlockingGcTimeMs") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcTimeMs },
         )
 
         private fun buildPacingReplayColumns(): List<Column<EnrichedCaptureRow>> = listOf(
@@ -882,8 +954,15 @@ class CaptureMetricsExcelExporter(
             Column("resultImageHeight") { it.row.metrics.resultImageSize.height },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("sessionCaptureIndex") { it.sessionSummary.sessionCaptureIndex },
+            Column("sessionBoundarySource") { it.sessionSummary.sessionBoundarySource },
+            Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
             Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
             Column("firstNodeStartUptimeMs") { it.row.firstNodeStartUptimeMs },
+            Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
+            Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
+            Column("draftWallMs") { it.row.draftWallMs },
+            // Deadline minus draft end - the pacing outcome each counterfactual delay is scored against.
+            Column("timeoutMarginMs") { it.row.timeoutMarginMs },
             Column("beforeDraftSequenceDurationMs") { it.row.draftSequenceDurationMs },
             Column("beforeCaptureTimedOut") { it.row.hasTimeoutFailure },
             Column("beforeCaptureWatchdogFailed") { it.row.hasWatchdogFailure },
@@ -940,10 +1019,19 @@ class CaptureMetricsExcelExporter(
             Column("beforeQueuedReservedWorkMs") {
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
             },
+            Column("beforeObservedSojournMs") { it.row.pacingReplay?.before?.observedSojournMs },
+            Column("beforeObservedMaxDraftMs") { it.row.pacingReplay?.before?.observedMaxDraftMs },
             Column("beforeLevelDeficitMs") { it.row.pacingReplay?.before?.levelDeficitMs },
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
             Column("beforeAppliedDelayMs") { it.row.pacingReplay?.before?.appliedDelayMs },
+            // Reserve calibration: recorded per-capture reserve minus this draft's wall time
+            // (positive = over-reserved = over-pacing pressure, negative = under-reserved).
+            Column("reserveErrorMs") {
+                val reserveMs = it.row.pacingReplay?.before?.preferredDraftPathUpperBoundMs
+                val draftWallMs = it.row.draftWallMs
+                if (reserveMs != null && draftWallMs != null) reserveMs - draftWallMs else null
+            },
             Column("") { "" },
             Column("captureTimeoutMs") { it.row.pacingReplay?.captureTimeoutMs },
             Column("observedSojournInference") { it.row.pacingReplay?.observedSojournInference },
@@ -979,12 +1067,14 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Admission session boundary",
-                note = "sticky demotion is replayed over timeout-delimited proxy sessions because the runtime pacer " +
-                    "session id was removed.",
+                note = "sticky demotion is replayed over recorded runtime pacer session ids when every row has one; " +
+                    "rows persisted before that field fall back to timeout-delimited proxy sessions. " +
+                    "sessionBoundarySource says which grouping was used.",
             ),
             ReplayNote(
                 topic = "Pacing sojourn",
-                note = "when the recorded backlog deficit is positive, observed sojourn is recovered exactly. A zero " +
+                note = "observed sojourn is read from the recorded runtime input (beforeObservedSojournMs) when " +
+                    "present. On legacy rows without it, a positive backlog deficit recovers it exactly; a zero " +
                     "deficit only provides a min/max range, so after delay is reported as a range unless both bounds " +
                     "produce the same result.",
             ),
@@ -1044,6 +1134,14 @@ class CaptureMetricsExcelExporter(
             Column("filterPredictedBudgetOverrun") { it.row.filterPredictedBudgetOverrun },
             Column("filterObservedBudgetOverrun") { it.row.filterObservedBudgetOverrun },
             Column("") { "" },
+            // Capture timeline: replay anchors plus the timeout margin the pacing policy is scored against.
+            Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
+            Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
+            Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
+            Column("draftWallMs") { it.row.draftWallMs },
+            Column("timeoutMarginMs") { it.row.timeoutMarginMs },
+            Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
+            Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
             Column("timeoutShotCount") { it.sessionSummary.sessionTimeoutShotCount?.let { count -> "#" + count } },
@@ -1071,10 +1169,19 @@ class CaptureMetricsExcelExporter(
             Column("cpuTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuTimeMs },
             Column("wallTimeMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.wallTimeMs },
             Column("runQueueWaitMs") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs },
+            Column("cpuUtilizationRatio") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuUtilizationRatio },
+            Column("nonvoluntaryCtxSwitches") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
+            Column("blockingGcCount") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcCount },
+            Column("blockingGcTimeMs") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcTimeMs },
             Column("") { "" },
             Column("budgetMs") { it.nodeRow.node.preExecutionMetrics.budgetMs },
             Column("admit") { it.nodeRow.prediction?.admit },
             Column("admissionSkipReason") { it.admissionSkipReason() },
+            Column("admissionMarginMs") { sheetRow ->
+                sheetRow.nodeRow.prediction?.let { prediction ->
+                    sheetRow.nodeRow.node.preExecutionMetrics.budgetMs - prediction.sequencePredictedUpperBoundMs
+                }
+            },
             Column("nodeStartUptimeMs") { it.nodeRow.node.startUptimeMs },
             Column("durationMs") { it.nodeRow.nodeActualDurationMs },
             Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },

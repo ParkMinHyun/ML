@@ -64,17 +64,14 @@ data class DraftSequenceMetricsEntity(
     @ColumnInfo(name = "is_timeout")
     val isTimeout: Boolean?,
 
-    /** Retained only to preserve the existing Room schema; new rows always store null. */
     @ColumnInfo(name = "draft_start_uptime_ms")
-    val legacyDraftStartUptimeMs: Long?,
+    val draftStartUptimeMs: Long?,
 
-    /** Retained only to preserve the existing Room schema; new rows always store null. */
     @ColumnInfo(name = "draft_end_uptime_ms")
-    val legacyDraftEndUptimeMs: Long?,
+    val draftEndUptimeMs: Long?,
 
-    /** Retained only to preserve the existing Room schema; new rows always store null. */
     @ColumnInfo(name = "pacer_session_id")
-    val legacyPacerSessionId: Int?,
+    val pacerSessionId: Int?,
 
     @Embedded(prefix = "pacing_")
     val pacingSnapshot: CaptureAvailablePacingMetricsEntity?,
@@ -101,6 +98,12 @@ data class CaptureAvailablePacingMetricsEntity(
 
     @ColumnInfo(name = "queued_predicted_work_ms")
     val queuedPredictedWorkMs: Double,
+
+    @ColumnInfo(name = "observed_sojourn_ms")
+    val observedSojournMs: Long?,
+
+    @ColumnInfo(name = "observed_max_draft_ms")
+    val observedMaxDraftMs: Long?,
 
     @ColumnInfo(name = "draft_start_budget_ms")
     val draftStartBudgetMs: Long,

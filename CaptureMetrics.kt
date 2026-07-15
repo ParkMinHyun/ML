@@ -19,6 +19,12 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
     var isPendingRequest: Boolean? = null,
     var hasWatchdogTimeout: Boolean? = false,
     var isTimeout: Boolean? = false,
+    /** Uptime when the draft node chain was initialized; anchors offline interarrival/backlog replay. */
+    var draftStartUptimeMs: Long? = null,
+    /** Uptime when the draft sequence completed; with the timeout deadline it scores the pacing outcome. */
+    var draftEndUptimeMs: Long? = null,
+    /** Burst-session ordinal from [CaptureAvailablePacer]; increments each time the drained pipeline clears it. */
+    var pacerSessionId: Int? = null,
     /**
      * Runtime pacing decision consumed at this capture's draft start - the captureAvailable delay that gated this
      * capture. Null when nothing gated it (first capture of a burst, or fresh process).
@@ -50,6 +56,10 @@ data class CaptureAvailablePacingMetrics(
     val backlogMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
+    /** Session max pre-draft latency consumed by the backlog deficit; null on rows persisted before recording. */
+    val observedSojournMs: Long?,
+    /** Session max measured draft wall time at decision time; null on rows persisted before recording. */
+    val observedMaxDraftMs: Long?,
     val draftStartBudgetMs: Long,
     val mandatoryReserveUpperBoundMs: Double,
     val preferredDraftPathPredictedMs: Double,

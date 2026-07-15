@@ -86,7 +86,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             WorkloadSequenceKey(plannedWorkloadKeys),
             readBudgetMs(),
         )
-        metricsRecorder.onDraftStart(gatingPacingDecision)
+        metricsRecorder.onDraftStart(
+            gatingPacingDecision = gatingPacingDecision,
+            pacerSessionId = captureAvailablePacer.currentSessionId(),
+        )
     }
 
     /**
@@ -299,8 +302,10 @@ private class MetricsRecorder(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?) {
+    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?, pacerSessionId: Int) {
         synchronized(draftSequenceMetrics) {
+            draftSequenceMetrics.draftStartUptimeMs = SystemClock.uptimeMillis()
+            draftSequenceMetrics.pacerSessionId = pacerSessionId
             if (gatingPacingDecision != null) {
                 draftSequenceMetrics.captureAvailablePacing = gatingPacingDecision.toCaptureAvailablePacingMetrics()
             }
@@ -353,6 +358,7 @@ private class MetricsRecorder(
     fun onCaptureEnd(isTimeout: Boolean) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.isTimeout = isTimeout
+            draftSequenceMetrics.draftEndUptimeMs = SystemClock.uptimeMillis()
         }
     }
 }

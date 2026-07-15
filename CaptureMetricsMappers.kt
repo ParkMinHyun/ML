@@ -21,9 +21,9 @@ fun DraftSequenceMetrics.toEntity(captureMetricsId: Int): DraftSequenceMetricsEn
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
-        legacyDraftStartUptimeMs = null,
-        legacyDraftEndUptimeMs = null,
-        legacyPacerSessionId = null,
+        draftStartUptimeMs = draftStartUptimeMs,
+        draftEndUptimeMs = draftEndUptimeMs,
+        pacerSessionId = pacerSessionId,
         pacingSnapshot = captureAvailablePacing?.toEntity(),
     )
 }
@@ -37,6 +37,8 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,
+        observedSojournMs = observedSojournMs,
+        observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
@@ -178,6 +180,9 @@ fun DraftSequenceMetricsEntity.toModel(
         isPendingRequest = isPendingRequest,
         hasWatchdogTimeout = hasWatchdogTimeout,
         isTimeout = isTimeout,
+        draftStartUptimeMs = draftStartUptimeMs,
+        draftEndUptimeMs = draftEndUptimeMs,
+        pacerSessionId = pacerSessionId,
         captureAvailablePacing = pacingSnapshot?.toModel(),
     )
 }
@@ -191,6 +196,8 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,
+        observedSojournMs = observedSojournMs,
+        observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,

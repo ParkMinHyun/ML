@@ -36,6 +36,7 @@ class CaptureAvailablePacer(
     private var pacingPrediction: CaptureAvailablePacingPrediction? = null
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
     private val sessionDemotions = mutableSetOf<SessionDemotion>()
+    private var sessionId = 0
 
     private var observedMaxDraftMs = 0L
     private var observedSojournMs = 0L
@@ -107,6 +108,8 @@ class CaptureAvailablePacer(
             backlogDeficitMs = backlogDeficitMs,
             queuedDraftCount = pendingDecisions.size,
             queuedPredictedWorkMs = queuedReservedWorkMs,
+            observedSojournMs = observedSojournMs,
+            observedMaxDraftMs = observedMaxDraftMs,
             decisionUptimeMs = nowUptimeMs,
             prediction = prediction,
         )
@@ -132,6 +135,10 @@ class CaptureAvailablePacer(
     @Synchronized
     fun isSessionDemoted(demotion: SessionDemotion): Boolean = demotion in sessionDemotions
 
+    /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
+    @Synchronized
+    fun currentSessionId(): Int = sessionId
+
     /** Clears all pacing state when the draft task queue drains. */
     @Synchronized
     fun clear() {
@@ -141,6 +148,7 @@ class CaptureAvailablePacer(
         observedMaxDraftMs = 0L
         observedSojournMs = 0L
         busyUntilUptimeMs = 0L
+        sessionId++
     }
 
     private fun preferredSequenceKey(workloadSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
@@ -210,6 +218,10 @@ data class CaptureAvailablePacingDecision(
     val backlogDeficitMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
+    /** Session max pre-draft latency consumed by the backlog deficit at decision time. */
+    val observedSojournMs: Long,
+    /** Session max measured draft wall time at decision time, before re-projection onto the demoted shape. */
+    val observedMaxDraftMs: Long,
     val decisionUptimeMs: Long,
     val prediction: CaptureAvailablePacingPrediction,
 )
@@ -224,6 +236,8 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,
+        observedSojournMs = observedSojournMs,
+        observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = prediction.draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = prediction.preferredDraftPathPredictedMs,
