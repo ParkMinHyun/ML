@@ -10,6 +10,7 @@ import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+import com.samsung.android.camera.core2.ml.DraftSequenceAdmissionPolicy;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
@@ -166,6 +167,7 @@ public class SavingDraftImageTaskManager {
         shutDownThreadPool();
         savingDraftImageTaskMap.clear();
         CaptureAvailablePacer.getInstance().clear();
+        DraftSequenceAdmissionPolicy.getInstance().clear();
         reservedSkipSaveDraftImageIdSet.clear();
         waitForSavingDraftImageTaskMapDrain = false;
         isWatchdogDrainInCurrentSession = false;
@@ -202,6 +204,7 @@ public class SavingDraftImageTaskManager {
                 isWatchdogDrainInCurrentSession = false;
                 hasCaptureTimeoutInCurrentSession = false;
                 CaptureAvailablePacer.getInstance().clear();
+                DraftSequenceAdmissionPolicy.getInstance().clear();
             }
         }
     }

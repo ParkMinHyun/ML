@@ -10,34 +10,9 @@ import com.samsung.android.camera.core2.node.imageCodec.samsung.SecImageCodecNod
 import com.samsung.android.camera.core2.node.watermark.WatermarkNode
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor
 import com.samsung.android.camera.core2.util.CLog
-import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import java.util.concurrent.CompletableFuture
 
 private const val TAG = "DraftSequenceExecutionProfiler"
-
-/** Effective admission rule shared by runtime execution and session-ordered offline replay. */
-internal fun applySessionAdmissionPolicy(
-    captureAvailablePacer: CaptureAvailablePacer,
-    workloadKey: WorkloadKey,
-    hasFrameWatermark: Boolean,
-    modelAdmit: Boolean,
-): Boolean {
-    if (workloadKey is WorkloadKey.Decoding && hasFrameWatermark) {
-        return true
-    }
-    return when (workloadKey) {
-        is WorkloadKey.Bokeh ->
-            captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.BOKEH, modelAdmit)
-        is WorkloadKey.Decoding, is WorkloadKey.Filter ->
-            captureAvailablePacer.admitWithSessionDemotion(SessionDemotion.YUV_EFFECTS, modelAdmit)
-        is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
-            modelAdmit
-        } else {
-            modelAdmit && !captureAvailablePacer.isSessionDemoted(SessionDemotion.YUV_EFFECTS)
-        }
-        is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
-    }
-}
 
 /**
  * Drives one draft sequence's node lifecycle: classifies each executing node into a [WorkloadKey], asks the
@@ -54,6 +29,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val deviceStateReader: DeviceStateReader,
     private val captureAvailablePacer: CaptureAvailablePacer = CaptureAvailablePacer.instance,
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
+    private val admissionPolicy: DraftSequenceAdmissionPolicy = DraftSequenceAdmissionPolicy.instance,
     draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
 ) {
 
@@ -67,9 +43,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
-     * Passes the full planned suffix (even before Bokeh's second input arrives); the pacer subtracts any
-     * session-demoted workloads itself, since it owns that state. Encoding-only captures pace the RESERVED Encoding
-     * sequence so captureAvailable admission and draft-start observations stay balanced.
+     * Passes the full planned suffix (even before Bokeh's second input arrives); the pacer re-projects it onto the
+     * session's demoted shape via the [DraftSequenceAdmissionPolicy]. Encoding-only captures pace the RESERVED
+     * Encoding sequence, and captures with no predictable workloads (JPEG passthrough) pass a null key so their
+     * admission record is still consumed - captureAvailable admission and draft-start observations stay balanced.
      */
     fun initializeDraftNodeChain(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
@@ -78,12 +55,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
             workloadKeyFor(plannedNode, requireReadyToRun = false)
         }
-        if (plannedWorkloadKeys.isEmpty()) {
-            return
-        }
-
         val gatingPacingDecision = captureAvailablePacer.observeDraftStart(
-            WorkloadSequenceKey(plannedWorkloadKeys),
+            plannedWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
             readBudgetMs(),
         )
         metricsRecorder.onDraftStart(
@@ -97,7 +70,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      *
      * OPTIONAL workloads are admitted by their remaining suffix UB, hardened by session-sticky demotion: the first
      * in-session rejection of Bokeh, or of the Decoding-Filter-Overlay Watermark chain, forces rejection until the
-     * draft pipeline drains ([CaptureAvailablePacer.clear]), so one burst never alternates effects between shots.
+     * draft pipeline drains ([DraftSequenceAdmissionPolicy.clear]), so one burst never alternates effects between
+     * shots.
      * JPEG-path Decoding is forced when required by Frame Watermark. REQUIRED workloads (DynamicFunction / Frame
      * Watermark) always run but are not reserve-protected; RESERVED workload is the mandatory tail.
      */
@@ -111,13 +85,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
         )
 
-        val decision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
-        val effectiveAdmit = effectiveAdmit(workloadSequenceKey, decision.executionPrediction.admit)
-        val effectiveDecision = decision.copy(
-            executionPrediction = decision.executionPrediction.copy(admit = effectiveAdmit),
+        val modelDecision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
+        val decision = modelDecision.copy(
+            executionPrediction = modelDecision.executionPrediction.copy(
+                admit = admissionPolicy.admit(
+                    workloadKey = workloadKey,
+                    hasFrameWatermark = workloadSequenceKey.hasFrameWatermark(),
+                    modelAdmit = modelDecision.executionPrediction.admit,
+                ),
+            ),
         )
-        modelUpdate.remember(effectiveDecision)
-        val prediction = effectiveDecision.executionPrediction
+        modelUpdate.remember(decision)
+        val prediction = decision.executionPrediction
         metricsRecorder.onPrediction(prediction)
 
         return createExecutionSession(
@@ -126,15 +105,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
             prediction = prediction,
-        )
-    }
-
-    private fun effectiveAdmit(workloadSequenceKey: WorkloadSequenceKey, modelAdmit: Boolean): Boolean {
-        return applySessionAdmissionPolicy(
-            captureAvailablePacer = captureAvailablePacer,
-            workloadKey = workloadSequenceKey.headWorkloadKey,
-            hasFrameWatermark = workloadSequenceKey.hasFrameWatermark(),
-            modelAdmit = modelAdmit,
         )
     }
 

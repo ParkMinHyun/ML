@@ -2,20 +2,19 @@ package com.samsung.android.camera.core2.ml
 
 import android.os.SystemClock
 import com.samsung.android.camera.core2.maker.MakerFeature
-import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import kotlin.math.ceil
 
-internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, preferredCeilingMs: Double): Long {
-    return positiveCeilMs(preferredCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
+internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, draftSequenceCeilingMs: Double): Long {
+    return positiveCeilMs(draftSequenceCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
 }
 
 internal fun captureAvailableBacklogDeficitMs(
     backlogMs: Long,
     observedSojournMs: Long,
-    preferredCeilingMs: Double,
+    draftSequenceCeilingMs: Double,
 ): Long {
     return positiveCeilMs(
-        backlogMs + observedSojournMs + preferredCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+        backlogMs + observedSojournMs + draftSequenceCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
     )
 }
 
@@ -28,14 +27,15 @@ private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerc
 /**
  * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, APM timings
  * update the observed session maxima, and each admission is paired with the next draft start through one FIFO.
+ * Asks the [DraftSequenceAdmissionPolicy] which draft sequence a planned one becomes in this session.
  */
 class CaptureAvailablePacer(
     private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
+    private val admissionPolicy: DraftSequenceAdmissionPolicy = DraftSequenceAdmissionPolicy.instance,
 ) {
 
     private var pacingPrediction: CaptureAvailablePacingPrediction? = null
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
-    private val sessionDemotions = mutableSetOf<SessionDemotion>()
     private var sessionId = 0
 
     private var observedMaxDraftMs = 0L
@@ -50,30 +50,37 @@ class CaptureAvailablePacer(
      */
     private var busyUntilUptimeMs = 0L
 
-    /** Refreshes the pacing prediction and consumes the oldest admitted callback. */
+    /**
+     * Refreshes the pacing prediction and consumes the oldest admitted callback. A null key means a draft with no
+     * predictable workloads (e.g. JPEG passthrough): the admission record is still consumed so the FIFO stays paired
+     * with draft starts, but it contributes zero predicted work and leaves the pacing prediction as-is.
+     */
     @Synchronized
-    fun observeDraftStart(workloadSequenceKey: WorkloadSequenceKey, budgetMs: Long): CaptureAvailablePacingDecision? {
-        val preferredSequenceKey = preferredSequenceKey(workloadSequenceKey)
-        val preferredEstimate = predictor.estimateDraftPath(preferredSequenceKey)
-        val demotedWorkloadMs = if (preferredSequenceKey == workloadSequenceKey) {
+    fun observeDraftStart(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
+        if (plannedSequenceKey == null) {
+            return rebaseBacklogOnDraftStart(0.0)
+        }
+        val draftSequence = admissionPolicy.draftSequence(plannedSequenceKey)
+        val draftSequenceEstimate = predictor.estimateDraftSequence(draftSequence)
+        val demotedWorkloadMs = if (draftSequence == plannedSequenceKey) {
             0.0
         } else {
-            (predictor.estimateDraftPath(workloadSequenceKey).predictedMs - preferredEstimate.predictedMs)
+            (predictor.estimateDraftSequence(plannedSequenceKey).predictedMs - draftSequenceEstimate.predictedMs)
                 .coerceAtLeast(0.0)
         }
         val draftCeilingMs = maxOf(
             observedMaxDraftMs.toDouble() - demotedWorkloadMs,
-            preferredEstimate.predictedMs,
+            draftSequenceEstimate.predictedMs,
         )
 
         pacingPrediction = CaptureAvailablePacingPrediction(
             draftStartBudgetMs = budgetMs,
-            mandatoryReserveUpperBoundMs = preferredEstimate.mandatoryReserveUpperBoundMs,
-            preferredDraftPathPredictedMs = preferredEstimate.predictedMs,
-            preferredDraftPathCeilingMs = draftCeilingMs,
-            workloadSequenceKey = preferredSequenceKey.toReplayString(),
+            mandatoryReserveUpperBoundMs = draftSequenceEstimate.mandatoryReserveUpperBoundMs,
+            draftSequencePredictedMs = draftSequenceEstimate.predictedMs,
+            draftSequenceCeilingMs = draftCeilingMs,
+            workloadSequenceKey = draftSequence.toReplayString(),
         )
-        return rebaseBacklogOnDraftStart(preferredEstimate.predictedMs)
+        return rebaseBacklogOnDraftStart(draftSequenceEstimate.predictedMs)
     }
 
     /** Records the APM timings observed together for one capture. */
@@ -96,16 +103,16 @@ class CaptureAvailablePacer(
         val prediction = pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
-        val draftCeilingMs = prediction.preferredDraftPathCeilingMs
+        val draftCeilingMs = prediction.draftSequenceCeilingMs
         val queuedPredictedWorkMs = sumQueuedPredictedWorkMs()
         val levelDeficitMs = captureAvailableLevelDeficitMs(
             draftStartBudgetMs = prediction.draftStartBudgetMs,
-            preferredCeilingMs = draftCeilingMs,
+            draftSequenceCeilingMs = draftCeilingMs,
         )
         val backlogDeficitMs = captureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
             observedSojournMs = observedSojournMs,
-            preferredCeilingMs = draftCeilingMs,
+            draftSequenceCeilingMs = draftCeilingMs,
         )
         val delayMs = captureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
 
@@ -123,25 +130,9 @@ class CaptureAvailablePacer(
         )
         pendingDecisions.addLast(decision)
         busyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, busyUntilUptimeMs) +
-            ceil(prediction.preferredDraftPathPredictedMs).toLong()
+            ceil(prediction.draftSequencePredictedMs).toLong()
         return decision
     }
-
-    /** Atomically applies a model decision to a sticky session-demotion group. */
-    @Synchronized
-    fun admitWithSessionDemotion(demotion: SessionDemotion, modelAdmit: Boolean): Boolean {
-        if (demotion in sessionDemotions) {
-            return false
-        }
-        if (!modelAdmit) {
-            sessionDemotions += demotion
-        }
-        return modelAdmit
-    }
-
-    /** Returns whether the workload group is already demoted in this burst session. */
-    @Synchronized
-    fun isSessionDemoted(demotion: SessionDemotion): Boolean = demotion in sessionDemotions
 
     /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
     @Synchronized
@@ -152,35 +143,10 @@ class CaptureAvailablePacer(
     fun clear() {
         pacingPrediction = null
         pendingDecisions.clear()
-        sessionDemotions.clear()
         observedMaxDraftMs = 0L
         observedSojournMs = 0L
         busyUntilUptimeMs = 0L
         sessionId++
-    }
-
-    private fun preferredSequenceKey(workloadSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
-        if (sessionDemotions.isEmpty()) {
-            return workloadSequenceKey
-        }
-
-        val bokehDemoted = SessionDemotion.BOKEH in sessionDemotions
-        val yuvEffectsDemoted = SessionDemotion.YUV_EFFECTS in sessionDemotions
-        val hasFrameWatermark = yuvEffectsDemoted && workloadSequenceKey.hasFrameWatermark()
-        val preferredWorkloads = workloadSequenceKey.workloadKeys.filterNot { workloadKey ->
-            when (workloadKey) {
-                is WorkloadKey.Bokeh -> bokehDemoted
-                is WorkloadKey.Filter -> yuvEffectsDemoted
-                is WorkloadKey.Watermark -> yuvEffectsDemoted && workloadKey.watermarkType != WatermarkType.FRAME
-                is WorkloadKey.Decoding -> yuvEffectsDemoted && !hasFrameWatermark
-                is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> false
-            }
-        }
-        return if (preferredWorkloads.isEmpty()) {
-            workloadSequenceKey
-        } else {
-            WorkloadSequenceKey(preferredWorkloads)
-        }
     }
 
     /** Reuses the decision FIFO as the admitted-work FIFO instead of maintaining a second queue. */
@@ -193,7 +159,7 @@ class CaptureAvailablePacer(
 
     private fun sumQueuedPredictedWorkMs(): Double {
         return pendingDecisions.sumOf { decision ->
-            decision.prediction.preferredDraftPathPredictedMs
+            decision.prediction.draftSequencePredictedMs
         }
     }
 
@@ -203,25 +169,19 @@ class CaptureAvailablePacer(
     }
 }
 
-/** Workload groups whose first rejection sticks until [CaptureAvailablePacer.clear]. */
-enum class SessionDemotion {
-    BOKEH,
-    YUV_EFFECTS,
-}
-
 /** Latest runtime prediction for captureAvailable pacing. */
 data class CaptureAvailablePacingPrediction(
     val draftStartBudgetMs: Long,
     /** Model upper bound of the RESERVED tail alone. Classifies log severity; never reaches the delay. */
     val mandatoryReserveUpperBoundMs: Double,
-    val preferredDraftPathPredictedMs: Double,
+    val draftSequencePredictedMs: Double,
     /**
      * Draft time both deficits set aside for the capture being paced. Not a model bound despite sitting beside one:
-     * it is the session's observed max draft wall time re-projected onto the preferred shape, floored by the point
+     * it is the session's observed max draft wall time re-projected onto this draft sequence, floored by the point
      * prediction (all a session's first capture has). Called a ceiling, not a reserve, because "reserve" in this
      * model always means the RESERVED-policy tail - a different quantity, computed a different way.
      */
-    val preferredDraftPathCeilingMs: Double,
+    val draftSequenceCeilingMs: Double,
     val workloadSequenceKey: String,
 )
 
@@ -255,8 +215,8 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = prediction.draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
-        preferredDraftPathPredictedMs = prediction.preferredDraftPathPredictedMs,
-        preferredDraftPathCeilingMs = prediction.preferredDraftPathCeilingMs,
+        draftSequencePredictedMs = prediction.draftSequencePredictedMs,
+        draftSequenceCeilingMs = prediction.draftSequenceCeilingMs,
         workloadSequenceKey = prediction.workloadSequenceKey,
     )
 }

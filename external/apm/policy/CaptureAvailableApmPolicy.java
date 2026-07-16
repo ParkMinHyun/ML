@@ -133,19 +133,19 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             warning = pacingPrediction.getDraftStartBudgetMs() < pacingPrediction.getMandatoryReserveUpperBoundMs();
 
             if (warning) {
-                reason = "mandatory reserve at risk - pace preferred draft path by " + appliedDelayMs + "ms";
+                reason = "mandatory reserve at risk - pace draft sequence by " + appliedDelayMs + "ms";
             } else if (appliedDelayMs > pacingDecision.getLevelDeficitMs()) {
                 reason = "pace admitted draft backlog by " + appliedDelayMs + "ms";
             } else if (appliedDelayMs > 0L) {
-                reason = "pace preferred draft path by " + appliedDelayMs + "ms";
+                reason = "pace draft sequence by " + appliedDelayMs + "ms";
             } else {
                 reason = "budget is enough";
             }
 
             pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
                     + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
-                    + ", preferredDraftPathPredicted=" + pacingPrediction.getPreferredDraftPathPredictedMs() + "ms"
-                    + ", preferredDraftPathCeiling=" + pacingPrediction.getPreferredDraftPathCeilingMs() + "ms"
+                    + ", draftSequencePredicted=" + pacingPrediction.getDraftSequencePredictedMs() + "ms"
+                    + ", draftSequenceCeiling=" + pacingPrediction.getDraftSequenceCeilingMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
                     + ", workloadSequenceKey=" + pacingPrediction.getWorkloadSequenceKey();

@@ -134,7 +134,7 @@ class CaptureMetricsExcelExporter(
 
     /** Replays the current admission code over recorded predictions while preserving sticky demotion order. */
     private fun simulateAdmissionAfter(captures: List<CaptureRow>) {
-        val replayPacer = CaptureAvailablePacer(DraftSequenceExecutionPredictor())
+        val replayPolicy = DraftSequenceAdmissionPolicy()
 
         for (capture in captures) {
             for (row in capture.nodeRows) {
@@ -147,17 +147,11 @@ class CaptureMetricsExcelExporter(
                     budgetMs = row.node.preExecutionMetrics.budgetMs,
                 )
                 val hasFrameWatermark = prediction.workloadSequenceKey?.contains(WATERMARK_TYPE_FRAME) == true
-                val demotion = when (workloadKey) {
-                    is WorkloadKey.Bokeh -> SessionDemotion.BOKEH
-                    is WorkloadKey.Decoding, is WorkloadKey.Filter, is WorkloadKey.Watermark ->
-                        SessionDemotion.YUV_EFFECTS
-                    is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> null
-                }
 
                 row.afterModelAdmit = modelAdmit
-                row.afterSessionDemotedBeforeDecision = demotion?.let(replayPacer::isSessionDemoted)
-                row.afterAdmit = applySessionAdmissionPolicy(
-                    captureAvailablePacer = replayPacer,
+                row.afterSessionDemotedBeforeDecision =
+                    AdmissionGroup.of(workloadKey)?.let(replayPolicy::isDemoted)
+                row.afterAdmit = replayPolicy.admit(
                     workloadKey = workloadKey,
                     hasFrameWatermark = hasFrameWatermark,
                     modelAdmit = modelAdmit,
@@ -467,7 +461,7 @@ class CaptureMetricsExcelExporter(
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
         private val backlogBaseWithoutSojournMs =
-            before.backlogMs + before.preferredDraftPathCeilingMs - captureTimeoutMs
+            before.backlogMs + before.draftSequenceCeilingMs - captureTimeoutMs
 
         val inferredObservedSojournMs: Long? = if (before.backlogDeficitMs > 0L) {
             (before.backlogDeficitMs - ceil(backlogBaseWithoutSojournMs).toLong()).coerceAtLeast(0L)
@@ -479,7 +473,7 @@ class CaptureMetricsExcelExporter(
         private val knownObservedSojournMs: Long? = before.observedSojournMs ?: inferredObservedSojournMs
         val observedSojournMinMs: Long = knownObservedSojournMs ?: 0L
         val observedSojournMaxMs: Long = knownObservedSojournMs ?: floor(
-            (captureTimeoutMs - before.backlogMs - before.preferredDraftPathCeilingMs).coerceAtLeast(0.0),
+            (captureTimeoutMs - before.backlogMs - before.draftSequenceCeilingMs).coerceAtLeast(0.0),
         ).toLong()
         val observedSojournInference: String = when {
             before.observedSojournMs != null -> PACING_SOJOURN_RECORDED
@@ -489,17 +483,17 @@ class CaptureMetricsExcelExporter(
 
         val afterLevelDeficitMs: Long = captureAvailableLevelDeficitMs(
             draftStartBudgetMs = before.draftStartBudgetMs,
-            preferredCeilingMs = before.preferredDraftPathCeilingMs,
+            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
         )
         val afterBacklogDeficitMinMs: Long = captureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMinMs,
-            preferredCeilingMs = before.preferredDraftPathCeilingMs,
+            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
         )
         val afterBacklogDeficitMaxMs: Long = captureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMaxMs,
-            preferredCeilingMs = before.preferredDraftPathCeilingMs,
+            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
@@ -1008,11 +1002,11 @@ class CaptureMetricsExcelExporter(
             Column("beforeMandatoryReserveUpperBoundMs") {
                 it.row.pacingReplay?.before?.mandatoryReserveUpperBoundMs
             },
-            Column("beforePreferredPathPredictedMs") {
-                it.row.pacingReplay?.before?.preferredDraftPathPredictedMs
+            Column("beforeDraftSequencePredictedMs") {
+                it.row.pacingReplay?.before?.draftSequencePredictedMs
             },
-            Column("beforePreferredPathCeilingMs") {
-                it.row.pacingReplay?.before?.preferredDraftPathCeilingMs
+            Column("beforeDraftSequenceCeilingMs") {
+                it.row.pacingReplay?.before?.draftSequenceCeilingMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
@@ -1028,7 +1022,7 @@ class CaptureMetricsExcelExporter(
             // Ceiling calibration: recorded per-capture ceiling minus this draft's wall time
             // (positive = ceiling too high = over-pacing pressure, negative = ceiling undershot the draft).
             Column("ceilingErrorMs") {
-                val ceilingMs = it.row.pacingReplay?.before?.preferredDraftPathCeilingMs
+                val ceilingMs = it.row.pacingReplay?.before?.draftSequenceCeilingMs
                 val draftWallMs = it.row.draftWallMs
                 if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
             },
@@ -1080,7 +1074,7 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Pacing prediction scope",
-                note = "after pacing reuses the recorded preferred-path prediction, ceiling, and backlog. Changes to " +
+                note = "after pacing reuses the recorded draft-sequence prediction, ceiling, and backlog. Changes to " +
                     "how the ceiling is derived or to backlog reconstruction require a sequential replay with " +
                     "additional raw runtime observations.",
             ),

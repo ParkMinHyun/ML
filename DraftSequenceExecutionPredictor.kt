@@ -23,7 +23,7 @@ internal fun shouldAdmitOptionalWorkload(
  * from positive residual ratios captured before workload EWMA updates; exact decision-sequence residuals win, with
  * global residuals as the cold-sequence fallback.
  *
- * Besides admission, [estimateDraftPath] snapshots the model for [CaptureAvailablePacer], which owns
+ * Besides admission, [estimateDraftSequence] snapshots the model for [CaptureAvailablePacer], which owns
  * captureAvailable pacing and only consumes these estimates.
  */
 class DraftSequenceExecutionPredictor {
@@ -206,7 +206,7 @@ class DraftSequenceExecutionPredictor {
         return WatchdogTimeoutDecision(timeoutMs, decision)
     }
 
-    /** RESERVED workloads in the observed draft path, including a RESERVED head for encoding-only captures. */
+    /** RESERVED workloads in the observed draft sequence, including a RESERVED head for encoding-only captures. */
     private fun mandatoryReserveWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
@@ -295,13 +295,13 @@ class DraftSequenceExecutionPredictor {
      * Point estimate for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in one consistent
      * model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with. The sequence's own
      * upper bound is deliberately not offered: pacing bounds a capture by observed draft wall time, not by this
-     * model, so exposing one only invites re-coupling the two (see the pacer's preferredDraftPathCeilingMs).
+     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequenceCeilingMs).
      */
     @Synchronized
-    fun estimateDraftPath(workloadSequenceKey: WorkloadSequenceKey): DraftPathEstimate {
+    fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
         val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
-        return DraftPathEstimate(
+        return DraftSequenceEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
             mandatoryReserveUpperBoundMs = if (reserveWorkloadKeys.isEmpty()) {
                 0.0
@@ -378,8 +378,8 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/** One consistent model snapshot for a draft path: point sum plus the mandatory RESERVED tail's upper bound. */
-data class DraftPathEstimate(
+/** One consistent model snapshot for a draft sequence: point sum plus the mandatory RESERVED tail's upper bound. */
+data class DraftSequenceEstimate(
     val predictedMs: Double,
     val mandatoryReserveUpperBoundMs: Double,
 )
