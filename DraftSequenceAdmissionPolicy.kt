@@ -66,7 +66,7 @@ class DraftSequenceAdmissionPolicy {
 
     /** The sequence the session actually runs: the planned one minus the workloads whose group is demoted. */
     @Synchronized
-    fun draftSequence(plannedSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
+    fun resolveDraftSequence(plannedSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
         if (demotedGroups.isEmpty()) {
             return plannedSequenceKey
         }

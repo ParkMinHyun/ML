@@ -7,15 +7,6 @@ import kotlin.math.roundToLong
 
 private const val TAG = "DraftSequenceExecutionPredictor"
 
-/** Pure OPTIONAL gate shared by runtime prediction and fixed-prediction offline replay. */
-internal fun shouldAdmitOptionalWorkload(
-    sequencePredictedMs: Double,
-    sequenceUpperBoundMs: Double,
-    budgetMs: Long,
-): Boolean {
-    return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
-}
-
 /**
  * Sequence-aware, phase-aware, adaptive upper bound.
  *
@@ -71,7 +62,7 @@ class DraftSequenceExecutionPredictor {
         sequenceUpperBoundMs: Double,
         budgetMs: Long,
     ): Boolean {
-        val admit = shouldAdmitOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
+        val admit = admitsOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         if (!admit) {
             CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
         }
@@ -88,7 +79,7 @@ class DraftSequenceExecutionPredictor {
         return workloadKeyDurationTrendMap.entries
             .filter { it.key.javaClass == workloadKey.javaClass }
             .maxOfOrNull { (siblingKey, model) ->
-                model.predictionMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
+                model.predictMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
             }
             ?: 0.0
     }
@@ -123,7 +114,7 @@ class DraftSequenceExecutionPredictor {
             return 0.0
         }
 
-        return predictedMs * exp(residualScoreFor(workloadSequenceKey))
+        return predictedMs * exp(estimateResidualScore(workloadSequenceKey))
     }
 
     private fun sumPredictedMs(
@@ -133,22 +124,22 @@ class DraftSequenceExecutionPredictor {
         return workloadSequenceKey.workloadKeys.sumOf { workloadPredictedMs.getValue(it) }
     }
 
-    private fun residualScoreFor(workloadSequenceKey: WorkloadSequenceKey): Double {
+    private fun estimateResidualScore(workloadSequenceKey: WorkloadSequenceKey): Double {
         val sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey]
-        return weightedQuantileScore(
+        return computeWeightedQuantileScore(
             if (sequenceSamples.isNullOrEmpty()) globalResidualSamples else sequenceSamples,
         )
     }
 
-    private fun weightedQuantileScore(samples: List<ResidualSample>): Double {
+    private fun computeWeightedQuantileScore(samples: List<ResidualSample>): Double {
         val weightedSamples = samples.filter { it.weight > 0.0 }
         if (weightedSamples.isEmpty()) {
             return 0.0
         }
 
         val totalWeight = weightedSamples.sumOf { it.weight }
-        val targetWeight = totalWeight * quantileForSampleSize(
-            effectiveSampleSize(weightedSamples.map { it.weight }),
+        val targetWeight = totalWeight * computeQuantileForSampleSize(
+            computeEffectiveSampleSize(weightedSamples.map { it.weight }),
         )
         var cumulativeWeight = 0.0
         for (sample in weightedSamples.sortedBy { it.score }) {
@@ -161,14 +152,14 @@ class DraftSequenceExecutionPredictor {
         return weightedSamples.maxOf { it.score }
     }
 
-    private fun quantileForSampleSize(sampleSize: Double): Double {
+    private fun computeQuantileForSampleSize(sampleSize: Double): Double {
         if (sampleSize <= 0.0) {
             return 0.0
         }
         return 1.0 - 1.0 / (sampleSize + 1.0)
     }
 
-    private fun effectiveSampleSize(weights: List<Double>): Double {
+    private fun computeEffectiveSampleSize(weights: List<Double>): Double {
         val sumW = weights.sum()
         val sumW2 = weights.sumOf { it * it }
         if (sumW <= 0.0 || sumW2 <= 0.0) {
@@ -189,7 +180,7 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
+        val reserveWorkloadKeys = selectMandatoryReserveWorkloadKeys(workloadSequenceKey)
         if (reserveWorkloadKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
@@ -207,7 +198,7 @@ class DraftSequenceExecutionPredictor {
     }
 
     /** RESERVED workloads in the observed draft sequence, including a RESERVED head for encoding-only captures. */
-    private fun mandatoryReserveWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+    private fun selectMandatoryReserveWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
     }
@@ -232,8 +223,8 @@ class DraftSequenceExecutionPredictor {
         admissionDecisions: Collection<AdmissionDecision>,
     ) {
         val samples = admissionDecisions.mapNotNull { decision ->
-            val actualMs = clampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
-            val score = logResidualScore(
+            val actualMs = computeClampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
+            val score = computeLogResidualScore(
                 predictedMs = decision.executionPrediction.sequencePredictedDurationMs,
                 actualMs = actualMs,
             ) ?: return@mapNotNull null
@@ -257,7 +248,7 @@ class DraftSequenceExecutionPredictor {
      * fast that capture. Returns null if any workload in the sequence did not run (incomplete sequence cannot be
      * scored).
      */
-    private fun clampedActualMs(
+    private fun computeClampedActualMs(
         decision: AdmissionDecision,
         workloadDurations: Map<WorkloadKey, Long>,
     ): Double? {
@@ -270,7 +261,7 @@ class DraftSequenceExecutionPredictor {
         return total.takeIf { it > 0.0 }
     }
 
-    private fun logResidualScore(predictedMs: Double, actualMs: Double): Double? {
+    private fun computeLogResidualScore(predictedMs: Double, actualMs: Double): Double? {
         if (predictedMs <= 0.0 || actualMs <= 0.0) {
             return null
         }
@@ -284,7 +275,7 @@ class DraftSequenceExecutionPredictor {
 
     private fun MutableList<ResidualSample>.decayAndPrune() {
         for (index in indices) {
-            this[index] = this[index].decayed(SCORE_WEIGHT_DECAY)
+            this[index] = this[index].decay(SCORE_WEIGHT_DECAY)
         }
         // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
         // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
@@ -300,7 +291,7 @@ class DraftSequenceExecutionPredictor {
     @Synchronized
     fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {
         val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
-        val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
+        val reserveWorkloadKeys = selectMandatoryReserveWorkloadKeys(workloadSequenceKey)
         return DraftSequenceEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
             mandatoryReserveUpperBoundMs = if (reserveWorkloadKeys.isEmpty()) {
@@ -319,7 +310,7 @@ class DraftSequenceExecutionPredictor {
         private var sampleCount: Int = 0
         private var levelMs: Double? = null
 
-        fun predictionMs(): Double = levelMs ?: 0.0
+        fun predictMs(): Double = levelMs ?: 0.0
 
         fun observeDurationMs(actualMs: Double) {
             if (actualMs <= 0.0) {
@@ -341,13 +332,27 @@ class DraftSequenceExecutionPredictor {
         val score: Double,
         val weight: Double = 1.0,
     ) {
-        fun decayed(factor: Double): ResidualSample = copy(weight = weight * factor)
+        fun decay(factor: Double): ResidualSample = copy(weight = weight * factor)
     }
 
     companion object {
         /** Process-wide learned model shared by profilers created across captures. */
         @JvmStatic
         val instance = DraftSequenceExecutionPredictor()
+
+        /**
+         * The OPTIONAL gate itself, stateless so a decision can be re-derived from a persisted prediction alone.
+         * Offline replay calls this exact function to answer "what would today's model admit", the same way it
+         * replays through a real [DraftSequenceAdmissionPolicy]; a copy of this rule would let the two drift and
+         * report a gate change as no change.
+         */
+        internal fun admitsOptionalWorkload(
+            sequencePredictedMs: Double,
+            sequenceUpperBoundMs: Double,
+            budgetMs: Long,
+        ): Boolean {
+            return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
+        }
 
         // Decoupled: alpha only tracks the workload level (responsive enough for thermal-throttle ramps);
         // decay sets the residual memory / safety quantile (effective ESS=(1+d)/(1-d) -> ~95th-pct bound at 0.9),

@@ -141,7 +141,7 @@ class CaptureMetricsExcelExporter(
                 val prediction = row.prediction ?: continue
                 val workloadKey = row.replayWorkloadKey() ?: continue
 
-                val modelAdmit = shouldAdmitOptionalWorkload(
+                val modelAdmit = DraftSequenceExecutionPredictor.admitsOptionalWorkload(
                     sequencePredictedMs = prediction.sequencePredictedDurationMs,
                     sequenceUpperBoundMs = prediction.sequencePredictedUpperBoundMs,
                     budgetMs = row.node.preExecutionMetrics.budgetMs,
@@ -481,16 +481,16 @@ class CaptureMetricsExcelExporter(
             else -> PACING_SOJOURN_BOUNDED
         }
 
-        val afterLevelDeficitMs: Long = captureAvailableLevelDeficitMs(
+        val afterLevelDeficitMs: Long = CaptureAvailablePacer.computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs = before.draftStartBudgetMs,
             draftSequenceCeilingMs = before.draftSequenceCeilingMs,
         )
-        val afterBacklogDeficitMinMs: Long = captureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMinMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMinMs,
             draftSequenceCeilingMs = before.draftSequenceCeilingMs,
         )
-        val afterBacklogDeficitMaxMs: Long = captureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMaxMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMaxMs,
             draftSequenceCeilingMs = before.draftSequenceCeilingMs,
@@ -498,11 +498,11 @@ class CaptureMetricsExcelExporter(
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
         }
-        val afterAppliedDelayMinMs: Long = captureAvailableDelayMs(
+        val afterAppliedDelayMinMs: Long = CaptureAvailablePacer.computeCaptureAvailableDelayMs(
             afterLevelDeficitMs,
             afterBacklogDeficitMinMs,
         )
-        val afterAppliedDelayMaxMs: Long = captureAvailableDelayMs(
+        val afterAppliedDelayMaxMs: Long = CaptureAvailablePacer.computeCaptureAvailableDelayMs(
             afterLevelDeficitMs,
             afterBacklogDeficitMaxMs,
         )

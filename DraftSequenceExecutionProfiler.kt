@@ -53,7 +53,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         draftSequenceNodeList = accessor.configuredNodeList
 
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
-            workloadKeyFor(plannedNode, requireReadyToRun = false)
+            classifyWorkloadKey(plannedNode, requireReadyToRun = false)
         }
         val gatingPacingDecision = captureAvailablePacer.observeDraftStart(
             plannedWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
@@ -61,7 +61,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
         metricsRecorder.onDraftStart(
             gatingPacingDecision = gatingPacingDecision,
-            pacerSessionId = captureAvailablePacer.currentSessionId(),
+            pacerSessionId = captureAvailablePacer.readCurrentSessionId(),
         )
     }
 
@@ -76,8 +76,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * Watermark) always run but are not reserve-protected; RESERVED workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
-        val workloadKey = workloadKeyFor(node, requireReadyToRun = true) ?: return null
-        val workloadSequenceKey = WorkloadSequenceKey(plannedWorkloadKeysFrom(node, workloadKey))
+        val workloadKey = classifyWorkloadKey(node, requireReadyToRun = true) ?: return null
+        val workloadSequenceKey = WorkloadSequenceKey(collectPlannedWorkloadKeysFrom(node, workloadKey))
         val preExecutionMetrics = readPreExecutionMetrics()
         val nodeExecutionMetrics = metricsRecorder.onNodeExecutionStart(
             nodeName = node.javaClass.simpleName,
@@ -141,7 +141,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                 val watchdogDecision = predictor.predictWatchdogTimeout(workloadSequenceKey, preExecutionMetrics)
                 watchdogDecision.decision?.let(modelUpdate::remember)
                 metricsRecorder.onWatchdogArmed(nodeExecutionMetrics, watchdogDecision.timeoutMs)
-                DraftSequenceExecutionSession.forOptionalWorkload(
+                DraftSequenceExecutionSession.createForOptionalWorkload(
                     shouldRun = prediction.admit,
                     watchdogTimeoutMs = watchdogDecision.timeoutMs,
                     onTimedOutTask = { worker ->
@@ -151,8 +151,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                     onComplete = onComplete,
                 )
             }
-            WorkloadPolicy.REQUIRED -> DraftSequenceExecutionSession.forRequiredWorkload(onComplete)
-            WorkloadPolicy.RESERVED -> DraftSequenceExecutionSession.forReservedWorkload(
+            WorkloadPolicy.REQUIRED -> DraftSequenceExecutionSession.createForRequiredWorkload(onComplete)
+            WorkloadPolicy.RESERVED -> DraftSequenceExecutionSession.createForReservedWorkload(
                 onCancel = { pendingCompleteSession = null },
                 onComplete = onComplete,
             ).also { session ->
@@ -182,18 +182,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         pendingCompleteSession = null
     }
 
-    private fun plannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
+    private fun collectPlannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
         val index = draftSequenceNodeList.indexOfFirst { plannedNode -> plannedNode === node }
         return if (index >= 0) {
             draftSequenceNodeList.drop(index).mapNotNull { plannedNode ->
-                workloadKeyFor(plannedNode, requireReadyToRun = false)
+                classifyWorkloadKey(plannedNode, requireReadyToRun = false)
             }
         } else {
             listOf(workloadKey)
         }
     }
 
-    private fun workloadKeyFor(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
+    private fun classifyWorkloadKey(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
         return when (node) {
             is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }

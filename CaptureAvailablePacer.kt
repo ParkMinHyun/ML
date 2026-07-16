@@ -4,26 +4,6 @@ import android.os.SystemClock
 import com.samsung.android.camera.core2.maker.MakerFeature
 import kotlin.math.ceil
 
-internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, draftSequenceCeilingMs: Double): Long {
-    return positiveCeilMs(draftSequenceCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
-}
-
-internal fun captureAvailableBacklogDeficitMs(
-    backlogMs: Long,
-    observedSojournMs: Long,
-    draftSequenceCeilingMs: Double,
-): Long {
-    return positiveCeilMs(
-        backlogMs + observedSojournMs + draftSequenceCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
-    )
-}
-
-internal fun captureAvailableDelayMs(levelDeficitMs: Long, backlogDeficitMs: Long): Long {
-    return maxOf(levelDeficitMs, backlogDeficitMs)
-}
-
-private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
-
 /**
  * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, APM timings
  * update the observed session maxima, and each admission is paired with the next draft start through one FIFO.
@@ -60,7 +40,7 @@ class CaptureAvailablePacer(
         if (plannedSequenceKey == null) {
             return rebaseBacklogOnDraftStart(0.0)
         }
-        val draftSequence = admissionPolicy.draftSequence(plannedSequenceKey)
+        val draftSequence = admissionPolicy.resolveDraftSequence(plannedSequenceKey)
         val draftSequenceEstimate = predictor.estimateDraftSequence(draftSequence)
         val demotedWorkloadMs = if (draftSequence == plannedSequenceKey) {
             0.0
@@ -105,16 +85,16 @@ class CaptureAvailablePacer(
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
         val draftCeilingMs = prediction.draftSequenceCeilingMs
         val queuedPredictedWorkMs = sumQueuedPredictedWorkMs()
-        val levelDeficitMs = captureAvailableLevelDeficitMs(
+        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs = prediction.draftStartBudgetMs,
             draftSequenceCeilingMs = draftCeilingMs,
         )
-        val backlogDeficitMs = captureAvailableBacklogDeficitMs(
+        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
             observedSojournMs = observedSojournMs,
             draftSequenceCeilingMs = draftCeilingMs,
         )
-        val delayMs = captureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
+        val delayMs = computeCaptureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
 
         val decision = CaptureAvailablePacingDecision(
             delayMs = delayMs,
@@ -136,7 +116,7 @@ class CaptureAvailablePacer(
 
     /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
     @Synchronized
-    fun currentSessionId(): Int = sessionId
+    fun readCurrentSessionId(): Int = sessionId
 
     /** Clears all pacing state when the draft task queue drains. */
     @Synchronized
@@ -166,6 +146,34 @@ class CaptureAvailablePacer(
     companion object {
         @JvmStatic
         val instance = CaptureAvailablePacer()
+
+        /**
+         * The two deficits and their max, stateless so a decision can be re-derived from persisted pacing inputs
+         * alone. Offline replay calls these exact functions to answer "what would today's pacing delay be"; a copy
+         * of this arithmetic would let the two drift and report a pacing change as no change.
+         */
+        internal fun computeCaptureAvailableLevelDeficitMs(
+            draftStartBudgetMs: Long,
+            draftSequenceCeilingMs: Double,
+        ): Long {
+            return ceilToPositiveMs(draftSequenceCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
+        }
+
+        internal fun computeCaptureAvailableBacklogDeficitMs(
+            backlogMs: Long,
+            observedSojournMs: Long,
+            draftSequenceCeilingMs: Double,
+        ): Long {
+            return ceilToPositiveMs(
+                backlogMs + observedSojournMs + draftSequenceCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+            )
+        }
+
+        internal fun computeCaptureAvailableDelayMs(levelDeficitMs: Long, backlogDeficitMs: Long): Long {
+            return maxOf(levelDeficitMs, backlogDeficitMs)
+        }
+
+        private fun ceilToPositiveMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
     }
 }
 
