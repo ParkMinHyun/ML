@@ -5,17 +5,17 @@ import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import kotlin.math.ceil
 
-internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, preferredUpperBoundMs: Double): Long {
-    return positiveCeilMs(preferredUpperBoundMs - draftStartBudgetMs.coerceAtLeast(0L))
+internal fun captureAvailableLevelDeficitMs(draftStartBudgetMs: Long, preferredCeilingMs: Double): Long {
+    return positiveCeilMs(preferredCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
 }
 
 internal fun captureAvailableBacklogDeficitMs(
     backlogMs: Long,
     observedSojournMs: Long,
-    preferredUpperBoundMs: Double,
+    preferredCeilingMs: Double,
 ): Long {
     return positiveCeilMs(
-        backlogMs + observedSojournMs + preferredUpperBoundMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+        backlogMs + observedSojournMs + preferredCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
     )
 }
 
@@ -26,7 +26,7 @@ internal fun captureAvailableDelayMs(levelDeficitMs: Long, backlogDeficitMs: Lon
 private fun positiveCeilMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
 
 /**
- * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current reserve, APM timings
+ * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, APM timings
  * update the observed session maxima, and each admission is paired with the next draft start through one FIFO.
  */
 class CaptureAvailablePacer(
@@ -43,9 +43,9 @@ class CaptureAvailablePacer(
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
-     * capture's point prediction, never by its reserve. Summing k reserves would price a queue at k times the session
+     * capture's point prediction, never by its ceiling. Summing k ceilings would price a queue at k times the session
      * worst case, which no observed burst reaches, and the over-pricing compounds with queue depth. The timeout
-     * margin comes from the reserve that [decideDelay] adds for the single capture being paced; underruns here do not
+     * margin comes from the ceiling that [decideDelay] adds for the single capture being paced; underruns here do not
      * accumulate because every draft start rebases this clock onto the real one.
      */
     private var busyUntilUptimeMs = 0L
@@ -61,7 +61,7 @@ class CaptureAvailablePacer(
             (predictor.estimateDraftPath(workloadSequenceKey).predictedMs - preferredEstimate.predictedMs)
                 .coerceAtLeast(0.0)
         }
-        val draftReserveMs = maxOf(
+        val draftCeilingMs = maxOf(
             observedMaxDraftMs.toDouble() - demotedWorkloadMs,
             preferredEstimate.predictedMs,
         )
@@ -70,7 +70,7 @@ class CaptureAvailablePacer(
             draftStartBudgetMs = budgetMs,
             mandatoryReserveUpperBoundMs = preferredEstimate.mandatoryReserveUpperBoundMs,
             preferredDraftPathPredictedMs = preferredEstimate.predictedMs,
-            preferredDraftPathUpperBoundMs = draftReserveMs,
+            preferredDraftPathCeilingMs = draftCeilingMs,
             workloadSequenceKey = preferredSequenceKey.toReplayString(),
         )
         return rebaseBacklogOnDraftStart(preferredEstimate.predictedMs)
@@ -96,16 +96,16 @@ class CaptureAvailablePacer(
         val prediction = pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
-        val reservedMs = prediction.preferredDraftPathUpperBoundMs
+        val draftCeilingMs = prediction.preferredDraftPathCeilingMs
         val queuedPredictedWorkMs = sumQueuedPredictedWorkMs()
         val levelDeficitMs = captureAvailableLevelDeficitMs(
             draftStartBudgetMs = prediction.draftStartBudgetMs,
-            preferredUpperBoundMs = reservedMs,
+            preferredCeilingMs = draftCeilingMs,
         )
         val backlogDeficitMs = captureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
             observedSojournMs = observedSojournMs,
-            preferredUpperBoundMs = reservedMs,
+            preferredCeilingMs = draftCeilingMs,
         )
         val delayMs = captureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
 
@@ -212,9 +212,16 @@ enum class SessionDemotion {
 /** Latest runtime prediction for captureAvailable pacing. */
 data class CaptureAvailablePacingPrediction(
     val draftStartBudgetMs: Long,
+    /** Model upper bound of the RESERVED tail alone. Classifies log severity; never reaches the delay. */
     val mandatoryReserveUpperBoundMs: Double,
     val preferredDraftPathPredictedMs: Double,
-    val preferredDraftPathUpperBoundMs: Double,
+    /**
+     * Draft time both deficits set aside for the capture being paced. Not a model bound despite sitting beside one:
+     * it is the session's observed max draft wall time re-projected onto the preferred shape, floored by the point
+     * prediction (all a session's first capture has). Called a ceiling, not a reserve, because "reserve" in this
+     * model always means the RESERVED-policy tail - a different quantity, computed a different way.
+     */
+    val preferredDraftPathCeilingMs: Double,
     val workloadSequenceKey: String,
 )
 
@@ -249,7 +256,7 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         draftStartBudgetMs = prediction.draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = prediction.preferredDraftPathPredictedMs,
-        preferredDraftPathUpperBoundMs = prediction.preferredDraftPathUpperBoundMs,
+        preferredDraftPathCeilingMs = prediction.preferredDraftPathCeilingMs,
         workloadSequenceKey = prediction.workloadSequenceKey,
     )
 }

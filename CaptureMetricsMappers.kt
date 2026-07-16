@@ -43,7 +43,7 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
-        preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
+        preferredDraftPathCeilingMs = preferredDraftPathCeilingMs,
         workloadSequenceKey = workloadSequenceKey,
     )
 }
@@ -203,7 +203,7 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         preferredDraftPathPredictedMs = preferredDraftPathPredictedMs,
-        preferredDraftPathUpperBoundMs = preferredDraftPathUpperBoundMs,
+        preferredDraftPathCeilingMs = preferredDraftPathCeilingMs,
         workloadSequenceKey = workloadSequenceKey,
     )
 }

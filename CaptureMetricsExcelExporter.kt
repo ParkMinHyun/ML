@@ -467,7 +467,7 @@ class CaptureMetricsExcelExporter(
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
         private val backlogBaseWithoutSojournMs =
-            before.backlogMs + before.preferredDraftPathUpperBoundMs - captureTimeoutMs
+            before.backlogMs + before.preferredDraftPathCeilingMs - captureTimeoutMs
 
         val inferredObservedSojournMs: Long? = if (before.backlogDeficitMs > 0L) {
             (before.backlogDeficitMs - ceil(backlogBaseWithoutSojournMs).toLong()).coerceAtLeast(0L)
@@ -479,7 +479,7 @@ class CaptureMetricsExcelExporter(
         private val knownObservedSojournMs: Long? = before.observedSojournMs ?: inferredObservedSojournMs
         val observedSojournMinMs: Long = knownObservedSojournMs ?: 0L
         val observedSojournMaxMs: Long = knownObservedSojournMs ?: floor(
-            (captureTimeoutMs - before.backlogMs - before.preferredDraftPathUpperBoundMs).coerceAtLeast(0.0),
+            (captureTimeoutMs - before.backlogMs - before.preferredDraftPathCeilingMs).coerceAtLeast(0.0),
         ).toLong()
         val observedSojournInference: String = when {
             before.observedSojournMs != null -> PACING_SOJOURN_RECORDED
@@ -489,17 +489,17 @@ class CaptureMetricsExcelExporter(
 
         val afterLevelDeficitMs: Long = captureAvailableLevelDeficitMs(
             draftStartBudgetMs = before.draftStartBudgetMs,
-            preferredUpperBoundMs = before.preferredDraftPathUpperBoundMs,
+            preferredCeilingMs = before.preferredDraftPathCeilingMs,
         )
         val afterBacklogDeficitMinMs: Long = captureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMinMs,
-            preferredUpperBoundMs = before.preferredDraftPathUpperBoundMs,
+            preferredCeilingMs = before.preferredDraftPathCeilingMs,
         )
         val afterBacklogDeficitMaxMs: Long = captureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMaxMs,
-            preferredUpperBoundMs = before.preferredDraftPathUpperBoundMs,
+            preferredCeilingMs = before.preferredDraftPathCeilingMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
@@ -1011,8 +1011,8 @@ class CaptureMetricsExcelExporter(
             Column("beforePreferredPathPredictedMs") {
                 it.row.pacingReplay?.before?.preferredDraftPathPredictedMs
             },
-            Column("beforePreferredPathUpperBoundMs") {
-                it.row.pacingReplay?.before?.preferredDraftPathUpperBoundMs
+            Column("beforePreferredPathCeilingMs") {
+                it.row.pacingReplay?.before?.preferredDraftPathCeilingMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
@@ -1025,12 +1025,12 @@ class CaptureMetricsExcelExporter(
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
             Column("beforeAppliedDelayMs") { it.row.pacingReplay?.before?.appliedDelayMs },
-            // Reserve calibration: recorded per-capture reserve minus this draft's wall time
-            // (positive = over-reserved = over-pacing pressure, negative = under-reserved).
-            Column("reserveErrorMs") {
-                val reserveMs = it.row.pacingReplay?.before?.preferredDraftPathUpperBoundMs
+            // Ceiling calibration: recorded per-capture ceiling minus this draft's wall time
+            // (positive = ceiling too high = over-pacing pressure, negative = ceiling undershot the draft).
+            Column("ceilingErrorMs") {
+                val ceilingMs = it.row.pacingReplay?.before?.preferredDraftPathCeilingMs
                 val draftWallMs = it.row.draftWallMs
-                if (reserveMs != null && draftWallMs != null) reserveMs - draftWallMs else null
+                if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
             },
             Column("") { "" },
             Column("captureTimeoutMs") { it.row.pacingReplay?.captureTimeoutMs },
@@ -1080,9 +1080,9 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Pacing prediction scope",
-                note = "after pacing reuses the recorded preferred-path prediction, reserve, and backlog. Changes to " +
-                    "reserve prediction or backlog reconstruction require a sequential replay with additional raw " +
-                    "runtime observations.",
+                note = "after pacing reuses the recorded preferred-path prediction, ceiling, and backlog. Changes to " +
+                    "how the ceiling is derived or to backlog reconstruction require a sequential replay with " +
+                    "additional raw runtime observations.",
             ),
             ReplayNote(
                 topic = "Counterfactual outcomes",

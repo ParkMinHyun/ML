@@ -292,8 +292,10 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Point/upper-bound estimates for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in
-     * one consistent model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with.
+     * Point estimate for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in one consistent
+     * model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with. The sequence's own
+     * upper bound is deliberately not offered: pacing bounds a capture by observed draft wall time, not by this
+     * model, so exposing one only invites re-coupling the two (see the pacer's preferredDraftPathCeilingMs).
      */
     @Synchronized
     fun estimateDraftPath(workloadSequenceKey: WorkloadSequenceKey): DraftPathEstimate {
@@ -301,7 +303,6 @@ class DraftSequenceExecutionPredictor {
         val reserveWorkloadKeys = mandatoryReserveWorkloadKeys(workloadSequenceKey)
         return DraftPathEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
-            upperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs),
             mandatoryReserveUpperBoundMs = if (reserveWorkloadKeys.isEmpty()) {
                 0.0
             } else {
@@ -377,9 +378,8 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/** One consistent model snapshot for a draft path: point sum, sequence upper bound, mandatory RESERVED upper bound. */
+/** One consistent model snapshot for a draft path: point sum plus the mandatory RESERVED tail's upper bound. */
 data class DraftPathEstimate(
     val predictedMs: Double,
-    val upperBoundMs: Double,
     val mandatoryReserveUpperBoundMs: Double,
 )

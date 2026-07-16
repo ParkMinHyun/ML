@@ -66,9 +66,11 @@ data class CaptureAvailablePacingMetrics(
     /** Session max measured draft wall time at decision time; null on rows persisted before recording. */
     val observedMaxDraftMs: Long?,
     val draftStartBudgetMs: Long,
+    /** Model upper bound of the RESERVED tail alone; log severity only, never part of the delay. */
     val mandatoryReserveUpperBoundMs: Double,
     val preferredDraftPathPredictedMs: Double,
-    val preferredDraftPathUpperBoundMs: Double,
+    /** Observed-max draft ceiling both deficits used; [CaptureAvailablePacingPrediction] says why it is not a bound. */
+    val preferredDraftPathCeilingMs: Double,
     val workloadSequenceKey: String,
 )
 

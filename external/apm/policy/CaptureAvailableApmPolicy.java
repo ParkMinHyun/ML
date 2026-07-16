@@ -53,7 +53,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * Reads the whole draft-task times and capture-available latency the {@link ProcessingResultData} repository
-     * collected. The max draft time (not a mean) feeds the pacer's observed reserve; a mean would lag a rising
+     * collected. The max draft time (not a mean) feeds the pacer's observed ceiling; a mean would lag a rising
      * thermal trend and let the queue overrun.
      */
     private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
@@ -145,7 +145,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
                     + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
                     + ", preferredDraftPathPredicted=" + pacingPrediction.getPreferredDraftPathPredictedMs() + "ms"
-                    + ", preferredDraftPathUpperBound=" + pacingPrediction.getPreferredDraftPathUpperBoundMs() + "ms"
+                    + ", preferredDraftPathCeiling=" + pacingPrediction.getPreferredDraftPathCeilingMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
                     + ", workloadSequenceKey=" + pacingPrediction.getWorkloadSequenceKey();
