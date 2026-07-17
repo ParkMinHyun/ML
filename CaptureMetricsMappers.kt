@@ -42,9 +42,9 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
-        draftSequencePredictedMs = draftSequencePredictedMs,
-        draftSequenceCeilingMs = draftSequenceCeilingMs,
-        workloadSequenceKey = workloadSequenceKey,
+        sessionPlannedPredictedMs = sessionPlannedPredictedMs,
+        sessionPlannedCeilingMs = sessionPlannedCeilingMs,
+        sessionPlannedSequenceKey = sessionPlannedSequenceKey,
     )
 }
 
@@ -202,9 +202,9 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
-        draftSequencePredictedMs = draftSequencePredictedMs,
-        draftSequenceCeilingMs = draftSequenceCeilingMs,
-        workloadSequenceKey = workloadSequenceKey,
+        sessionPlannedPredictedMs = sessionPlannedPredictedMs,
+        sessionPlannedCeilingMs = sessionPlannedCeilingMs,
+        sessionPlannedSequenceKey = sessionPlannedSequenceKey,
     )
 }
 

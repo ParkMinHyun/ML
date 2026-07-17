@@ -17,7 +17,7 @@ fun interface CaptureAvailablePacingDecider {
 /**
  * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, observed APM
  * timings update the session maxima, and each admission is paired with the next draft start through one FIFO.
- * Asks the [DraftSequenceAdmissionPolicy] which draft sequence a planned one becomes in this session.
+ * Asks the [DraftSequenceAdmissionPolicy] which sequence key a planned one becomes in this session's plan.
  * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
  */
 class CaptureAvailablePacer(
@@ -51,27 +51,27 @@ class CaptureAvailablePacer(
         if (plannedSequenceKey == null) {
             return rebaseBacklogOnDraftStart(0.0)
         }
-        val draftSequence = admissionPolicy.resolveDraftSequence(plannedSequenceKey)
-        val draftSequenceEstimate = predictor.estimateDraftSequence(draftSequence)
-        val demotedWorkloadMs = if (draftSequence == plannedSequenceKey) {
+        val sessionPlannedSequenceKey = admissionPolicy.resolveSessionPlannedSequenceKey(plannedSequenceKey)
+        val sessionPlannedEstimate = predictor.estimateDraftSequence(sessionPlannedSequenceKey)
+        val demotedWorkloadMs = if (sessionPlannedSequenceKey == plannedSequenceKey) {
             0.0
         } else {
-            (predictor.estimateDraftSequence(plannedSequenceKey).predictedMs - draftSequenceEstimate.predictedMs)
+            (predictor.estimateDraftSequence(plannedSequenceKey).predictedMs - sessionPlannedEstimate.predictedMs)
                 .coerceAtLeast(0.0)
         }
-        val draftCeilingMs = maxOf(
+        val sessionPlannedCeilingMs = maxOf(
             observedMaxDraftMs.toDouble() - demotedWorkloadMs,
-            draftSequenceEstimate.predictedMs,
+            sessionPlannedEstimate.predictedMs,
         )
 
         pacingPrediction = CaptureAvailablePacingPrediction(
             draftStartBudgetMs = budgetMs,
-            mandatoryReserveUpperBoundMs = draftSequenceEstimate.mandatoryReserveUpperBoundMs,
-            draftSequencePredictedMs = draftSequenceEstimate.predictedMs,
-            draftSequenceCeilingMs = draftCeilingMs,
-            workloadSequenceKey = draftSequence.toReplayString(),
+            mandatoryReserveUpperBoundMs = sessionPlannedEstimate.mandatoryReserveUpperBoundMs,
+            sessionPlannedPredictedMs = sessionPlannedEstimate.predictedMs,
+            sessionPlannedCeilingMs = sessionPlannedCeilingMs,
+            sessionPlannedSequenceKey = sessionPlannedSequenceKey.toReplayString(),
         )
-        return rebaseBacklogOnDraftStart(draftSequenceEstimate.predictedMs)
+        return rebaseBacklogOnDraftStart(sessionPlannedEstimate.predictedMs)
     }
 
     /**
@@ -91,16 +91,16 @@ class CaptureAvailablePacer(
         val prediction = pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
-        val draftCeilingMs = prediction.draftSequenceCeilingMs
+        val sessionPlannedCeilingMs = prediction.sessionPlannedCeilingMs
         val queuedPredictedWorkMs = sumQueuedPredictedWorkMs()
         val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs = prediction.draftStartBudgetMs,
-            draftSequenceCeilingMs = draftCeilingMs,
+            sessionPlannedCeilingMs = sessionPlannedCeilingMs,
         )
         val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
             observedSojournMs = observedSojournMs,
-            draftSequenceCeilingMs = draftCeilingMs,
+            sessionPlannedCeilingMs = sessionPlannedCeilingMs,
         )
         val delayMs = computeCaptureAvailableDelayMs(levelDeficitMs, backlogDeficitMs)
 
@@ -118,7 +118,7 @@ class CaptureAvailablePacer(
         )
         pendingDecisions.addLast(decision)
         busyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, busyUntilUptimeMs) +
-            ceil(prediction.draftSequencePredictedMs).toLong()
+            ceil(prediction.sessionPlannedPredictedMs).toLong()
         return decision
     }
 
@@ -147,7 +147,7 @@ class CaptureAvailablePacer(
 
     private fun sumQueuedPredictedWorkMs(): Double {
         return pendingDecisions.sumOf { decision ->
-            decision.prediction.draftSequencePredictedMs
+            decision.prediction.sessionPlannedPredictedMs
         }
     }
 
@@ -159,18 +159,18 @@ class CaptureAvailablePacer(
          */
         internal fun computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs: Long,
-            draftSequenceCeilingMs: Double,
+            sessionPlannedCeilingMs: Double,
         ): Long {
-            return ceilToPositiveMs(draftSequenceCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
+            return ceilToPositiveMs(sessionPlannedCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
         }
 
         internal fun computeCaptureAvailableBacklogDeficitMs(
             backlogMs: Long,
             observedSojournMs: Long,
-            draftSequenceCeilingMs: Double,
+            sessionPlannedCeilingMs: Double,
         ): Long {
             return ceilToPositiveMs(
-                backlogMs + observedSojournMs + draftSequenceCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+                backlogMs + observedSojournMs + sessionPlannedCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
             )
         }
 
@@ -187,15 +187,15 @@ data class CaptureAvailablePacingPrediction(
     val draftStartBudgetMs: Long,
     /** Model upper bound of the RESERVED tail alone. Classifies log severity; never reaches the delay. */
     val mandatoryReserveUpperBoundMs: Double,
-    val draftSequencePredictedMs: Double,
+    val sessionPlannedPredictedMs: Double,
     /**
      * Draft time both deficits set aside for the capture being paced. Not a model bound despite sitting beside one:
      * it is the session's observed max draft wall time re-projected onto this draft sequence, floored by the point
      * prediction (all a session's first capture has). Called a ceiling, not a reserve, because "reserve" in this
      * model always means the RESERVED-policy tail - a different quantity, computed a different way.
      */
-    val draftSequenceCeilingMs: Double,
-    val workloadSequenceKey: String,
+    val sessionPlannedCeilingMs: Double,
+    val sessionPlannedSequenceKey: String,
 )
 
 /** One captureAvailable pacing decision and the inputs that produced it. */
@@ -228,8 +228,8 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = prediction.draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
-        draftSequencePredictedMs = prediction.draftSequencePredictedMs,
-        draftSequenceCeilingMs = prediction.draftSequenceCeilingMs,
-        workloadSequenceKey = prediction.workloadSequenceKey,
+        sessionPlannedPredictedMs = prediction.sessionPlannedPredictedMs,
+        sessionPlannedCeilingMs = prediction.sessionPlannedCeilingMs,
+        sessionPlannedSequenceKey = prediction.sessionPlannedSequenceKey,
     )
 }

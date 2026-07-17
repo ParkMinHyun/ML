@@ -68,10 +68,10 @@ data class CaptureAvailablePacingMetrics(
     val draftStartBudgetMs: Long,
     /** Model upper bound of the RESERVED tail alone; log severity only, never part of the delay. */
     val mandatoryReserveUpperBoundMs: Double,
-    val draftSequencePredictedMs: Double,
+    val sessionPlannedPredictedMs: Double,
     /** Observed-max draft ceiling both deficits used; [CaptureAvailablePacingPrediction] says why it is not a bound. */
-    val draftSequenceCeilingMs: Double,
-    val workloadSequenceKey: String,
+    val sessionPlannedCeilingMs: Double,
+    val sessionPlannedSequenceKey: String,
 )
 
 data class PreExecutionMetrics(

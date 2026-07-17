@@ -114,14 +114,14 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "mandatory_reserve_upper_bound_ms")
     val mandatoryReserveUpperBoundMs: Double,
 
-    @ColumnInfo(name = "draft_sequence_predicted_ms")
-    val draftSequencePredictedMs: Double,
+    @ColumnInfo(name = "session_planned_predicted_ms")
+    val sessionPlannedPredictedMs: Double,
 
-    @ColumnInfo(name = "draft_sequence_ceiling_ms")
-    val draftSequenceCeilingMs: Double,
+    @ColumnInfo(name = "session_planned_ceiling_ms")
+    val sessionPlannedCeilingMs: Double,
 
-    @ColumnInfo(name = "workload_sequence_key")
-    val workloadSequenceKey: String,
+    @ColumnInfo(name = "session_planned_sequence_key")
+    val sessionPlannedSequenceKey: String,
 )
 
 @Entity(

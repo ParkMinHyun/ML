@@ -289,7 +289,7 @@ class DraftSequenceExecutionPredictor {
      * Point estimate for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in one consistent
      * model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with. The sequence's own
      * upper bound is deliberately not offered: pacing bounds a capture by observed draft wall time, not by this
-     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequenceCeilingMs).
+     * model, so exposing one only invites re-coupling the two (see the pacer's sessionPlannedCeilingMs).
      */
     @Synchronized
     fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {

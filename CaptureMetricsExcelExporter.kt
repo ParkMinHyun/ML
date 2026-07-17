@@ -461,7 +461,7 @@ class CaptureMetricsExcelExporter(
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
         private val backlogBaseWithoutSojournMs =
-            before.backlogMs + before.draftSequenceCeilingMs - captureTimeoutMs
+            before.backlogMs + before.sessionPlannedCeilingMs - captureTimeoutMs
 
         val inferredObservedSojournMs: Long? = if (before.backlogDeficitMs > 0L) {
             (before.backlogDeficitMs - ceil(backlogBaseWithoutSojournMs).toLong()).coerceAtLeast(0L)
@@ -473,7 +473,7 @@ class CaptureMetricsExcelExporter(
         private val knownObservedSojournMs: Long? = before.observedSojournMs ?: inferredObservedSojournMs
         val observedSojournMinMs: Long = knownObservedSojournMs ?: 0L
         val observedSojournMaxMs: Long = knownObservedSojournMs ?: floor(
-            (captureTimeoutMs - before.backlogMs - before.draftSequenceCeilingMs).coerceAtLeast(0.0),
+            (captureTimeoutMs - before.backlogMs - before.sessionPlannedCeilingMs).coerceAtLeast(0.0),
         ).toLong()
         val observedSojournInference: String = when {
             before.observedSojournMs != null -> PACING_SOJOURN_RECORDED
@@ -483,17 +483,17 @@ class CaptureMetricsExcelExporter(
 
         val afterLevelDeficitMs: Long = CaptureAvailablePacer.computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs = before.draftStartBudgetMs,
-            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
+            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
         val afterBacklogDeficitMinMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMinMs,
-            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
+            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
         val afterBacklogDeficitMaxMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             observedSojournMs = observedSojournMaxMs,
-            draftSequenceCeilingMs = before.draftSequenceCeilingMs,
+            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
@@ -997,16 +997,16 @@ class CaptureMetricsExcelExporter(
                     firstNodeStartUptimeMs - decisionUptimeMs
                 }
             },
-            Column("beforeWorkloadSequenceKey") { it.row.pacingReplay?.before?.workloadSequenceKey },
+            Column("beforeSessionPlannedSequenceKey") { it.row.pacingReplay?.before?.sessionPlannedSequenceKey },
             Column("beforeDraftStartBudgetMs") { it.row.pacingReplay?.before?.draftStartBudgetMs },
             Column("beforeMandatoryReserveUpperBoundMs") {
                 it.row.pacingReplay?.before?.mandatoryReserveUpperBoundMs
             },
-            Column("beforeDraftSequencePredictedMs") {
-                it.row.pacingReplay?.before?.draftSequencePredictedMs
+            Column("beforeSessionPlannedPredictedMs") {
+                it.row.pacingReplay?.before?.sessionPlannedPredictedMs
             },
-            Column("beforeDraftSequenceCeilingMs") {
-                it.row.pacingReplay?.before?.draftSequenceCeilingMs
+            Column("beforeSessionPlannedCeilingMs") {
+                it.row.pacingReplay?.before?.sessionPlannedCeilingMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
@@ -1022,7 +1022,7 @@ class CaptureMetricsExcelExporter(
             // Ceiling calibration: recorded per-capture ceiling minus this draft's wall time
             // (positive = ceiling too high = over-pacing pressure, negative = ceiling undershot the draft).
             Column("ceilingErrorMs") {
-                val ceilingMs = it.row.pacingReplay?.before?.draftSequenceCeilingMs
+                val ceilingMs = it.row.pacingReplay?.before?.sessionPlannedCeilingMs
                 val draftWallMs = it.row.draftWallMs
                 if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
             },

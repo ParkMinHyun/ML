@@ -150,11 +150,11 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
             pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
                     + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
-                    + ", draftSequencePredicted=" + pacingPrediction.getDraftSequencePredictedMs() + "ms"
-                    + ", draftSequenceCeiling=" + pacingPrediction.getDraftSequenceCeilingMs() + "ms"
+                    + ", sessionPlannedPredicted=" + pacingPrediction.getSessionPlannedPredictedMs() + "ms"
+                    + ", sessionPlannedCeiling=" + pacingPrediction.getSessionPlannedCeilingMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
-                    + ", workloadSequenceKey=" + pacingPrediction.getWorkloadSequenceKey();
+                    + ", sessionPlannedSequenceKey=" + pacingPrediction.getSessionPlannedSequenceKey();
         }
 
         final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, appliedDelayMs);
