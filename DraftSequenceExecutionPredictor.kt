@@ -16,6 +16,9 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  *
  * Besides admission, [estimateDraftSequence] snapshots the model for [CaptureAvailablePacer], which owns
  * captureAvailable pacing and only consumes these estimates.
+ *
+ * Owned by the draft-saving task manager and shared by the profilers it creates across captures, so the model
+ * lives exactly as long as the draft pipeline it learned from.
  */
 class DraftSequenceExecutionPredictor {
 
@@ -277,7 +280,7 @@ class DraftSequenceExecutionPredictor {
         for (index in indices) {
             this[index] = this[index].decay(SCORE_WEIGHT_DECAY)
         }
-        // ponytail: drop the negligible tail so the process-wide singleton's sample lists stay bounded.
+        // ponytail: drop the negligible tail so this long-lived model's sample lists stay bounded.
         // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
         removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
     }
@@ -336,10 +339,6 @@ class DraftSequenceExecutionPredictor {
     }
 
     companion object {
-        /** Process-wide learned model shared by profilers created across captures. */
-        @JvmStatic
-        val instance = DraftSequenceExecutionPredictor()
-
         /**
          * The OPTIONAL gate itself, stateless so a decision can be re-derived from a persisted prediction alone.
          * Offline replay calls this exact function to answer "what would today's model admit", the same way it

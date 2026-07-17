@@ -40,9 +40,7 @@ import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.container.SavingInfoContainer.SavingInfo;
 import com.samsung.android.camera.core2.exception.InvalidOperationException;
-import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.DeviceStateReader;
-import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.node.NodeChain;
 import com.samsung.android.camera.core2.processor.RecoveryProcessManager.RecoveryProcessSequence;
 import com.samsung.android.camera.core2.processor.container.NodeChainKeyContainer;
@@ -95,7 +93,6 @@ public class PostProcessor extends ProcessorBase implements IEventHandler, PostP
     private final Context mContext;
     private final ActivityManager mActivityManager;
     private final PowerManager mPowerManager;
-    private final DeviceStateReader mDeviceStateReader;
     private final SequenceSet mSequenceSet = new SequenceSet();
 
     private final ProcessRequestCollectionTracker mProcessRequestCollectionTracker = new ProcessRequestCollectionTracker();
@@ -326,8 +323,8 @@ public class PostProcessor extends ProcessorBase implements IEventHandler, PostP
         mProcessFileBufferPool = new DirectBufferPool(context, 2);
 
         mPostProcessThread = new PostProcessThread(context, mPostProcessStateManager, mPostSavingStateManagerGroup, mPostProcessorThreadCallback);
-        mDeviceStateReader = new DeviceStateReader(mActivityManager, mPowerManager, mPostProcessThread::getOverHeatHint);
-        mSavingDraftImageTaskManager = new SavingDraftImageTaskManager(mContext);
+        mSavingDraftImageTaskManager = new SavingDraftImageTaskManager(mContext,
+                new DeviceStateReader(mActivityManager, mPowerManager, mPostProcessThread::getOverHeatHint));
 //        CaptureMetricsRepository.getInstance(mContext).deleteFromIdAsync(194);
 //        CaptureMetricsRepository.getInstance(mContext).deleteByDsModeBlocking(0);
 //        DraftSequenceExecutionPredictor.warmUp(mContext);
@@ -644,10 +641,6 @@ public class PostProcessor extends ProcessorBase implements IEventHandler, PostP
                     extraBundle.get(ExtraBundle.MULTI_PICTURE_DATA_EXTRA_RESULT_FILES),
                     Objects.requireNonNull(mNodeControllerStateManager.getDraftRecoveryNodeChainAccessor()));
         }
-
-        final CaptureMetrics captureMetrics = Objects.requireNonNull(extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS), "captureMetrics");
-        final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = new DraftSequenceExecutionProfiler(isPendingRequest, captureMetrics, mDeviceStateReader);
-        extraBundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER, draftSequenceExecutionProfiler);
 
         mSavingDraftImageTaskManager.addRequest(processRequest,
                 mPostSavingStateManagerGroup,

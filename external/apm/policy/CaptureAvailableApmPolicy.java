@@ -19,6 +19,7 @@
 package com.samsung.android.camera.core2.apm.policy;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
@@ -26,8 +27,8 @@ import com.samsung.android.camera.core2.apm.repository.ApmDataProvider;
 import com.samsung.android.camera.core2.apm.repository.ApmResultDataSelector;
 import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
-import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecider;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingPrediction;
 import com.samsung.android.camera.core2.util.PLog;
 
@@ -59,7 +60,8 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
             new CaptureAvailableData(
                     resultData.getDraftTimes(),
-                    resultData.getCaptureAvailableTime()
+                    resultData.getCaptureAvailableTime(),
+                    resultData.getPacingDecider()
             );
 
     private SingleThreadDelayedScheduler singleThreadDelayedScheduler;
@@ -95,12 +97,12 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Delegates the pacing decision to the pacer, then schedules the provided {@code runnable} after the
-     * decided delay.
+     * Hands the observed timings to the published pacing decider, receives the delay decision, then schedules the
+     * provided {@code runnable} after the decided delay.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * pacing 결정을 pacer에 위임하고, 결정된 지연 후 {@code runnable}을 스케줄링합니다.
+     * 관측 타이밍을 발행된 pacing decider에 전달해 delay 결정을 받고, 결정된 지연 후 {@code runnable}을 스케줄링합니다.
      * </div>
      *
      * @param sequenceId sequenceId
@@ -111,19 +113,23 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
         long maxDraftTimeMs = 0L;
         long captureAvailableTimeMs = 0L;
+        CaptureAvailablePacingDecider pacingDecider = null;
         final ApmDataProvider<ProcessingResultData> provider = getApmDataProvider(ProcessingResultData.class);
         if (provider != null) {
             final CaptureAvailableData captureAvailableData = provider.getSelectedApmResultData(sequenceId, SELECTOR);
             maxDraftTimeMs = captureAvailableData.getMaxDraftTime();
             captureAvailableTimeMs = captureAvailableData.getCaptureAvailableTime();
-            CaptureAvailablePacer.getInstance().observeDraftTimings(maxDraftTimeMs, captureAvailableTimeMs);
+            pacingDecider = captureAvailableData.getPacingDecider();
         }
 
-        final CaptureAvailablePacingDecision pacingDecision = CaptureAvailablePacer.getInstance().decideDelay();
+        final CaptureAvailablePacingDecision pacingDecision =
+                pacingDecider != null ? pacingDecider.decideDelay(maxDraftTimeMs, captureAvailableTimeMs) : null;
 
         long appliedDelayMs = 0L;
         boolean warning = false;
-        String reason = "captureAvailable pacing waits for the first draft prediction";
+        String reason = pacingDecider != null
+                ? "captureAvailable pacing waits for the first draft prediction"
+                : "no pacing decider published - no pacing";
         String pacingDetails = ", maxDraftTime=" + maxDraftTimeMs + "ms, captureAvailableTime=" + captureAvailableTimeMs + "ms";
 
         if (pacingDecision != null) {
@@ -212,10 +218,13 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static class CaptureAvailableData {
         private final long maxDraftTime;
         private final long captureAvailableTime;
+        private final CaptureAvailablePacingDecider pacingDecider;
 
-        CaptureAvailableData(@NonNull List<Long> draftTimes, long captureAvailableTime) {
+        CaptureAvailableData(@NonNull List<Long> draftTimes, long captureAvailableTime,
+                             @Nullable CaptureAvailablePacingDecider pacingDecider) {
             this.maxDraftTime = draftTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
             this.captureAvailableTime = captureAvailableTime;
+            this.pacingDecider = pacingDecider;
         }
 
         long getMaxDraftTime() {
@@ -224,6 +233,11 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
         long getCaptureAvailableTime() {
             return captureAvailableTime;
+        }
+
+        @Nullable
+        CaptureAvailablePacingDecider getPacingDecider() {
+            return pacingDecider;
         }
     }
 

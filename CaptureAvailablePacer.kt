@@ -5,14 +5,25 @@ import com.samsung.android.camera.core2.maker.MakerFeature
 import kotlin.math.ceil
 
 /**
- * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, APM timings
- * update the observed session maxima, and each admission is paired with the next draft start through one FIFO.
+ * The one call CaptureAvailableApmPolicy exchanges with the draft pipeline: it hands over the timings it observed
+ * and receives back the delay decision data. Deliberately a single method - reading the admitted backlog against
+ * "now", computing the delay, and recording the admission for the next draft start must happen under one lock, or
+ * concurrent captureAvailable callbacks would double-admit against a stale backlog.
+ */
+fun interface CaptureAvailablePacingDecider {
+    fun decideDelay(observedDraftWallMs: Long, observedSojournMs: Long): CaptureAvailablePacingDecision?
+}
+
+/**
+ * Paces captureAvailable callbacks for one burst session. Draft starts refresh the current ceiling, observed APM
+ * timings update the session maxima, and each admission is paired with the next draft start through one FIFO.
  * Asks the [DraftSequenceAdmissionPolicy] which draft sequence a planned one becomes in this session.
+ * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
  */
 class CaptureAvailablePacer(
-    private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
-    private val admissionPolicy: DraftSequenceAdmissionPolicy = DraftSequenceAdmissionPolicy.instance,
-) {
+    private val predictor: DraftSequenceExecutionPredictor,
+    private val admissionPolicy: DraftSequenceAdmissionPolicy,
+) : CaptureAvailablePacingDecider {
 
     private var pacingPrediction: CaptureAvailablePacingPrediction? = null
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
@@ -63,23 +74,20 @@ class CaptureAvailablePacer(
         return rebaseBacklogOnDraftStart(draftSequenceEstimate.predictedMs)
     }
 
-    /** Records the APM timings observed together for one capture. */
+    /**
+     * Records the APM timings observed for this capture (non-positive values mean no observation), then returns the
+     * larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is
+     * queued as the admission record consumed by the next draft start.
+     */
     @Synchronized
-    fun observeDraftTimings(draftWallMs: Long, sojournMs: Long) {
+    override fun decideDelay(draftWallMs: Long, sojournMs: Long): CaptureAvailablePacingDecision? {
         if (draftWallMs > 0L) {
             observedMaxDraftMs = maxOf(observedMaxDraftMs, draftWallMs)
         }
         if (sojournMs > 0L) {
             observedSojournMs = maxOf(observedSojournMs, sojournMs)
         }
-    }
 
-    /**
-     * Returns the larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same
-     * decision is queued as the admission record consumed by the next draft start.
-     */
-    @Synchronized
-    fun decideDelay(): CaptureAvailablePacingDecision? {
         val prediction = pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
@@ -144,9 +152,6 @@ class CaptureAvailablePacer(
     }
 
     companion object {
-        @JvmStatic
-        val instance = CaptureAvailablePacer()
-
         /**
          * The two deficits and their max, stateless so a decision can be re-derived from persisted pacing inputs
          * alone. Offline replay calls these exact functions to answer "what would today's pacing delay be"; a copy

@@ -27,9 +27,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val isPendingRequest: Boolean,
     private val captureMetrics: CaptureMetrics,
     private val deviceStateReader: DeviceStateReader,
-    private val captureAvailablePacer: CaptureAvailablePacer = CaptureAvailablePacer.instance,
-    private val predictor: DraftSequenceExecutionPredictor = DraftSequenceExecutionPredictor.instance,
-    private val admissionPolicy: DraftSequenceAdmissionPolicy = DraftSequenceAdmissionPolicy.instance,
+    private val captureAvailablePacer: CaptureAvailablePacer,
+    private val predictor: DraftSequenceExecutionPredictor,
+    private val admissionPolicy: DraftSequenceAdmissionPolicy,
     draftSequenceMetrics: DraftSequenceMetrics = DraftSequenceMetrics(),
 ) {
 

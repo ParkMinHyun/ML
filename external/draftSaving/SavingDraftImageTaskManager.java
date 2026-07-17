@@ -5,18 +5,23 @@ import android.content.Context;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;
+import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
 import com.samsung.android.camera.core2.container.ExtraBundle;
 import com.samsung.android.camera.core2.container.SavingInfoContainer;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
 import com.samsung.android.camera.core2.ml.CaptureMetrics;
 import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+import com.samsung.android.camera.core2.ml.DeviceStateReader;
 import com.samsung.android.camera.core2.ml.DraftSequenceAdmissionPolicy;
+import com.samsung.android.camera.core2.ml.DraftSequenceExecutionPredictor;
 import com.samsung.android.camera.core2.ml.DraftSequenceExecutionProfiler;
 import com.samsung.android.camera.core2.processor.nodeController.DraftNodeChainAccessor;
 import com.samsung.android.camera.core2.processor.postSaving.PostSavingStateManagerGroup;
 import com.samsung.android.camera.core2.processor.request.ProcessRequest;
 import com.samsung.android.camera.core2.util.CLog;
 import com.samsung.android.camera.core2.util.ConditionChecker;
+import com.samsung.android.camera.core2.util.DynamicShotUtils;
 import com.samsung.android.camera.core2.util.ImageBuffer;
 import com.samsung.android.camera.core2.util.PLog;
 
@@ -35,6 +40,14 @@ import java.util.function.Consumer;
 public class SavingDraftImageTaskManager {
     private static final String TAG = "SavingDraftImageTaskManager";
     private final Context context;
+    private final DeviceStateReader deviceStateReader;
+    // Draft-sequence execution collaborators, owned here: this manager is the draft pipeline - it schedules the
+    // tasks the predictor learns from, owns the burst-session boundary that clears the pacer and the sticky
+    // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
+    private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
+    private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
+    private final CaptureAvailablePacer captureAvailablePacer =
+            new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
@@ -51,10 +64,12 @@ public class SavingDraftImageTaskManager {
      * SavingDraftImageTaskManager 생성자.
      * </div>
      *
-     * @param context               context
+     * @param context           context
+     * @param deviceStateReader reader for the device state snapshots each profiler records
      */
-    public SavingDraftImageTaskManager(@NonNull Context context) {
+    public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
         this.context = context;
+        this.deviceStateReader = deviceStateReader;
     }
 
     /**
@@ -115,6 +130,20 @@ public class SavingDraftImageTaskManager {
         savingDraftImageTask.addOriginalBuffer(processRequest.getData(), processRequest.getExtraBundle());
 
         if (processRequest.getCurrentDraftCount() == processRequest.getTotalDraftCount()) {
+            // One profiler per task, bound to the bundle the task processes with and reports through. Created at
+            // scheduling time so multi-draft captures do not build one dead profiler per intermediate request.
+            final CaptureMetrics captureMetrics = savingDraftImageTask.extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
+            ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
+            savingDraftImageTask.extraBundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER,
+                    new DraftSequenceExecutionProfiler(
+                            DynamicShotUtils.isPendingRequest(processRequest.getDsMode(), processRequest.getDsExtraInfo()),
+                            captureMetrics, deviceStateReader,
+                            captureAvailablePacer, draftSequenceExecutionPredictor, admissionPolicy));
+            // Publish the pacing decider with every draft start (idempotent - same reference): a publication dropped
+            // before APM start or wiped by a repository reset heals on the next shot, and no teardown detach is
+            // needed - a cleared pacer keeps answering "no delay" until the next pipeline's decider replaces it.
+            AdaptivePerformanceManager.getInstance().updateData(new PacingDeciderApmData(captureAvailablePacer));
+
             if (waitForSavingDraftImageTaskMapDrain) {
                 PLog.i(TAG, "[mhyun2.park] addRequest(ppSequenceId:%d) - save original draft image only until savingDraftImageTaskMap is drained", ppSequenceId);
                 savingDraftImageTask.markSaveOriginalDraftImageOnly();
@@ -166,8 +195,8 @@ public class SavingDraftImageTaskManager {
     public synchronized void close() {
         shutDownThreadPool();
         savingDraftImageTaskMap.clear();
-        CaptureAvailablePacer.getInstance().clear();
-        DraftSequenceAdmissionPolicy.getInstance().clear();
+        captureAvailablePacer.clear();
+        admissionPolicy.clear();
         reservedSkipSaveDraftImageIdSet.clear();
         waitForSavingDraftImageTaskMapDrain = false;
         isWatchdogDrainInCurrentSession = false;
@@ -203,8 +232,8 @@ public class SavingDraftImageTaskManager {
                 waitForSavingDraftImageTaskMapDrain = false;
                 isWatchdogDrainInCurrentSession = false;
                 hasCaptureTimeoutInCurrentSession = false;
-                CaptureAvailablePacer.getInstance().clear();
-                DraftSequenceAdmissionPolicy.getInstance().clear();
+                captureAvailablePacer.clear();
+                admissionPolicy.clear();
             }
         }
     }

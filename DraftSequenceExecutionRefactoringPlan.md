@@ -2,13 +2,19 @@
 
 ## Current usage flow
 
-`PostProcessor` creates a `DraftSequenceExecutionProfiler` for each draft request and stores it in the extra bundle.
-The configured node chain calls `profileNodeExecution()` and executes the returned session. The saving-task manager
-then completes or cancels the sequence. `CaptureAvailableApmPolicy` consumes the process-wide
-`CaptureAvailablePacer` independently of the profiler.
+`SavingDraftImageTaskManager` is the draft pipeline and owns the `DraftSequenceExecutionPredictor` (the learned
+model), `DraftSequenceAdmissionPolicy`, and `CaptureAvailablePacer` for its own lifetime; it creates one
+`DraftSequenceExecutionProfiler` per saving task at scheduling time, stored in the bundle the task processes with.
+The configured node chain calls `profileNodeExecution()` and executes the returned session. The manager owns the
+burst-session boundary and clears the pacer and admission policy when the draft task queue drains.
+`CaptureAvailableApmPolicy` exchanges only pacing data through the `CaptureAvailablePacingDecider` (observed timings
+in, a delay decision out). The decider travels the same APM data pipeline as the timings: the manager publishes it as
+`PacingDeciderApmData` at every draft start (idempotent, self-healing across APM restarts and repository resets), the
+`ProcessingDataRepository` stores it, and the policy selects it per callback; with no decider published, callbacks run
+undelayed.
 
-The Java-facing profiler constructor, lifecycle methods, session `execute(Callable, Callable)`, pacer data-class
-getters, and `getInstance()` singletons are compatibility boundaries and should remain unchanged.
+The Java-facing profiler constructor, lifecycle methods, session `execute(Callable, Callable)`, and pacer data-class
+getters are compatibility boundaries and should remain unchanged.
 
 ## Applied first step
 

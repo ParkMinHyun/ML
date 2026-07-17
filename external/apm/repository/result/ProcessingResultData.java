@@ -18,6 +18,10 @@
 
 package com.samsung.android.camera.core2.apm.repository.result;
 
+import androidx.annotation.Nullable;
+
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecider;
+
 import java.util.List;
 
 /**
@@ -55,4 +59,18 @@ public abstract class ProcessingResultData extends ApmResultData {
      * @return Capture available time in milliseconds.
      */
     public abstract long getCaptureAvailableTime();
+
+    /**
+     * <div class="camera_en">
+     * Returns the pacing decider of the draft pipeline currently producing this data.
+     * </div>
+     *
+     * <div class="camera_kr" style="display:none;">
+     * 현재 이 데이터를 생산 중인 draft 파이프라인의 pacing decider를 반환합니다.
+     * </div>
+     *
+     * @return The published pacing decider, or null until the pipeline's first draft start publishes one.
+     */
+    @Nullable
+    public abstract CaptureAvailablePacingDecider getPacingDecider();
 }

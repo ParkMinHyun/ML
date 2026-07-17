@@ -105,9 +105,4 @@ class DraftSequenceAdmissionPolicy {
         }
         return modelAdmit
     }
-
-    companion object {
-        @JvmStatic
-        val instance = DraftSequenceAdmissionPolicy()
-    }
 }
