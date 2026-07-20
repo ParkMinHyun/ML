@@ -91,12 +91,8 @@ class CaptureMetricsExcelExporter(
         val groups = groupCaptures(captures, usesPacerSessionBoundary)
         groups.forEach(::simulateAdmissionAfter)
 
-        val sortedGroups = groups.sortedBy { group ->
-            group.firstOrNull()?.nodeRows?.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel ?: Int.MAX_VALUE
-        }
-
         val enriched = mutableListOf<EnrichedCaptureRow>()
-        sortedGroups.forEachIndexed { sessionId, group ->
+        groups.forEachIndexed { sessionId, group ->
             var bokehAdmitCount = 0
             var bokehTotalCount = 0
             var filterAdmitCount = 0
@@ -241,13 +237,6 @@ class CaptureMetricsExcelExporter(
                 val value = column.extractor(item)
                 styles.styleFor(column.title, value)?.let { cell.cellStyle = it }
                 setCellValue(cell, value)
-            }
-
-            if (item is EnrichedCaptureRow && item.row.metrics.draftSequenceMetrics?.isTimeout == true && rowIndex < items.lastIndex) {
-                val nextItem = items.getOrNull(rowIndex + 1) as? EnrichedCaptureRow
-                if (nextItem != null && item.sessionSummary.sessionId != nextItem.sessionSummary.sessionId) {
-                    sheet.createRow(sheet.lastRowNum + 1)
-                }
             }
         }
     }

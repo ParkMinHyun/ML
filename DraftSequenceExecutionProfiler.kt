@@ -1,6 +1,7 @@
 package com.samsung.android.camera.core2.ml
 
 import android.os.SystemClock
+import com.samsung.android.camera.core2.container.CodecConfiguration
 import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.DynamicFunctionNode
 import com.samsung.android.camera.core2.node.Node
@@ -200,14 +201,16 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
             is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
             is WatermarkNode -> WorkloadKey.Watermark(sizeBucket, node.watermarkType)
-            is SecImageCodecNodeBase -> when {
-                node.isDecodingUsage -> WorkloadKey.Decoding(sizeBucket)
-                node.isEncodeUsage -> WorkloadKey.Encoding(
-                    sizeBucket,
-                    captureMetrics.resultImageFormat,
-                    isPendingRequest,
-                )
-                else -> error("SecImageCodecNodeBase is neither decoding nor encoding usage: ${node.javaClass.simpleName}")
+            is SecImageCodecNodeBase -> {
+                when (node.codecUsage) {
+                    CodecConfiguration.DECODE -> WorkloadKey.Decoding(sizeBucket)
+                    CodecConfiguration.ENCODE -> WorkloadKey.Encoding(
+                        sizeBucket,
+                        captureMetrics.resultImageFormat,
+                        isPendingRequest,
+                    )
+                    else -> error("not supported codecUsage(${node.codecUsage})")
+                }
             }
             else -> null
         }
