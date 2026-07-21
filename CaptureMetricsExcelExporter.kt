@@ -22,7 +22,45 @@ class CaptureMetricsExcelExporter(
     private class EnrichedCaptureRow(
         val row: CaptureRow,
         val sessionSummary: SessionSummary,
+        val wallBase: WallBaseDiagnostics,
     )
+
+    /**
+     * Cross-capture measurements for evaluating a future draft-wall-time-based pacing clock. They quantify the two
+     * obstacles a wall-based clock hits: completion-lag (the freshest wall observable at a decision lags the drafts
+     * actually in flight) and pricing error (the recorded backlog vs the pipeline's real time-to-free). Computed from
+     * the session's draft-start/end timeline, so they need the whole group, not one row.
+     */
+    private class WallBaseDiagnostics(
+        /** Drafts started but not yet finished at this capture's pacing decision - the occupancy a wall must price. */
+        val inFlightDraftCountAtDecision: Int?,
+        /** Wall of the most recently finished draft as of the decision - the freshest wall a wall-EWMA could see. */
+        val freshestCompletedDraftWallMs: Long?,
+    )
+
+    /** Per capture: in-flight count and the freshest completed draft wall as of its pacing decision. */
+    private fun computeWallBaseDiagnostics(group: List<CaptureRow>, member: CaptureRow): WallBaseDiagnostics {
+        val decisionMs = member.pacingReplay?.before?.decisionUptimeMs ?: member.draftStartUptimeMs
+            ?: return WallBaseDiagnostics(null, null)
+        var inFlight = 0
+        var freshestEndMs = Long.MIN_VALUE
+        var freshestWallMs: Long? = null
+        for (other in group) {
+            if (other === member) {
+                continue
+            }
+            val startMs = other.draftStartUptimeMs ?: continue
+            val endMs = other.draftEndUptimeMs ?: continue
+            if (startMs <= decisionMs && endMs > decisionMs) {
+                inFlight++
+            }
+            if (endMs <= decisionMs && endMs > freshestEndMs) {
+                freshestEndMs = endMs
+                freshestWallMs = other.draftWallMs
+            }
+        }
+        return WallBaseDiagnostics(inFlight, freshestWallMs)
+    }
 
     suspend fun export(): File {
         val outputDir = context.getExternalFilesDir(DIR_NAME)
@@ -122,7 +160,13 @@ class CaptureMetricsExcelExporter(
                     sessionFilterTotalCount = filterTotalCount,
                     sessionFilterAdmitRate = SessionSummary.admitRate(filterAdmitCount, filterTotalCount),
                 )
-                enriched.add(EnrichedCaptureRow(groupMember, sessionSummary))
+                enriched.add(
+                    EnrichedCaptureRow(
+                        groupMember,
+                        sessionSummary,
+                        computeWallBaseDiagnostics(group, groupMember),
+                    )
+                )
             }
         }
         return enriched
@@ -994,6 +1038,9 @@ class CaptureMetricsExcelExporter(
             Column("beforeSessionPlannedPredictedMs") {
                 it.row.pacingReplay?.before?.sessionPlannedPredictedMs
             },
+            Column("beforeSessionPlannedDraftOverheadMs") {
+                it.row.pacingReplay?.before?.sessionPlannedDraftOverheadMs
+            },
             Column("beforeSessionPlannedCeilingMs") {
                 it.row.pacingReplay?.before?.sessionPlannedCeilingMs
             },
@@ -1014,6 +1061,57 @@ class CaptureMetricsExcelExporter(
                 val ceilingMs = it.row.pacingReplay?.before?.sessionPlannedCeilingMs
                 val draftWallMs = it.row.draftWallMs
                 if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
+            },
+            // This draft's real between-node overhead (wall minus node processing) - what the clock's learned
+            // overhead term is calibrated against. Compare to beforeSessionPlannedDraftOverheadMs.
+            Column("overheadActualMs") {
+                val draftWallMs = it.row.draftWallMs
+                val nodeMs = it.row.draftSequenceDurationMs
+                if (draftWallMs != null && nodeMs != null) draftWallMs - nodeMs else null
+            },
+            // Learned overhead the clock added minus what this draft actually needed (positive = learned ran high).
+            Column("overheadLearnedMinusActualMs") {
+                val learnedMs = it.row.pacingReplay?.before?.sessionPlannedDraftOverheadMs
+                val draftWallMs = it.row.draftWallMs
+                val nodeMs = it.row.draftSequenceDurationMs
+                if (learnedMs != null && draftWallMs != null && nodeMs != null) {
+                    learnedMs - (draftWallMs - nodeMs)
+                } else {
+                    null
+                }
+            },
+            // How much the node point sum ALONE under-priced this draft's real pipeline occupancy (wall minus point
+            // sum) - the shortfall the overhead term exists to close. Positive = a point-only clock runs fast here,
+            // which is the backlog under-pricing that compounds with queue depth into a timeout.
+            Column("draftOccupancyUnderpriceMs") {
+                val predMs = it.row.pacingReplay?.before?.sessionPlannedPredictedMs
+                val draftWallMs = it.row.draftWallMs
+                if (predMs != null && draftWallMs != null) draftWallMs - predMs else null
+            },
+            // ---- Draft-wall-time-base viability probes (see ReplayNotes "Wall-base pacing") ----
+            // Drafts in flight when this capture was paced: the occupancy a wall-based clock must price but cannot yet
+            // observe (their walls are only known once they finish). High values = completion-lag territory.
+            Column("inFlightDraftCountAtDecision") { it.wallBase.inFlightDraftCountAtDecision },
+            // The freshest whole-draft wall observable at the decision (most recently finished draft).
+            Column("freshestCompletedDraftWallMs") { it.wallBase.freshestCompletedDraftWallMs },
+            // This draft's actual wall minus that freshest observable wall: the completion-lag error a "use the latest
+            // observed wall" clock would carry. Large positive during a throttle ramp = the observable wall is stale.
+            Column("freshestWallLagErrorMs") {
+                val actualMs = it.row.draftWallMs
+                val freshestMs = it.wallBase.freshestCompletedDraftWallMs
+                if (actualMs != null && freshestMs != null) actualMs - freshestMs else null
+            },
+            // Ground-truth pipeline wait this capture actually hit (draft start minus its release = decision + applied
+            // delay): the real backlog to compare against the priced beforeBacklogMs + beforeObservedSojournMs.
+            Column("realQueueWaitMs") {
+                val draftStartMs = it.row.draftStartUptimeMs
+                val decisionMs = it.row.pacingReplay?.before?.decisionUptimeMs
+                val appliedDelayMs = it.row.pacingReplay?.before?.appliedDelayMs
+                if (draftStartMs != null && decisionMs != null && appliedDelayMs != null) {
+                    (draftStartMs - decisionMs - appliedDelayMs).coerceAtLeast(0L)
+                } else {
+                    null
+                }
             },
             Column("") { "" },
             Column("captureTimeoutMs") { it.row.pacingReplay?.captureTimeoutMs },
@@ -1071,6 +1169,17 @@ class CaptureMetricsExcelExporter(
                 topic = "Counterfactual outcomes",
                 note = "a changed decision whose workload was not observed online requires offline replay or shadow " +
                     "execution. afterOutcomeStatus and afterObservationStatus identify those rows.",
+            ),
+            ReplayNote(
+                topic = "Wall-base pacing",
+                note = "columns for judging a future draft-wall-time-based clock. draftOccupancyUnderpriceMs " +
+                    "(draftWall - point sum) is how much the current point clock under-prices a draft; " +
+                    "sessionPlannedDraftOverheadMs vs overheadActualMs is the learned overhead's calibration. For a " +
+                    "wall-based clock the blockers show up as: inFlightDraftCountAtDecision (drafts whose wall is not " +
+                    "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
+                    "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
+                    "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
+                    "(compare to beforeBacklogMs + beforeObservedSojournMs).",
             ),
         )
 

@@ -69,6 +69,8 @@ data class CaptureAvailablePacingMetrics(
     /** Model upper bound of the RESERVED tail alone; log severity only, never part of the delay. */
     val mandatoryReserveUpperBoundMs: Double,
     val sessionPlannedPredictedMs: Double,
+    /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
+    val sessionPlannedDraftOverheadMs: Double,
     /** Observed-max draft ceiling both deficits used; [CaptureAvailablePacingPrediction] says why it is not a bound. */
     val sessionPlannedCeilingMs: Double,
     val sessionPlannedSequenceKey: String,

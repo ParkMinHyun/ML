@@ -117,6 +117,9 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "session_planned_predicted_ms")
     val sessionPlannedPredictedMs: Double,
 
+    @ColumnInfo(name = "session_planned_draft_overhead_ms")
+    val sessionPlannedDraftOverheadMs: Double,
+
     @ColumnInfo(name = "session_planned_ceiling_ms")
     val sessionPlannedCeilingMs: Double,
 

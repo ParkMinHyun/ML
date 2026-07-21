@@ -79,6 +79,7 @@ class CaptureAvailablePacer(
             draftStartBudgetMs = budgetMs,
             mandatoryReserveUpperBoundMs = sessionPlannedEstimate.mandatoryReserveUpperBoundMs,
             sessionPlannedPredictedMs = sessionPlannedEstimate.predictedMs,
+            sessionPlannedDraftOverheadMs = draftOverheadMs,
             sessionPlannedCeilingMs = sessionPlannedCeilingMs,
             sessionPlannedSequenceKey = sessionPlannedSequenceKey.toReplayString(),
         )
@@ -205,6 +206,8 @@ data class CaptureAvailablePacingPrediction(
     /** Model upper bound of the RESERVED tail alone. Classifies log severity; never reaches the delay. */
     val mandatoryReserveUpperBoundMs: Double,
     val sessionPlannedPredictedMs: Double,
+    /** Learned between-node overhead added once per queued draft to the backlog clock (clock work = predicted + this). */
+    val sessionPlannedDraftOverheadMs: Double,
     /**
      * Draft time both deficits set aside for the capture being paced. Not a model bound despite sitting beside one:
      * it is the session's observed max draft wall time re-projected onto this draft sequence, floored by the point
@@ -246,6 +249,7 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         draftStartBudgetMs = prediction.draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = prediction.mandatoryReserveUpperBoundMs,
         sessionPlannedPredictedMs = prediction.sessionPlannedPredictedMs,
+        sessionPlannedDraftOverheadMs = prediction.sessionPlannedDraftOverheadMs,
         sessionPlannedCeilingMs = prediction.sessionPlannedCeilingMs,
         sessionPlannedSequenceKey = prediction.sessionPlannedSequenceKey,
     )

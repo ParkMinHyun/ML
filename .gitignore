@@ -1,3 +1,4 @@
 .codex/
+.codex_tmp_xlsx/
 .agents/
 .claude/settings.local.json

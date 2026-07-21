@@ -43,6 +43,7 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         sessionPlannedPredictedMs = sessionPlannedPredictedMs,
+        sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
         sessionPlannedCeilingMs = sessionPlannedCeilingMs,
         sessionPlannedSequenceKey = sessionPlannedSequenceKey,
     )
@@ -203,6 +204,7 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         draftStartBudgetMs = draftStartBudgetMs,
         mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         sessionPlannedPredictedMs = sessionPlannedPredictedMs,
+        sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
         sessionPlannedCeilingMs = sessionPlannedCeilingMs,
         sessionPlannedSequenceKey = sessionPlannedSequenceKey,
     )
