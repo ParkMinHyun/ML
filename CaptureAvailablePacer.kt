@@ -34,12 +34,22 @@ class CaptureAvailablePacer(
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
-     * capture's point prediction, never by its ceiling. Summing k ceilings would price a queue at k times the session
-     * worst case, which no observed burst reaches, and the over-pricing compounds with queue depth. The timeout
-     * margin comes from the ceiling that [decideDelay] adds for the single capture being paced; underruns here do not
-     * accumulate because every draft start rebases this clock onto the real one.
+     * capture's point prediction plus the session's learned between-node overhead ([draftOverheadMs]), never by its
+     * ceiling. The point sum alone under-prices real pipeline occupancy (it omits the inter-node/deinit time), and
+     * that shortfall compounds with queue depth into a timeout; adding the overhead prices each queued draft by its
+     * real occupancy. The ceiling is still avoided here - summing k ceilings would price a queue at k times the
+     * session worst case, which no observed burst reaches. The timeout margin comes from the ceiling that
+     * [decideDelay] adds for the single capture being paced; underruns here do not accumulate because every draft
+     * start rebases this clock onto the real one.
      */
     private var busyUntilUptimeMs = 0L
+
+    /**
+     * Session snapshot of the predictor's learned between-node draft overhead, refreshed at each draft start. Added
+     * once per queued draft to [busyUntilUptimeMs] so the backlog clock tracks whole-draft occupancy, not just node
+     * processing. Sequence-independent, so one scalar covers every queued draft.
+     */
+    private var draftOverheadMs = 0.0
 
     /**
      * Refreshes the pacing prediction and consumes the oldest admitted callback. A null key means a draft with no
@@ -53,6 +63,7 @@ class CaptureAvailablePacer(
         }
         val sessionPlannedSequenceKey = admissionPolicy.resolveSessionPlannedSequenceKey(plannedSequenceKey)
         val sessionPlannedEstimate = predictor.estimateDraftSequence(sessionPlannedSequenceKey)
+        draftOverheadMs = sessionPlannedEstimate.draftOverheadMs
         val demotedWorkloadMs = if (sessionPlannedSequenceKey == plannedSequenceKey) {
             0.0
         } else {
@@ -118,7 +129,7 @@ class CaptureAvailablePacer(
         )
         pendingDecisions.addLast(decision)
         busyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, busyUntilUptimeMs) +
-            ceil(prediction.sessionPlannedPredictedMs).toLong()
+            ceil(prediction.sessionPlannedPredictedMs + draftOverheadMs).toLong()
         return decision
     }
 
@@ -134,6 +145,7 @@ class CaptureAvailablePacer(
         observedMaxDraftMs = 0L
         observedSojournMs = 0L
         busyUntilUptimeMs = 0L
+        draftOverheadMs = 0.0
         sessionId++
     }
 
@@ -141,7 +153,7 @@ class CaptureAvailablePacer(
     private fun rebaseBacklogOnDraftStart(startingPredictedMs: Double): CaptureAvailablePacingDecision? {
         val gatingDecision = pendingDecisions.removeFirstOrNull()
         busyUntilUptimeMs = SystemClock.uptimeMillis() +
-            ceil(startingPredictedMs + sumQueuedPredictedWorkMs()).toLong()
+            ceil(startingPredictedMs + draftOverheadMs + sumQueuedDraftWorkMs()).toLong()
         return gatingDecision
     }
 
@@ -149,6 +161,11 @@ class CaptureAvailablePacer(
         return pendingDecisions.sumOf { decision ->
             decision.prediction.sessionPlannedPredictedMs
         }
+    }
+
+    /** Queued point work plus one between-node overhead per queued draft - the clock's view of pending occupancy. */
+    private fun sumQueuedDraftWorkMs(): Double {
+        return sumQueuedPredictedWorkMs() + draftOverheadMs * pendingDecisions.size
     }
 
     companion object {

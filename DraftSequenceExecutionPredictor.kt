@@ -26,6 +26,14 @@ class DraftSequenceExecutionPredictor {
     private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
     private val globalResidualSamples = mutableListOf<ResidualSample>()
 
+    /**
+     * Whole-draft time the per-workload point sum does not capture: inter-node gaps, deinit, and scheduling between
+     * node executions. EWMA-tracked like a workload duration so the pacer can price a queued draft by its real
+     * pipeline occupancy (point sum + this) instead of node processing alone. Sequence-independent by construction,
+     * so it is a single trend rather than a per-sequence one.
+     */
+    private val draftOverheadTrend = WorkloadDurationTrend()
+
     @Synchronized
     fun predictAdmission(
         workloadSequenceKey: WorkloadSequenceKey,
@@ -210,6 +218,7 @@ class DraftSequenceExecutionPredictor {
     fun learnFromCapture(
         workloadDurations: Map<WorkloadKey, Long>,
         admissionDecisions: Collection<AdmissionDecision>,
+        draftWallMs: Long,
     ) {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
 
@@ -218,6 +227,13 @@ class DraftSequenceExecutionPredictor {
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
             workloadKeyDurationTrendMap.getOrPut(workloadKey) { WorkloadDurationTrend() }
                 .observeDurationMs(durationMs.toDouble())
+        }
+
+        // Everything in the draft wall not accounted for by node processing is the between-node overhead the point
+        // sum misses. Learn it only from fully measured drafts (both terms positive), never below zero.
+        val nodeProcessingMs = validWorkloadDurations.values.sum()
+        if (draftWallMs > 0L && nodeProcessingMs > 0L) {
+            draftOverheadTrend.observeDurationMs((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
         }
     }
 
@@ -305,6 +321,7 @@ class DraftSequenceExecutionPredictor {
                     reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
                 )
             },
+            draftOverheadMs = draftOverheadTrend.predictMs(),
         )
     }
 
@@ -382,8 +399,12 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/** One consistent model snapshot for a draft sequence: point sum plus the mandatory RESERVED tail's upper bound. */
+/**
+ * One consistent model snapshot for a draft sequence: point sum, the mandatory RESERVED tail's upper bound, and the
+ * learned between-node overhead the point sum omits (added to the point sum when pricing pipeline occupancy).
+ */
 data class DraftSequenceEstimate(
     val predictedMs: Double,
     val mandatoryReserveUpperBoundMs: Double,
+    val draftOverheadMs: Double,
 )

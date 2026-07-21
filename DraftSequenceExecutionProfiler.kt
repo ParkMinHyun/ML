@@ -41,6 +41,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var pendingCompleteSession: DraftSequenceExecutionSession? = null
+    private var draftDeviceStateSnapshot: DeviceStateSnapshot? = null
+    private var draftStartUptimeMs = 0L
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
@@ -52,6 +54,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun initializeDraftNodeChain(accessor: DraftNodeChainAccessor) {
         nodeChainLifecycle.setAccessor(accessor)
         draftSequenceNodeList = accessor.configuredNodeList
+        draftStartUptimeMs = SystemClock.uptimeMillis()
 
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
             classifyWorkloadKey(plannedNode, requireReadyToRun = false)
@@ -64,6 +67,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             gatingPacingDecision = gatingPacingDecision,
             pacerSessionId = captureAvailablePacer.readCurrentSessionId(),
         )
+
+        // Memory, thermal, and storage are observability inputs; only the timeout budget must stay fresh per node.
+        // Sampling them once keeps DeviceStateReader's blocking dispatcher work off every node transition.
+        draftDeviceStateSnapshot = deviceStateReader.read()
     }
 
     /**
@@ -110,7 +117,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {
-        val deviceState = deviceStateReader.read()
+        val deviceState = draftDeviceStateSnapshot ?: deviceStateReader.read().also { snapshot ->
+            draftDeviceStateSnapshot = snapshot
+        }
         return PreExecutionMetrics(
             budgetMs = readBudgetMs(),
             memorySnapshot = deviceState.memorySnapshot,
@@ -167,8 +176,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
 
+        val draftWallMs = if (draftStartUptimeMs > 0L) {
+            (SystemClock.uptimeMillis() - draftStartUptimeMs).coerceAtLeast(0L)
+        } else {
+            0L
+        }
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
-            predictor.learnFromCapture(workloadDurations, admissionDecisions)
+            predictor.learnFromCapture(workloadDurations, admissionDecisions, draftWallMs)
         }
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
