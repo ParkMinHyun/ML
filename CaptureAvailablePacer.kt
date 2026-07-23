@@ -33,6 +33,15 @@ class CaptureAvailablePacer(
     private var observedSojournMs = 0L
 
     /**
+     * Observed max draft wall per draft size, fed by the draft pipeline at completion ([observeDraftMeasured]) where
+     * both the size and the real wall are known. The ceiling reads the current draft's own size so a heavy other-size
+     * draft (a MP24 burst) no longer inflates a MP12 capture's reserve. A size not yet measured this session falls
+     * back to the size-agnostic max, floored by the size-aware point prediction - conservative for a genuinely cold
+     * size, exact once its own size has run.
+     */
+    private val observedMaxDraftMsBySize = mutableMapOf<SizeBucket, Long>()
+
+    /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
      * capture's point prediction plus the session's learned between-node overhead ([draftOverheadMs]), never by its
      * ceiling. The point sum alone under-prices real pipeline occupancy (it omits the inter-node/deinit time), and
@@ -70,8 +79,10 @@ class CaptureAvailablePacer(
             (predictor.estimateDraftSequence(plannedSequenceKey).predictedMs - sessionPlannedEstimate.predictedMs)
                 .coerceAtLeast(0.0)
         }
+        val currentSizeBucket = plannedSequenceKey.workloadKeys.firstOrNull()?.sizeBucket
+        val sizeScopedObservedMaxMs = currentSizeBucket?.let { observedMaxDraftMsBySize[it] } ?: observedMaxDraftMs
         val sessionPlannedCeilingMs = maxOf(
-            observedMaxDraftMs.toDouble() - demotedWorkloadMs,
+            sizeScopedObservedMaxMs.toDouble() - demotedWorkloadMs,
             sessionPlannedEstimate.predictedMs,
         )
 
@@ -134,6 +145,18 @@ class CaptureAvailablePacer(
         return decision
     }
 
+    /**
+     * Records one completed draft's real wall against its own size, fed by the draft pipeline (which knows both) so
+     * the per-size ceiling stays free of the size-agnostic windowed max the APM callback would otherwise attribute to
+     * whatever draft is currently paced.
+     */
+    @Synchronized
+    fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
+        if (draftWallMs > 0L) {
+            observedMaxDraftMsBySize[sizeBucket] = maxOf(observedMaxDraftMsBySize[sizeBucket] ?: 0L, draftWallMs)
+        }
+    }
+
     /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
     @Synchronized
     fun readCurrentSessionId(): Int = sessionId
@@ -144,6 +167,7 @@ class CaptureAvailablePacer(
         pacingPrediction = null
         pendingDecisions.clear()
         observedMaxDraftMs = 0L
+        observedMaxDraftMsBySize.clear()
         observedSojournMs = 0L
         busyUntilUptimeMs = 0L
         draftOverheadMs = 0.0

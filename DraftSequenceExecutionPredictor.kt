@@ -22,7 +22,12 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  */
 class DraftSequenceExecutionPredictor {
 
-    private val workloadKeyDurationTrendMap = mutableMapOf<WorkloadKey, WorkloadDurationTrend>()
+    // Point model as a multiplicative decomposition: duration(size) ≈ baseline(size) × condition(family).
+    // The per-size baseline is the duration with the transient condition divided out (structural, stable); the family
+    // condition carries the transient throttling shared across sizes, so a size not shot under it is corrected by it.
+    private val workloadKeyBaselineMap = mutableMapOf<WorkloadKey, BaselineMean>()
+    private val familyConditionMap = mutableMapOf<Class<*>, EwmaTrend>()
+
     private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
     private val globalResidualSamples = mutableListOf<ResidualSample>()
 
@@ -32,7 +37,7 @@ class DraftSequenceExecutionPredictor {
      * pipeline occupancy (point sum + this) instead of node processing alone. Sequence-independent by construction,
      * so it is a single trend rather than a per-sequence one.
      */
-    private val draftOverheadTrend = WorkloadDurationTrend()
+    private val draftOverheadTrend = EwmaTrend()
 
     @Synchronized
     fun predictAdmission(
@@ -82,17 +87,19 @@ class DraftSequenceExecutionPredictor {
     }
 
     private fun estimateWorkloadMs(workloadKey: WorkloadKey): Double {
-        // Conservative cross-size coupling: every same-type sibling bucket informs this workload. A smaller sibling
-        // scales UP by the megapixel ratio (a well-sampled MP12 x2 bounds an under-sampled MP24); a larger sibling is
-        // used as-is, never scaled down (a heavy MP24 bounds MP12 at its full value, not halved) - the ratio floors at
-        // 1.0. max() over siblings only raises the estimate; the ratio-1.0 sibling is the workload's own model.
-        // Predict-time only: the scaled value is never fed back into any model, so buckets never learn from each other.
-        return workloadKeyDurationTrendMap.entries
-            .filter { it.key.javaClass == workloadKey.javaClass }
-            .maxOfOrNull { (siblingKey, model) ->
-                model.predictMs() * siblingKey.sizeBucket.sizeRatio(workloadKey.sizeBucket).coerceAtLeast(1.0)
-            }
-            ?: 0.0
+        val condition = familyConditionMap[workloadKey.javaClass]?.value() ?: 1.0
+        workloadKeyBaselineMap[workloadKey]?.let { return it.meanMs() * condition }
+
+        // Cold size (never observed): scale a same-family sibling's baseline by the linear megapixel ratio, then apply
+        // the shared condition. A plain ratio is the cold-start prior (a 24MP sibling prices cold 12MP at half), used
+        // only until this size is observed once, after which the branch above returns its exact baseline.
+        val sibling = workloadKeyBaselineMap.entries
+            .filter { (siblingKey, _) -> siblingKey.isWorkloadFamily(workloadKey) }
+            .maxByOrNull { (_, baseline) -> baseline.meanMs() }
+            ?: return 0.0
+        val megaPixelRatio =
+            workloadKey.sizeBucket.megaPixels.toDouble() / sibling.key.sizeBucket.megaPixels.toDouble()
+        return sibling.value.meanMs() * megaPixelRatio * condition
     }
 
     private fun estimateUpperBoundMs(
@@ -224,16 +231,27 @@ class DraftSequenceExecutionPredictor {
 
         addResidualSamples(validWorkloadDurations, admissionDecisions)
 
+        // Multiplicative decomposition update. Each observation refreshes the family's shared condition (from how
+        // far it deviates from this size's own baseline) and the size's condition-stripped baseline - both read from
+        // PRE-update snapshots so the two do not feed back within one observation. The condition (fast EWMA) carries
+        // a thermal ramp across sizes; the baseline (running mean) stays a stable per-size structural anchor. This
+        // shares only the transient movement, without the double-count that inflated a sibling being shot concurrently.
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            workloadKeyDurationTrendMap.getOrPut(workloadKey) { WorkloadDurationTrend() }
-                .observeDurationMs(durationMs.toDouble())
+            val observedMs = durationMs.toDouble()
+            val family = workloadKey.javaClass
+            val conditionSnapshot = familyConditionMap[family]?.value() ?: 1.0
+            val baselineSnapshot = workloadKeyBaselineMap[workloadKey]?.meanMs()
+            if (baselineSnapshot != null && baselineSnapshot > 0.0) {
+                familyConditionMap.getOrPut(family) { EwmaTrend() }.observe(observedMs / baselineSnapshot)
+            }
+            workloadKeyBaselineMap.getOrPut(workloadKey) { BaselineMean() }.observe(observedMs / conditionSnapshot)
         }
 
         // Everything in the draft wall not accounted for by node processing is the between-node overhead the point
         // sum misses. Learn it only from fully measured drafts (both terms positive), never below zero.
         val nodeProcessingMs = validWorkloadDurations.values.sum()
         if (draftWallMs > 0L && nodeProcessingMs > 0L) {
-            draftOverheadTrend.observeDurationMs((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            draftOverheadTrend.observe((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
         }
     }
 
@@ -321,30 +339,50 @@ class DraftSequenceExecutionPredictor {
                     reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
                 )
             },
-            draftOverheadMs = draftOverheadTrend.predictMs(),
+            draftOverheadMs = draftOverheadTrend.value(),
         )
     }
 
-    /** Per-workload duration level, EWMA-tracked - the point-prediction half of the model. */
-    private class WorkloadDurationTrend {
+    /**
+     * Floored EWMA of a positive series: alpha = max([WORKLOAD_EWMA_ALPHA], 1/n), so recent samples keep at least a
+     * ~30% weight and the estimate tracks drift instead of settling into a flat mean. The first sample seeds it
+     * (alpha = 1 at n = 1, overwriting the 0.0 start). Used for both the family thermal-condition multiplier (~1.0 at
+     * reference, higher under throttling; fed duration/baseline ratios pooled across a family's sizes) and the
+     * between-node draft overhead (fed ms) - identical math, so one class serves both.
+     */
+    private class EwmaTrend {
         private var sampleCount: Int = 0
-        private var levelMs: Double? = null
+        private var estimate: Double = 0.0
 
-        fun predictMs(): Double = levelMs ?: 0.0
+        fun value(): Double = estimate
 
-        fun observeDurationMs(actualMs: Double) {
-            if (actualMs <= 0.0) {
+        fun observe(sample: Double) {
+            if (sample <= 0.0) {
                 return
             }
-
             sampleCount++
-            val currentLevelMs = levelMs
-            levelMs = if (currentLevelMs == null) {
-                actualMs
-            } else {
-                val effectiveAlpha = maxOf(WORKLOAD_EWMA_ALPHA, 1.0 / sampleCount)
-                currentLevelMs + effectiveAlpha * (actualMs - currentLevelMs)
+            estimate += maxOf(WORKLOAD_EWMA_ALPHA, 1.0 / sampleCount) * (sample - estimate)
+        }
+    }
+
+    /**
+     * One size's structural duration baseline with the shared thermal condition divided out: the running mean of
+     * (observed / condition-at-observation). Unlike [EwmaTrend] every sample weighs 1/n, so it converges to a stable
+     * average and never chases the condition within a sample - a stale size keeps its true baseline while [EwmaTrend]
+     * carries the transient throttling.
+     */
+    private class BaselineMean {
+        private var sampleCount: Int = 0
+        private var mean: Double = 0.0
+
+        fun meanMs(): Double = mean
+
+        fun observe(baselineSampleMs: Double) {
+            if (baselineSampleMs <= 0.0) {
+                return
             }
+            sampleCount++
+            mean += (baselineSampleMs - mean) / sampleCount
         }
     }
 
@@ -370,7 +408,7 @@ class DraftSequenceExecutionPredictor {
             return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
         }
 
-        // Decoupled: alpha only tracks the workload level (responsive enough for thermal-throttle ramps);
+        // Decoupled: alpha tracks the transient condition (responsive enough for thermal-throttle ramps);
         // decay sets the residual memory / safety quantile (effective ESS=(1+d)/(1-d) -> ~95th-pct bound at 0.9),
         // which self-calibrates to each device's throttling magnitude. Do not re-couple decay to 1 - alpha.
         private const val WORKLOAD_EWMA_ALPHA = 0.30

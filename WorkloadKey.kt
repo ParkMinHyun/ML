@@ -52,6 +52,9 @@ sealed interface WorkloadKey {
     }
 }
 
+/** Workload subtypes form resolution-independent families without a parallel key hierarchy. */
+fun WorkloadKey.isWorkloadFamily(other: WorkloadKey): Boolean = javaClass == other.javaClass
+
 fun WorkloadKey.toReplayString(): String = when (this) {
     is WorkloadKey.Bokeh -> "BOKEH(sizeBucket=$sizeBucket)"
     is WorkloadKey.DynamicFunction -> "DYNAMIC_FUNCTION(sizeBucket=$sizeBucket)"
@@ -79,9 +82,6 @@ enum class SizeBucket(val megaPixels: Int) {
     MP50(50),
     MP108(108),
     MP200(200);
-
-    fun sizeRatio(to: SizeBucket): Double =
-        to.megaPixels.toDouble() / megaPixels.toDouble()
 
     companion object {
         fun of(size: Size): SizeBucket {

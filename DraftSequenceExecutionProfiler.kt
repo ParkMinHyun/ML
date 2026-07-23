@@ -184,6 +184,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftWallMs)
         }
+        // Attribute this wall to its own draft size so the pacer's per-size ceiling is not contaminated by other sizes.
+        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
