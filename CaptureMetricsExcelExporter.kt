@@ -152,7 +152,25 @@ class CaptureMetricsExcelExporter(
             val evaluationRun = EvaluationRun(replayCaptures)
             val admissionReplayRows = nodeSheetRows(replayCaptures)
                 .filter { row -> row.nodeRow.isAdmissionWorkload && row.nodeRow.prediction != null }
+            val failureAttributionRows = evaluationRun.timelineRows
+                .filter { row -> isFailureOrNearMiss(row.capture.row) }
 
+            writeSheet(
+                workbook,
+                styles,
+                "RunContext",
+                listOf(evaluationRun),
+                buildRunContextColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "RunScorecard",
+                listOf(evaluationRun),
+                buildRunScorecardColumns(),
+                optimizeColumnWidths = true,
+            )
             writeSheet(
                 workbook,
                 styles,
@@ -183,6 +201,22 @@ class CaptureMetricsExcelExporter(
                 "RQ3Timeline",
                 evaluationRun.timelineRows,
                 buildRq3TimelineColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "GuardBaseline",
+                evaluationRun.timelineRows,
+                buildGuardBaselineColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "FailureAttribution",
+                failureAttributionRows,
+                buildFailureAttributionColumns(),
                 optimizeColumnWidths = true,
             )
             writeSheet(
@@ -962,6 +996,55 @@ class CaptureMetricsExcelExporter(
         private const val PACING_OUTCOME_REQUIRES_REPLAY = "Changed delay requires offline replay"
         private const val PACING_OUTCOME_BOUNDED = "Delay range requires offline replay"
 
+        // ---- SEIP evaluation additions: run context, static-guard baseline, failure attribution ----
+        // Production static thermal guard from Section 2.4: optional Draft processing is skipped at this overheat
+        // level or higher. Used only as an offline counterfactual to contrast with the controller's decisions.
+        private const val STATIC_GUARD_OVERHEAT_LEVEL = 4
+
+        // Tail-diagnostic threshold: a capture that finished within this margin of the deadline is a near miss, so
+        // failure attribution and tail analysis have signal even in runs with zero hard timeouts. 10% of the timeout.
+        private val NEAR_MISS_MARGIN_MS = (MakerFeature.CAPTURE_TIMEOUT_MS * 0.1).toLong()
+
+        // Cold-start window: prediction error over the first vs last few captures shows the online model converging.
+        private const val COLD_START_CAPTURE_COUNT = 5
+
+        // PowerManager thermal headroom is normalized so >= 1.0 means at or past the throttling threshold.
+        private const val THERMAL_HEADROOM_THROTTLING = 1.0f
+
+        private const val TARGET_CONFIG_M_AND_S = "M+S"
+        private const val TARGET_CONFIG_M_ONLY = "M"
+        private const val TARGET_CONFIG_S_ONLY = "S-only"
+        private const val TARGET_CONFIG_NONE = "none"
+
+        // Controller arm inferred from observed behavior only; a skip implies admission ran, a nonzero delay implies
+        // pacing ran. It cannot tell an inactive mechanism from an active one that never triggered - armLabel wins.
+        private const val ARM_FULL = "FULL (admission + pacing)"
+        private const val ARM_ADMISSION_ONLY = "ADMISSION_ONLY (skip observed, no delay)"
+        private const val ARM_PACING_ONLY = "PACING_ONLY (delay observed, no skip)"
+        private const val ARM_INACTIVE = "NONE_OR_INACTIVE (no skip and no delay observed)"
+
+        private const val GUARD_CELL_RECOVERED_M_SAFE = "RecoveredM_Safe: guard suppresses, controller ran M, no timeout"
+        private const val GUARD_CELL_ADMITTED_M_TIMEOUT = "AdmittedM_Timeout: guard suppresses, controller ran M, timeout"
+        private const val GUARD_CELL_AGREE_SUPPRESS = "AgreeSuppress: guard suppresses, controller skipped M"
+        private const val GUARD_CELL_AGREE_PERMIT_SAFE = "AgreePermit_Safe: guard permits, controller ran M, no timeout"
+        private const val GUARD_CELL_GUARD_BLIND_TIMEOUT = "GuardBlindTimeout: guard permits, controller ran M, timeout"
+        private const val GUARD_CELL_TIGHTENED_SAFE = "TightenedBelow4_Safe: guard permits, controller skipped M, no timeout"
+        private const val GUARD_CELL_TIGHTENED_TIMEOUT = "Tightened_Timeout: guard permits, controller skipped M, timeout"
+        private const val GUARD_CELL_M_NOT_ELIGIBLE = "M_not_eligible: no Bokeh decision in this capture"
+        private const val GUARD_CELL_UNKNOWN_LEVEL = "Unknown_level"
+
+        private const val CAUSE_CROSS_SHOT_BACKLOG = "CrossShotBacklogAccumulation"
+        private const val CAUSE_SINGLE_CAPTURE_OVERRUN = "SingleCaptureBudgetOverrun"
+        private const val CAUSE_PREDICTION_MISS = "PredictionMiss"
+        private const val CAUSE_THROTTLE_RAMP = "ThrottleRampSlowdown"
+        private const val CAUSE_UNATTRIBUTED = "Unattributed"
+
+        private const val MECHANISM_PACING = "Pacing"
+        private const val MECHANISM_ADMISSION = "Admission"
+        private const val MECHANISM_PREDICTOR = "Predictor"
+        private const val MECHANISM_ENVIRONMENT = "Environment"
+        private const val MECHANISM_UNATTRIBUTED = "Unattributed"
+
         private fun nodeSheetRows(captures: List<EnrichedCaptureRow>): List<NodeSheetRow> {
             return captures.flatMap { capture ->
                 capture.row.nodeRows.mapIndexed { index, nodeRow ->
@@ -1083,6 +1166,13 @@ class CaptureMetricsExcelExporter(
             Column("tailOnlySafeCount") { run ->
                 run.captureRows.count { capture -> capture.policyOutcome() == PolicyOutcome.TAIL_ONLY_SAFE }
             },
+            // The benefit Section 2.4 targets: run M where the static guard forbids it (level >= 4) without a timeout,
+            // while staying safe where the guard is blind (level < 4). Stratifying M availability by the guard level
+            // is what shows the controller is not just uniformly stricter or looser than the fixed threshold.
+            Column("mBokehCompletionLevelGE4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = true) },
+            Column("mBokehCompletionLevelLT4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = false) },
+            Column("guardFalsePositiveFixCount") { guardFalsePositiveFixCount(it) },
+            Column("guardFalseNegativeExposedCount") { guardFalseNegativeExposedCount(it) },
         )
 
         private fun buildRq2Columns(): List<Column<EvaluationRun>> = listOf(
@@ -1160,6 +1250,17 @@ class CaptureMetricsExcelExporter(
             },
             Column("mBokehSkipCount") { run -> run.bokehRows.count { row -> row.wasSkipped } },
             Column("sFilterSkipCount") { run -> run.filterRows.count { row -> row.wasSkipped } },
+            // Where the pacing cost went: delay charged because this capture's own ceiling exceeded a throttled
+            // budget (level-dominant, throttle recovery) vs delay charged to drain a queued backlog the current
+            // capture inherited (backlog-dominant, cross-shot recovery). Section 2.4 argues only the latter can
+            // recover budget already lost while waiting for the Draft worker, so separating them is load-bearing.
+            Column("throttleRecoveryDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_LEVEL) },
+            Column("backlogRecoveryDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_BACKLOG) },
+            Column("coDominantDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_EQUAL) },
+            Column("effectiveShotsPerSecond") { run ->
+                val meanMs = mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+                if (meanMs != null && meanMs > 0.0) 1000.0 / meanMs else null
+            },
         )
 
         private fun buildRq3Columns(): List<Column<EvaluationRun>> = listOf(
@@ -1324,6 +1425,20 @@ class CaptureMetricsExcelExporter(
             Column("p95QueuePricingErrorMs") { run ->
                 percentile(queuePricingErrorsMs(run), 0.95)
             },
+            // Cold-start convergence: the model learns online with no persisted priors, so absolute prediction error
+            // over the first few captures vs the last few shows it settling. A positive convergence delta means the
+            // later captures predict more accurately than the opening ones.
+            Column("coldStartMedianAbsPredictionErrorMs") { run ->
+                percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
+            },
+            Column("steadyStateMedianAbsPredictionErrorMs") { run ->
+                percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
+            },
+            Column("predictionErrorConvergenceDeltaMs") { run ->
+                val cold = percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
+                val steady = percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
+                if (cold != null && steady != null) cold - steady else null
+            },
         )
 
         private fun buildRq3TimelineColumns(): List<Column<EvaluationTimelineRow>> = listOf(
@@ -1418,6 +1533,354 @@ class CaptureMetricsExcelExporter(
             },
         )
 
+        /**
+         * One self-describing row per workbook. Lets several exported workbooks be aggregated into the baseline and
+         * ablation comparison tables without parsing file names: every config axis of the Section 2.4 study (device,
+         * resolution, size bucket, starting/observed overheat, memory, M vs M+S) plus the inferred controller arm.
+         */
+        private fun buildRunContextColumns(): List<Column<EvaluationRun>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("androidSdkInt") { Build.VERSION.SDK_INT },
+            Column("androidRelease") { Build.VERSION.RELEASE },
+            Column("captureCount") { it.captureRows.size },
+            Column("expectedCaptureCount") { EVALUATION_SESSION_CAPTURE_COUNT },
+            Column("sessionComplete") { it.captureRows.size == EVALUATION_SESSION_CAPTURE_COUNT },
+            Column("dominantResolution") { dominantResolution(it) },
+            Column("observedResolutions") { run ->
+                run.captureRows.map { capture ->
+                    "${capture.metrics.resultImageSize.width}x${capture.metrics.resultImageSize.height}"
+                }.distinct().sorted().joinToString("|")
+            },
+            Column("sizeBucketInferred") { sizeBucketInferred(it) },
+            Column("targetConfigInferred") { targetConfigInferred(it) },
+            Column("startingOverheatLevel") { overheatLevels(it).firstOrNull() },
+            Column("minOverheatLevel") { overheatLevels(it).minOrNull() },
+            Column("maxOverheatLevel") { overheatLevels(it).maxOrNull() },
+            Column("finalOverheatLevel") { overheatLevels(it).lastOrNull() },
+            Column("overheatRampObserved") { run ->
+                val levels = overheatLevels(run)
+                val start = levels.firstOrNull()
+                val peak = levels.maxOrNull()
+                start != null && peak != null && peak > start
+            },
+            Column("anyLowMemoryObserved") { run ->
+                firstNodePreExecutionMetrics(run).any { metrics -> metrics.memorySnapshot.isLowMemory }
+            },
+            Column("minRamAvailablePercent") { run ->
+                firstNodePreExecutionMetrics(run).minOfOrNull { metrics -> metrics.memorySnapshot.ramAvailablePercent }
+            },
+            Column("admissionActiveObserved") { run -> run.admissionRows.any { row -> row.nodeRow.wasSkipped } },
+            Column("pacingDecisionsPresent") { it.pacingRows.isNotEmpty() },
+            Column("pacingActiveObserved") { run -> run.pacingRows.any { pacing -> pacing.before.appliedDelayMs > 0L } },
+            Column("armSignatureInferred") { armSignatureInferred(it) },
+            Column("captureTimeoutMs") { MakerFeature.CAPTURE_TIMEOUT_MS },
+            Column("staticGuardOverheatLevel") { STATIC_GUARD_OVERHEAT_LEVEL },
+            Column("nearMissMarginMs") { NEAR_MISS_MARGIN_MS },
+            // Blank cells for the operator to annotate the authoritative arm/condition after pulling the workbook.
+            Column("armLabel") { "" },
+            Column("conditionLabel") { "" },
+            Column("trialId") { "" },
+            Column("notes") { "" },
+        )
+
+        /**
+         * One headline row per workbook: the same config keys as RunContext plus the safety, feature, cost, and
+         * correctness KPIs. Stack these rows across arm/condition runs to assemble the baseline vs proposed and the
+         * admission-only / pacing-only / full ablation comparison tables directly.
+         */
+        private fun buildRunScorecardColumns(): List<Column<EvaluationRun>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("sizeBucketInferred") { sizeBucketInferred(it) },
+            Column("targetConfigInferred") { targetConfigInferred(it) },
+            Column("anyLowMemoryObserved") { run ->
+                firstNodePreExecutionMetrics(run).any { metrics -> metrics.memorySnapshot.isLowMemory }
+            },
+            Column("startingOverheatLevel") { overheatLevels(it).firstOrNull() },
+            Column("armSignatureInferred") { armSignatureInferred(it) },
+            Column("armLabel") { "" },
+            Column("conditionLabel") { "" },
+            Column("captureCount") { it.captureRows.size },
+            // Safety.
+            Column("timeoutCount") { run -> run.captureRows.count { capture -> capture.hasTimeoutFailure } },
+            Column("timeoutRate") { run ->
+                rate(run.captureRows.count { capture -> capture.hasTimeoutFailure }, run.captureRows.size)
+            },
+            Column("firstTimeoutCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.hasTimeoutFailure }
+            },
+            Column("timeoutRightCensored") { run -> run.captureRows.none { capture -> capture.hasTimeoutFailure } },
+            Column("watchdogFailureCount") { run -> run.captureRows.count { capture -> capture.hasWatchdogFailure } },
+            Column("minTimeoutMarginMs") { run ->
+                run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs }.minOrNull()
+            },
+            Column("p05TimeoutMarginMs") { run ->
+                percentile(run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.05)
+            },
+            Column("medianTimeoutMarginMs") { run ->
+                percentile(run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.50)
+            },
+            // Feature availability.
+            Column("mBokehCompletionRate") { run ->
+                rate(run.bokehRows.count { row -> row.wasCompleted }, run.bokehRows.size)
+            },
+            Column("mBokehCompletionLevelGE4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = true) },
+            Column("mBokehCompletionLevelLT4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = false) },
+            Column("sFilterCompletionRate") { run ->
+                rate(run.filterRows.count { row -> row.wasCompleted }, run.filterRows.size)
+            },
+            Column("fullFeatureSuccessRate") { run ->
+                rate(run.captureRows.count { capture -> capture.isFullFeatureSuccess }, run.featureEligibleCaptures.size)
+            },
+            Column("guardFalsePositiveFixCount") { guardFalsePositiveFixCount(it) },
+            Column("guardFalseNegativeExposedCount") { guardFalseNegativeExposedCount(it) },
+            // Cost.
+            Column("meanShotToShotTimeMs") { run ->
+                mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+            },
+            Column("p95ShotToShotTimeMs") { run ->
+                percentile(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() }, 0.95)
+            },
+            Column("nonzeroPacingDelayRate") { run ->
+                rate(run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }, run.pacingRows.size)
+            },
+            Column("meanAppliedPacingDelayMs") { run ->
+                mean(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() })
+            },
+            Column("p95AppliedPacingDelayMs") { run ->
+                percentile(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() }, 0.95)
+            },
+            // Correctness.
+            Column("unsafeAdmitCount") { run ->
+                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT }
+            },
+            Column("sequenceUpperBoundMissCount") { run ->
+                run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
+            },
+            Column("medianAbsolutePredictionErrorMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row -> row.nodeRow.sequencePredictionResidualMs()?.let(::abs) },
+                    0.50,
+                )
+            },
+        )
+
+        /**
+         * Per-capture offline counterfactual against the production static thermal guard (skip optional Draft at
+         * overheat level >= 4). Answers the Section 2.4 claim directly: the controller must recover M where the guard
+         * suppresses it and stay safe where the guard is blind. This reads the recorded overheat level only; it is
+         * not a separate on-device guard run.
+         */
+        private fun buildGuardBaselineColumns(): List<Column<EvaluationTimelineRow>> = listOf(
+            Column("trialCaptureNumber") { it.trialCaptureNumber },
+            Column("captureIndex") { it.capture.row.captureIndex },
+            Column("resultImageWidth") { it.capture.row.metrics.resultImageSize.width },
+            Column("resultImageHeight") { it.capture.row.metrics.resultImageSize.height },
+            Column("overheatLevel") { overheatLevelOf(it.capture.row) },
+            Column("guardWouldSuppressOptional") { row ->
+                overheatLevelOf(row.capture.row)?.let { level -> level >= STATIC_GUARD_OVERHEAT_LEVEL }
+            },
+            Column("mBokehEligible") { it.capture.row.bokehDecisionRow != null },
+            Column("mBokehAdmitted") { it.capture.row.bokehDecisionRow?.wasAdmitted },
+            Column("mBokehCompleted") { it.capture.row.bokehDecisionRow?.wasCompleted },
+            Column("sFilterAdmitted") { it.capture.row.filterDecisionRow?.wasAdmitted },
+            Column("sFilterCompleted") { it.capture.row.filterDecisionRow?.wasCompleted },
+            Column("isTimeout") { it.capture.row.hasTimeoutFailure },
+            Column("timeoutMarginMs") { it.capture.row.timeoutMarginMs },
+            Column("guardVsControllerCell") { guardBaselineCell(it.capture.row) },
+            Column("mRecoveredAtSuppressedLevel") { row ->
+                val capture = row.capture.row
+                val level = overheatLevelOf(capture)
+                level != null && level >= STATIC_GUARD_OVERHEAT_LEVEL &&
+                    capture.bokehDecisionRow?.wasCompleted == true && !capture.hasTimeoutFailure
+            },
+            Column("guardBlindTimeout") { row ->
+                val capture = row.capture.row
+                val level = overheatLevelOf(capture)
+                level != null && level < STATIC_GUARD_OVERHEAT_LEVEL && capture.hasTimeoutFailure
+            },
+        )
+
+        /**
+         * One row per timeout, watchdog failure, or near miss, attributing the binding constraint to the mechanism
+         * responsible. This is the ablation-necessity evidence: an admission-only run should retain residual Pacing
+         * failures (cross-shot backlog it cannot space out) and a pacing-only run residual Admission failures
+         * (single-capture overruns it cannot shrink). Precedence: backlog, then overrun, then upper-bound miss,
+         * then throttle.
+         */
+        private fun buildFailureAttributionColumns(): List<Column<EvaluationTimelineRow>> = listOf(
+            Column("trialCaptureNumber") { it.trialCaptureNumber },
+            Column("captureIndex") { it.capture.row.captureIndex },
+            Column("overheatLevel") { overheatLevelOf(it.capture.row) },
+            Column("thermalHeadroom") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("isTimeout") { it.capture.row.hasTimeoutFailure },
+            Column("hasWatchdogFailure") { it.capture.row.hasWatchdogFailure },
+            Column("isNearMiss") { isNearMiss(it.capture.row) },
+            Column("timeoutMarginMs") { it.capture.row.timeoutMarginMs },
+            Column("draftWallMs") { it.capture.row.draftWallMs },
+            Column("primaryCause") { failurePrimaryCause(it.capture.row) },
+            Column("mechanismResponsible") { mechanismResponsible(failurePrimaryCause(it.capture.row)) },
+            // Supporting evidence so the attribution is auditable and can be reclassified offline.
+            Column("bokehObservedBudgetOverrun") { it.capture.row.bokehObservedBudgetOverrun },
+            Column("filterObservedBudgetOverrun") { it.capture.row.filterObservedBudgetOverrun },
+            Column("anyUpperBoundMiss") { upperBoundMissed(it.capture.row) },
+            Column("pacingDominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
+            Column("pacingBacklogMs") { it.capture.row.pacingReplay?.before?.backlogMs },
+            Column("pacingObservedSojournMs") { it.capture.row.pacingReplay?.before?.observedSojournMs },
+            Column("pacingQueuedDraftCount") { it.capture.row.pacingReplay?.before?.queuedDraftCount },
+            Column("appliedPacingDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
+        )
+
+        private fun overheatLevelOf(capture: CaptureRow): Int? =
+            capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
+
+        /** M (Bokeh) completion rate among captures eligible for it, split at the static-guard overheat threshold. */
+        private fun mCompletionRateAtLevel(run: EvaluationRun, atOrAboveGuard: Boolean): Double? {
+            val eligible = run.captureRows.filter { capture ->
+                val level = overheatLevelOf(capture)
+                level != null && capture.bokehDecisionRow != null &&
+                    (if (atOrAboveGuard) level >= STATIC_GUARD_OVERHEAT_LEVEL else level < STATIC_GUARD_OVERHEAT_LEVEL)
+            }
+            return rate(eligible.count { it.bokehDecisionRow?.wasCompleted == true }, eligible.size)
+        }
+
+        /** Captures where the guard would suppress M (level >= 4) but the controller ran it safely - the benefit. */
+        private fun guardFalsePositiveFixCount(run: EvaluationRun): Int =
+            run.captureRows.count { capture ->
+                val level = overheatLevelOf(capture)
+                level != null && level >= STATIC_GUARD_OVERHEAT_LEVEL &&
+                    capture.bokehDecisionRow?.wasCompleted == true && !capture.hasTimeoutFailure
+            }
+
+        /** Timeouts below level 4, where the static guard permits optional Draft and so would not have prevented them. */
+        private fun guardFalseNegativeExposedCount(run: EvaluationRun): Int =
+            run.captureRows.count { capture ->
+                val level = overheatLevelOf(capture)
+                level != null && level < STATIC_GUARD_OVERHEAT_LEVEL && capture.hasTimeoutFailure
+            }
+
+        private fun guardBaselineCell(capture: CaptureRow): String {
+            capture.bokehDecisionRow ?: return GUARD_CELL_M_NOT_ELIGIBLE
+            val level = overheatLevelOf(capture) ?: return GUARD_CELL_UNKNOWN_LEVEL
+            val guardSuppress = level >= STATIC_GUARD_OVERHEAT_LEVEL
+            val ranM = capture.bokehDecisionRow?.wasCompleted == true
+            val timeout = capture.hasTimeoutFailure
+            return when {
+                guardSuppress && ranM && !timeout -> GUARD_CELL_RECOVERED_M_SAFE
+                guardSuppress && ranM && timeout -> GUARD_CELL_ADMITTED_M_TIMEOUT
+                guardSuppress && !ranM -> GUARD_CELL_AGREE_SUPPRESS
+                !guardSuppress && ranM && !timeout -> GUARD_CELL_AGREE_PERMIT_SAFE
+                !guardSuppress && ranM && timeout -> GUARD_CELL_GUARD_BLIND_TIMEOUT
+                !guardSuppress && !ranM && !timeout -> GUARD_CELL_TIGHTENED_SAFE
+                else -> GUARD_CELL_TIGHTENED_TIMEOUT
+            }
+        }
+
+        private fun isNearMiss(capture: CaptureRow): Boolean {
+            val marginMs = capture.timeoutMarginMs ?: return false
+            return marginMs <= NEAR_MISS_MARGIN_MS
+        }
+
+        private fun isFailureOrNearMiss(capture: CaptureRow): Boolean =
+            capture.hasTimeoutFailure || capture.hasWatchdogFailure || isNearMiss(capture)
+
+        private fun failurePrimaryCause(capture: CaptureRow): String {
+            val pacingReplay = capture.pacingReplay
+            val pacing = pacingReplay?.before
+            if (pacing != null) {
+                val backlogPlusSojournMs = pacing.backlogMs + (pacing.observedSojournMs ?: 0L)
+                if (pacingReplay.beforeDominantDeficit == PACING_DOMINANT_BACKLOG && backlogPlusSojournMs > 0L) {
+                    return CAUSE_CROSS_SHOT_BACKLOG
+                }
+            }
+            if (capture.bokehObservedBudgetOverrun == true || capture.filterObservedBudgetOverrun == true) {
+                return CAUSE_SINGLE_CAPTURE_OVERRUN
+            }
+            if (upperBoundMissed(capture)) {
+                return CAUSE_PREDICTION_MISS
+            }
+            if (throttleObserved(capture)) {
+                return CAUSE_THROTTLE_RAMP
+            }
+            return CAUSE_UNATTRIBUTED
+        }
+
+        private fun mechanismResponsible(cause: String): String = when (cause) {
+            CAUSE_CROSS_SHOT_BACKLOG -> MECHANISM_PACING
+            CAUSE_SINGLE_CAPTURE_OVERRUN -> MECHANISM_ADMISSION
+            CAUSE_PREDICTION_MISS -> MECHANISM_PREDICTOR
+            CAUSE_THROTTLE_RAMP -> MECHANISM_ENVIRONMENT
+            else -> MECHANISM_UNATTRIBUTED
+        }
+
+        private fun throttleObserved(capture: CaptureRow): Boolean {
+            val thermal = capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot ?: return false
+            return thermal.overheatLevel >= STATIC_GUARD_OVERHEAT_LEVEL ||
+                thermal.thermalHeadroom >= THERMAL_HEADROOM_THROTTLING
+        }
+
+        private fun upperBoundMissed(capture: CaptureRow): Boolean {
+            val decisionRows = listOfNotNull(
+                capture.bokehDecisionRow,
+                capture.filterDecisionRow,
+                capture.decodingDecisionRow,
+                capture.overlayWatermarkDecisionRow,
+            )
+            return decisionRows.any { row -> admissionSheetRow(capture, row)?.sequenceUpperBoundMiss() == true }
+        }
+
+        private fun appliedDelaySumByDominant(run: EvaluationRun, dominantDeficit: String): Long =
+            run.pacingRows.filter { pacing -> pacing.beforeDominantDeficit == dominantDeficit }
+                .sumOf { pacing -> pacing.before.appliedDelayMs }
+
+        private fun absPredictionErrors(captures: List<EnrichedCaptureRow>): List<Double> =
+            captures.flatMap { capture -> capture.row.nodeRows }
+                .filter { row -> row.isAdmissionWorkload && row.prediction != null }
+                .mapNotNull { row -> row.sequencePredictionResidualMs()?.let(::abs) }
+
+        private fun dominantResolution(run: EvaluationRun): String? =
+            run.captureRows.groupingBy { capture ->
+                "${capture.metrics.resultImageSize.width}x${capture.metrics.resultImageSize.height}"
+            }.eachCount().maxByOrNull { entry -> entry.value }?.key
+
+        private fun sizeBucketInferred(run: EvaluationRun): String? =
+            run.captureRows.groupingBy { capture ->
+                sizeBucketNameOf(capture.metrics.resultImageSize.width, capture.metrics.resultImageSize.height)
+            }.eachCount().maxByOrNull { entry -> entry.value }?.key
+
+        private fun sizeBucketNameOf(width: Int, height: Int): String {
+            val megaPixels =
+                (width.toLong().coerceAtLeast(0L) * height.toLong().coerceAtLeast(0L)).toDouble() / 1_000_000.0
+            return SizeBucket.entries.minByOrNull { bucket -> abs(megaPixels - bucket.megaPixels) }?.name
+                ?: SizeBucket.MP12.name
+        }
+
+        private fun targetConfigInferred(run: EvaluationRun): String {
+            val hasM = run.captureRows.any { capture -> capture.bokehDecisionRow != null }
+            val hasS = run.captureRows.any { capture ->
+                capture.filterDecisionRow != null || capture.decodingDecisionRow != null ||
+                    capture.overlayWatermarkDecisionRow != null
+            }
+            return when {
+                hasM && hasS -> TARGET_CONFIG_M_AND_S
+                hasM -> TARGET_CONFIG_M_ONLY
+                hasS -> TARGET_CONFIG_S_ONLY
+                else -> TARGET_CONFIG_NONE
+            }
+        }
+
+        private fun armSignatureInferred(run: EvaluationRun): String {
+            val admissionActive = run.admissionRows.any { row -> row.nodeRow.wasSkipped }
+            val pacingActive = run.pacingRows.any { pacing -> pacing.before.appliedDelayMs > 0L }
+            return when {
+                admissionActive && pacingActive -> ARM_FULL
+                admissionActive -> ARM_ADMISSION_ONLY
+                pacingActive -> ARM_PACING_ONLY
+                else -> ARM_INACTIVE
+            }
+        }
+
         private fun buildEvaluationNotes(): List<ReplayNote> = listOf(
             ReplayNote(
                 topic = "Evaluation session",
@@ -1455,6 +1918,36 @@ class CaptureMetricsExcelExporter(
                 topic = "Cross-session statistics",
                 note = "Aggregate rates, confidence intervals, and time-to-first-timeout survival analysis must use " +
                     "each exported workbook/session as the independent unit, not individual captures.",
+            ),
+            ReplayNote(
+                topic = "RunContext and RunScorecard",
+                note = "RunContext self-describes this workbook (device, resolution, size bucket, starting and " +
+                    "observed overheat, memory, inferred target config and controller arm) so several workbooks can " +
+                    "be aggregated without parsing file names. RunScorecard is one headline row per workbook with the " +
+                    "same config keys plus safety, feature, cost, and correctness KPIs; stack RunScorecard rows " +
+                    "across arm and condition runs to build the baseline-vs-proposed and the admission-only / " +
+                    "pacing-only / full ablation tables. armSignatureInferred is derived from behavior only (a skip " +
+                    "implies admission ran, a nonzero delay implies pacing ran) and cannot distinguish an inactive " +
+                    "mechanism from an active one that never triggered, so set armLabel and conditionLabel " +
+                    "explicitly for the authoritative arm.",
+            ),
+            ReplayNote(
+                topic = "GuardBaseline (static-guard counterfactual)",
+                note = "Contrasts the production static thermal guard (skip optional Draft at overheat level >= 4, " +
+                    "Section 2.4) with the controller's per-capture decision and the deadline outcome. " +
+                    "guardVsControllerCell classifies each capture; mRecoveredAtSuppressedLevel counts the benefit " +
+                    "(M ran safely where the guard forbids it) and guardBlindTimeout counts timeouts below level 4 " +
+                    "that the guard alone would not have prevented. This is an offline counterfactual over the " +
+                    "recorded overheat level, not a separate on-device guard run.",
+            ),
+            ReplayNote(
+                topic = "FailureAttribution (ablation necessity)",
+                note = "For every timeout, watchdog failure, or near miss (finished within 10% of the deadline), " +
+                    "primaryCause and mechanismResponsible attribute the binding constraint to Pacing (cross-shot " +
+                    "backlog), Admission (single-capture budget overrun), Predictor (upper-bound miss), or " +
+                    "Environment (throttle). Admission-only runs should retain residual Pacing failures and " +
+                    "pacing-only runs residual Admission failures; that separation is the evidence that both " +
+                    "mechanisms are necessary. Precedence: backlog, then overrun, then upper-bound miss, then throttle.",
             ),
         )
 
