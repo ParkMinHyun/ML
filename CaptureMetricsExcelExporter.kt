@@ -8,9 +8,11 @@ import com.samsung.android.camera.watermark.Watermark.WatermarkType
 import org.apache.poi.ss.usermodel.Cell
 import org.apache.poi.ss.usermodel.CellStyle
 import org.apache.poi.ss.usermodel.Workbook
+import org.apache.poi.ss.util.CellRangeAddress
 import org.apache.poi.xssf.usermodel.XSSFWorkbook
 import java.io.File
 import java.io.FileOutputStream
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.floor
 
@@ -23,6 +25,28 @@ class CaptureMetricsExcelExporter(
         val row: CaptureRow,
         val sessionSummary: SessionSummary,
         val wallBase: WallBaseDiagnostics,
+    )
+
+    private class EvaluationRun(
+        val captures: List<EnrichedCaptureRow>,
+    ) {
+        val captureRows: List<CaptureRow> = captures.map { enriched -> enriched.row }
+        val admissionRows: List<NodeSheetRow> = nodeSheetRows(captures)
+            .filter { sheetRow -> sheetRow.nodeRow.isAdmissionWorkload && sheetRow.nodeRow.prediction != null }
+        val pacingRows: List<PacingReplay> = captureRows.mapNotNull { capture -> capture.pacingReplay }
+        val bokehRows: List<NodeRow> = captureRows.mapNotNull { capture -> capture.bokehDecisionRow }
+        val filterRows: List<NodeRow> = captureRows.mapNotNull { capture -> capture.filterDecisionRow }
+        val featureEligibleCaptures: List<CaptureRow> = captureRows.filter { capture ->
+            capture.bokehDecisionRow != null || capture.filterDecisionRow != null
+        }
+        val timelineRows: List<EvaluationTimelineRow> = captures.mapIndexed { index, capture ->
+            EvaluationTimelineRow(index + 1, capture)
+        }
+    }
+
+    private class EvaluationTimelineRow(
+        val trialCaptureNumber: Int,
+        val capture: EnrichedCaptureRow,
     )
 
     /**
@@ -100,7 +124,7 @@ class CaptureMetricsExcelExporter(
         XSSFWorkbook().use { workbook ->
             val styles = Styles(workbook)
 
-            val rawCaptures = metricsList.mapIndexed { index, metrics ->
+            val allRawCaptures = metricsList.mapIndexed { index, metrics ->
                 val draftMetrics = metrics.draftSequenceMetrics
 
                 val nodeMetricsList = draftMetrics?.nodeExecutionMetricsList.orEmpty()
@@ -121,11 +145,54 @@ class CaptureMetricsExcelExporter(
                     nodeRows = nodeRows,
                 )
             }
+            val rawCaptures = allRawCaptures.takeLast(EVALUATION_SESSION_CAPTURE_COUNT)
 
             val enrichedNormalCaptures = processCaptures(rawCaptures)
             val replayCaptures = enrichedNormalCaptures.sortedBy { enriched -> enriched.row.captureIndex }
+            val evaluationRun = EvaluationRun(replayCaptures)
             val admissionReplayRows = nodeSheetRows(replayCaptures)
                 .filter { row -> row.nodeRow.isAdmissionWorkload && row.nodeRow.prediction != null }
+
+            writeSheet(
+                workbook,
+                styles,
+                "RQ1Effectiveness",
+                listOf(evaluationRun),
+                buildRq1Columns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "RQ2Tradeoff",
+                listOf(evaluationRun),
+                buildRq2Columns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "RQ3Robustness",
+                listOf(evaluationRun),
+                buildRq3Columns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "RQ3Timeline",
+                evaluationRun.timelineRows,
+                buildRq3TimelineColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "EvaluationNotes",
+                buildEvaluationNotes(),
+                buildReplayNoteColumns(),
+                optimizeColumnWidths = true,
+            )
 
             writeSheet(workbook, styles, "AdmissionReplay", admissionReplayRows, buildAdmissionReplayColumns())
             writeSheet(workbook, styles, "PacingReplay", replayCaptures, buildPacingReplayColumns())
@@ -291,12 +358,16 @@ class CaptureMetricsExcelExporter(
         sheetName: String,
         items: List<T>,
         columns: List<Column<T>>,
+        optimizeColumnWidths: Boolean = false,
     ) {
         val sheet = workbook.createSheet(sheetName)
 
         val headerRow = sheet.createRow(0)
         columns.forEachIndexed { index, column ->
-            headerRow.createCell(index).setCellValue(column.title)
+            headerRow.createCell(index).apply {
+                cellStyle = styles.headerStyle
+                setCellValue(column.title)
+            }
         }
 
         items.forEachIndexed { rowIndex, item ->
@@ -306,6 +377,18 @@ class CaptureMetricsExcelExporter(
                 val value = column.extractor(item)
                 styles.styleFor(column.title, value)?.let { cell.cellStyle = it }
                 setCellValue(cell, value)
+            }
+        }
+        sheet.createFreezePane(0, 1)
+        if (items.isNotEmpty() && columns.isNotEmpty() && columns.all { column -> column.title.isNotBlank() }) {
+            sheet.setAutoFilter(CellRangeAddress(0, sheet.lastRowNum, 0, columns.lastIndex))
+        }
+        if (optimizeColumnWidths) {
+            columns.indices.forEach { columnIndex ->
+                sheet.autoSizeColumn(columnIndex)
+                if (sheet.getColumnWidth(columnIndex) > MAX_EVALUATION_COLUMN_WIDTH) {
+                    sheet.setColumnWidth(columnIndex, MAX_EVALUATION_COLUMN_WIDTH)
+                }
             }
         }
     }
@@ -807,6 +890,9 @@ class CaptureMetricsExcelExporter(
     /** Cell number formats keyed by column-title suffix. */
     private class Styles(workbook: Workbook) {
         private val dataFormat = workbook.createDataFormat()
+        val headerStyle: CellStyle = workbook.createCellStyle().apply {
+            setFont(workbook.createFont().apply { bold = true })
+        }
         private val msStyle: CellStyle = workbook.createCellStyle().apply {
             dataFormat = this@Styles.dataFormat.getFormat("0\" ms\"")
         }
@@ -816,8 +902,15 @@ class CaptureMetricsExcelExporter(
         private val rateStyle: CellStyle = workbook.createCellStyle().apply {
             dataFormat = this@Styles.dataFormat.getFormat("0.0%")
         }
+        private val wrapTextStyle: CellStyle = workbook.createCellStyle().apply {
+            wrapText = true
+            verticalAlignment = org.apache.poi.ss.usermodel.VerticalAlignment.TOP
+        }
 
         fun styleFor(columnTitle: String, value: Any?): CellStyle? {
+            if (columnTitle.equals("note", ignoreCase = true)) {
+                return wrapTextStyle
+            }
             if (value !is Number) {
                 return null
             }
@@ -833,7 +926,9 @@ class CaptureMetricsExcelExporter(
     private companion object {
         private const val DIR_NAME = "metrics"
         private val FILE_NAME = "${Build.MODEL}_metrics.xlsx"
+        private const val EVALUATION_SESSION_CAPTURE_COUNT = 30
         private const val MAX_SHEET_NAME_LENGTH = 31
+        private const val MAX_EVALUATION_COLUMN_WIDTH = 48 * 256
         private const val ADMIT_BOKEH_PREFIX = "BOKEH("
         private const val ADMIT_DECODING_PREFIX = "DECODING("
         private const val ADMIT_FILTER_PREFIX = "FILTER("
@@ -893,6 +988,558 @@ class CaptureMetricsExcelExporter(
                 isOverlayWatermarkWorkload -> WorkloadKey.Watermark(sizeBucket, WatermarkType.OVERLAY)
                 else -> null
             }
+        }
+
+        private fun buildRq1Columns(): List<Column<EvaluationRun>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("captureCount") { it.captureRows.size },
+            Column("expectedCaptureCount") { EVALUATION_SESSION_CAPTURE_COUNT },
+            Column("sessionComplete") { run ->
+                run.captureRows.size == EVALUATION_SESSION_CAPTURE_COUNT
+            },
+            Column("timeoutCount") { run -> run.captureRows.count { capture -> capture.hasTimeoutFailure } },
+            Column("timeoutRate") { run ->
+                rate(run.captureRows.count { capture -> capture.hasTimeoutFailure }, run.captureRows.size)
+            },
+            Column("watchdogFailureCount") { run ->
+                run.captureRows.count { capture -> capture.hasWatchdogFailure }
+            },
+            Column("watchdogFailureRate") { run ->
+                rate(run.captureRows.count { capture -> capture.hasWatchdogFailure }, run.captureRows.size)
+            },
+            Column("timeoutOrWatchdogFailureCount") { run ->
+                run.captureRows.count { capture -> capture.hasTimeoutOrWatchdogFailure }
+            },
+            Column("timeoutOrWatchdogFailureRate") { run ->
+                rate(run.captureRows.count { capture -> capture.hasTimeoutOrWatchdogFailure }, run.captureRows.size)
+            },
+            Column("anyTimeoutOrWatchdogFailure") { run ->
+                run.captureRows.any { capture -> capture.hasTimeoutOrWatchdogFailure }
+            },
+            Column("firstTimeoutCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.hasTimeoutFailure }
+            },
+            Column("firstFailureCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.hasTimeoutOrWatchdogFailure }
+            },
+            Column("timeoutRightCensored") { run ->
+                run.captureRows.none { capture -> capture.hasTimeoutFailure }
+            },
+            Column("timeoutMarginObservedCount") { run ->
+                run.captureRows.count { capture -> capture.timeoutMarginMs != null }
+            },
+            Column("minimumTimeoutMarginMs") { run ->
+                run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs }.minOrNull()
+            },
+            Column("p05TimeoutMarginMs") { run ->
+                percentile(run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.05)
+            },
+            Column("medianTimeoutMarginMs") { run ->
+                percentile(run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.50)
+            },
+            Column("featureEligibleCaptureCount") { it.featureEligibleCaptures.size },
+            Column("mBokehDecisionCount") { it.bokehRows.size },
+            Column("mBokehAdmitCount") { run -> run.bokehRows.count { row -> row.wasAdmitted == true } },
+            Column("mBokehAdmitRate") { run ->
+                rate(run.bokehRows.count { row -> row.wasAdmitted == true }, run.bokehRows.size)
+            },
+            Column("mBokehCompletedCount") { run -> run.bokehRows.count { row -> row.wasCompleted } },
+            Column("mBokehCompletionRate") { run ->
+                rate(run.bokehRows.count { row -> row.wasCompleted }, run.bokehRows.size)
+            },
+            Column("mBokehCompletionAmongAdmittedRate") { run ->
+                rate(
+                    run.bokehRows.count { row -> row.wasCompleted },
+                    run.bokehRows.count { row -> row.wasAdmitted == true },
+                )
+            },
+            Column("sFilterDecisionCount") { it.filterRows.size },
+            Column("sFilterAdmitCount") { run -> run.filterRows.count { row -> row.wasAdmitted == true } },
+            Column("sFilterAdmitRate") { run ->
+                rate(run.filterRows.count { row -> row.wasAdmitted == true }, run.filterRows.size)
+            },
+            Column("sFilterCompletedCount") { run -> run.filterRows.count { row -> row.wasCompleted } },
+            Column("sFilterCompletionRate") { run ->
+                rate(run.filterRows.count { row -> row.wasCompleted }, run.filterRows.size)
+            },
+            Column("fullFeatureSuccessCount") { run ->
+                run.captureRows.count { capture -> capture.isFullFeatureSuccess }
+            },
+            Column("fullFeatureSuccessRate") { run ->
+                rate(
+                    run.captureRows.count { capture -> capture.isFullFeatureSuccess },
+                    run.featureEligibleCaptures.size,
+                )
+            },
+            Column("selectiveBokehSkipSuccessCount") { run ->
+                run.captureRows.count { capture -> capture.isSelectiveBokehSkipSuccess }
+            },
+            Column("selectiveBokehSkipSuccessRate") { run ->
+                rate(
+                    run.captureRows.count { capture -> capture.isSelectiveBokehSkipSuccess },
+                    run.featureEligibleCaptures.size,
+                )
+            },
+            Column("tailOnlySafeCount") { run ->
+                run.captureRows.count { capture -> capture.policyOutcome() == PolicyOutcome.TAIL_ONLY_SAFE }
+            },
+        )
+
+        private fun buildRq2Columns(): List<Column<EvaluationRun>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("captureCount") { it.captureRows.size },
+            Column("shotToShotObservedCount") { run ->
+                run.captureRows.count { capture -> capture.metrics.shotToShotTimeMs != null }
+            },
+            Column("totalShotToShotTimeMs") { run ->
+                run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs }.sum()
+            },
+            Column("meanShotToShotTimeMs") { run ->
+                mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+            },
+            Column("medianShotToShotTimeMs") { run ->
+                percentile(
+                    run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    0.50,
+                )
+            },
+            Column("p95ShotToShotTimeMs") { run ->
+                percentile(
+                    run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    0.95,
+                )
+            },
+            Column("maximumShotToShotTimeMs") { run ->
+                run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs }.maxOrNull()
+            },
+            Column("pacingDecisionCount") { it.pacingRows.size },
+            Column("nonzeroPacingDelayCount") { run ->
+                run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }
+            },
+            Column("nonzeroPacingDelayRate") { run ->
+                rate(
+                    run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L },
+                    run.pacingRows.size,
+                )
+            },
+            Column("totalAppliedPacingDelayMs") { run ->
+                run.pacingRows.sumOf { pacing -> pacing.before.appliedDelayMs }
+            },
+            Column("meanAppliedPacingDelayMs") { run ->
+                mean(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() })
+            },
+            Column("medianAppliedPacingDelayMs") { run ->
+                percentile(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() }, 0.50)
+            },
+            Column("p95AppliedPacingDelayMs") { run ->
+                percentile(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() }, 0.95)
+            },
+            Column("maximumAppliedPacingDelayMs") { run ->
+                run.pacingRows.maxOfOrNull { pacing -> pacing.before.appliedDelayMs }
+            },
+            Column("levelDominantPacingCount") { run ->
+                run.pacingRows.count { pacing -> pacing.beforeDominantDeficit == PACING_DOMINANT_LEVEL }
+            },
+            Column("backlogDominantPacingCount") { run ->
+                run.pacingRows.count { pacing -> pacing.beforeDominantDeficit == PACING_DOMINANT_BACKLOG }
+            },
+            Column("equalDeficitPacingCount") { run ->
+                run.pacingRows.count { pacing -> pacing.beforeDominantDeficit == PACING_DOMINANT_EQUAL }
+            },
+            Column("noDeficitPacingCount") { run ->
+                run.pacingRows.count { pacing -> pacing.beforeDominantDeficit == PACING_DOMINANT_NONE }
+            },
+            Column("admissionDecisionCount") { it.admissionRows.size },
+            Column("upperBoundSkipCount") { run ->
+                run.admissionRows.count { row -> row.admissionSkipReason() == ADMISSION_SKIP_REASON_UPPER_BOUND }
+            },
+            Column("sessionDemotionSkipCount") { run ->
+                run.admissionRows.count {
+                    row -> row.admissionSkipReason() == ADMISSION_SKIP_REASON_SESSION_DEMOTION
+                }
+            },
+            Column("mBokehSkipCount") { run -> run.bokehRows.count { row -> row.wasSkipped } },
+            Column("sFilterSkipCount") { run -> run.filterRows.count { row -> row.wasSkipped } },
+        )
+
+        private fun buildRq3Columns(): List<Column<EvaluationRun>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("captureCount") { it.captureRows.size },
+            Column("observedResolutions") { run ->
+                run.captureRows.map { capture ->
+                    "${capture.metrics.resultImageSize.width}x${capture.metrics.resultImageSize.height}"
+                }.distinct().sorted().joinToString("|")
+            },
+            Column("observedStartingOverheatLevel") { run -> overheatLevels(run).firstOrNull() },
+            Column("minimumObservedOverheatLevel") { run -> overheatLevels(run).minOrNull() },
+            Column("maximumObservedOverheatLevel") { run -> overheatLevels(run).maxOrNull() },
+            Column("finalObservedOverheatLevel") { run -> overheatLevels(run).lastOrNull() },
+            Column("overheatLevelChangeCount") { run ->
+                overheatLevels(run).zipWithNext().count { (before, after) -> before != after }
+            },
+            Column("maximumAdjacentOverheatIncrease") { run ->
+                overheatLevels(run).zipWithNext()
+                    .maxOfOrNull { (before, after) -> after - before }
+                    ?.coerceAtLeast(0)
+            },
+            Column("lowMemoryCaptureCount") { run ->
+                firstNodePreExecutionMetrics(run).count { metrics -> metrics.memorySnapshot.isLowMemory }
+            },
+            Column("lowMemoryCaptureRate") { run ->
+                rate(
+                    firstNodePreExecutionMetrics(run).count { metrics -> metrics.memorySnapshot.isLowMemory },
+                    firstNodePreExecutionMetrics(run).size,
+                )
+            },
+            Column("minimumRamAvailablePercent") { run ->
+                firstNodePreExecutionMetrics(run).minOfOrNull { metrics ->
+                    metrics.memorySnapshot.ramAvailablePercent
+                }
+            },
+            Column("maximumJavaHeapUsedPercent") { run ->
+                firstNodePreExecutionMetrics(run).maxOfOrNull { metrics ->
+                    metrics.memorySnapshot.javaHeapUsedPercent
+                }
+            },
+            Column("maximumNativeHeapAllocatedPercent") { run ->
+                firstNodePreExecutionMetrics(run).maxOfOrNull { metrics ->
+                    metrics.memorySnapshot.nativeHeapAllocatedPercent
+                }
+            },
+            Column("minimumThermalHeadroom") { run ->
+                firstNodePreExecutionMetrics(run).minOfOrNull { metrics ->
+                    metrics.thermalSnapshot.thermalHeadroom
+                }
+            },
+            Column("admissionDecisionCount") { it.admissionRows.size },
+            Column("zeroPointPredictionCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.prediction?.sequencePredictedDurationMs?.let { duration -> duration <= 0.0 } == true
+                }
+            },
+            Column("zeroPointPredictionRate") { run ->
+                rate(
+                    run.admissionRows.count { row ->
+                        row.nodeRow.prediction?.sequencePredictedDurationMs?.let { duration -> duration <= 0.0 } == true
+                    },
+                    run.admissionRows.size,
+                )
+            },
+            Column("firstPositivePredictionCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captures) { capture ->
+                    capture.row.nodeRows.any { row ->
+                        row.isAdmissionWorkload &&
+                            row.prediction?.sequencePredictedDurationMs?.let { duration -> duration > 0.0 } == true
+                    }
+                }
+            },
+            Column("fullyObservedAdmissionDecisionCount") { run ->
+                run.admissionRows.count { row -> row.isFullyObservedSuffix() }
+            },
+            Column("sequenceUpperBoundMissCount") { run ->
+                run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
+            },
+            Column("sequenceUpperBoundMissRate") { run ->
+                rate(
+                    run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true },
+                    run.admissionRows.count { row -> row.sequenceUpperBoundMiss() != null },
+                )
+            },
+            Column("sequenceUpperBoundCoverageRate") { run ->
+                val observed = run.admissionRows.count { row -> row.sequenceUpperBoundMiss() != null }
+                val misses = run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
+                rate(observed - misses, observed)
+            },
+            Column("minimumSequenceUpperBoundSlackMs") { run ->
+                run.admissionRows.mapNotNull { row -> row.nodeRow.sequenceUpperBoundSlackMs() }.minOrNull()
+            },
+            Column("p05SequenceUpperBoundSlackMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row -> row.nodeRow.sequenceUpperBoundSlackMs() },
+                    0.05,
+                )
+            },
+            Column("medianAbsolutePredictionErrorMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row ->
+                        row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                    },
+                    0.50,
+                )
+            },
+            Column("p95AbsolutePredictionErrorMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row ->
+                        row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                    },
+                    0.95,
+                )
+            },
+            Column("correctAdmitCount") { run ->
+                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT }
+            },
+            Column("unsafeAdmitCount") { run ->
+                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT }
+            },
+            Column("unsafeAdmitRateAmongObservedAdmits") { run ->
+                val correct = run.admissionRows.count {
+                    row -> row.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT
+                }
+                val unsafe = run.admissionRows.count {
+                    row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT
+                }
+                rate(unsafe, correct + unsafe)
+            },
+            Column("skipRequiresOfflineOracleCount") { run ->
+                run.admissionRows.count {
+                    row -> row.decisionOutcome() == DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
+                }
+            },
+            Column("pacingCeilingObservedCount") { run -> ceilingErrorsMs(run).size },
+            Column("ceilingUndershootCount") { run ->
+                ceilingErrorsMs(run).count { errorMs -> errorMs < 0.0 }
+            },
+            Column("ceilingUndershootRate") { run ->
+                rate(
+                    ceilingErrorsMs(run).count { errorMs -> errorMs < 0.0 },
+                    ceilingErrorsMs(run).size,
+                )
+            },
+            Column("minimumCeilingErrorMs") { run -> ceilingErrorsMs(run).minOrNull() },
+            Column("p05CeilingErrorMs") { run -> percentile(ceilingErrorsMs(run), 0.05) },
+            Column("p95CeilingErrorMs") { run -> percentile(ceilingErrorsMs(run), 0.95) },
+            Column("queuePricingObservedCount") { run -> queuePricingErrorsMs(run).size },
+            Column("queueUnderpriceCount") { run ->
+                queuePricingErrorsMs(run).count { errorMs -> errorMs > 0.0 }
+            },
+            Column("queueUnderpriceRate") { run ->
+                rate(
+                    queuePricingErrorsMs(run).count { errorMs -> errorMs > 0.0 },
+                    queuePricingErrorsMs(run).size,
+                )
+            },
+            Column("medianQueuePricingErrorMs") { run ->
+                percentile(queuePricingErrorsMs(run), 0.50)
+            },
+            Column("p95QueuePricingErrorMs") { run ->
+                percentile(queuePricingErrorsMs(run), 0.95)
+            },
+        )
+
+        private fun buildRq3TimelineColumns(): List<Column<EvaluationTimelineRow>> = listOf(
+            Column("trialCaptureNumber") { it.trialCaptureNumber },
+            Column("captureIndex") { it.capture.row.captureIndex },
+            Column("ppSequenceId") { it.capture.row.metrics.ppSequenceId },
+            Column("dsMode") { DynamicShotMode.getDsModeName(it.capture.row.metrics.dsMode) },
+            Column("resultImageWidth") { it.capture.row.metrics.resultImageSize.width },
+            Column("resultImageHeight") { it.capture.row.metrics.resultImageSize.height },
+            Column("shotToShotTimeMs") { it.capture.row.metrics.shotToShotTimeMs },
+            Column("overheatLevel") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
+            },
+            Column("thermalStatus") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalStatus
+            },
+            Column("thermalHeadroom") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("isLowMemory") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
+            },
+            Column("ramAvailablePercent") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.ramAvailablePercent
+            },
+            Column("javaHeapUsedPercent") {
+                it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.memorySnapshot?.javaHeapUsedPercent
+            },
+            Column("nativeHeapAllocatedPercent") {
+                it.capture.row.nodeRows.firstOrNull()
+                    ?.node?.preExecutionMetrics?.memorySnapshot?.nativeHeapAllocatedPercent
+            },
+            Column("isTimeout") { it.capture.row.hasTimeoutFailure },
+            Column("hasWatchdogFailure") { it.capture.row.hasWatchdogFailure },
+            Column("timeoutMarginMs") { it.capture.row.timeoutMarginMs },
+            Column("draftWallMs") { it.capture.row.draftWallMs },
+            Column("policyOutcome") { it.capture.row.policyOutcome().label },
+            Column("mBokehAdmitted") { it.capture.row.bokehDecisionRow?.wasAdmitted },
+            Column("mBokehCompleted") { it.capture.row.bokehDecisionRow?.wasCompleted },
+            Column("mBokehPredictedDurationMs") {
+                it.capture.row.bokehDecisionRow?.prediction?.sequencePredictedDurationMs
+            },
+            Column("mBokehPredictedUpperBoundMs") {
+                it.capture.row.bokehDecisionRow?.prediction?.sequencePredictedUpperBoundMs
+            },
+            Column("mBokehActualSuffixDurationMs") {
+                it.capture.row.bokehDecisionRow?.sequenceActualDurationMs
+            },
+            Column("mBokehUpperBoundSlackMs") {
+                it.capture.row.bokehDecisionRow?.sequenceUpperBoundSlackMs()
+            },
+            Column("mBokehUpperBoundMiss") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.bokehDecisionRow)?.sequenceUpperBoundMiss()
+            },
+            Column("sFilterAdmitted") { it.capture.row.filterDecisionRow?.wasAdmitted },
+            Column("sFilterCompleted") { it.capture.row.filterDecisionRow?.wasCompleted },
+            Column("sFilterPredictedDurationMs") {
+                it.capture.row.filterDecisionRow?.prediction?.sequencePredictedDurationMs
+            },
+            Column("sFilterPredictedUpperBoundMs") {
+                it.capture.row.filterDecisionRow?.prediction?.sequencePredictedUpperBoundMs
+            },
+            Column("sFilterActualSuffixDurationMs") {
+                it.capture.row.filterDecisionRow?.sequenceActualDurationMs
+            },
+            Column("sFilterUpperBoundSlackMs") {
+                it.capture.row.filterDecisionRow?.sequenceUpperBoundSlackMs()
+            },
+            Column("sFilterUpperBoundMiss") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.filterDecisionRow)?.sequenceUpperBoundMiss()
+            },
+            Column("pacingDecisionAvailable") { it.capture.row.pacingReplay != null },
+            Column("appliedPacingDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
+            Column("pacingDominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
+            Column("pacingBacklogMs") { it.capture.row.pacingReplay?.before?.backlogMs },
+            Column("pacingQueuedDraftCount") { it.capture.row.pacingReplay?.before?.queuedDraftCount },
+            Column("pacingObservedSojournMs") { it.capture.row.pacingReplay?.before?.observedSojournMs },
+            Column("pacingSessionPlannedCeilingMs") {
+                it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            },
+            Column("pacingCeilingErrorMs") {
+                val ceilingMs = it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+                val draftWallMs = it.capture.row.draftWallMs
+                if (ceilingMs == null || draftWallMs == null) {
+                    null
+                } else {
+                    ceilingMs - draftWallMs
+                }
+            },
+            Column("pacingQueuePricingErrorMs") { row ->
+                queuePricingErrorMs(row.capture)
+            },
+        )
+
+        private fun buildEvaluationNotes(): List<ReplayNote> = listOf(
+            ReplayNote(
+                topic = "Evaluation session",
+                note = "Each export evaluates the newest 30 stored captures as one session. sessionComplete is false " +
+                    "when fewer than 30 captures are available. The exporter does not attach manually configured " +
+                    "environment labels; record the test condition in the exported file name after pulling it.",
+            ),
+            ReplayNote(
+                topic = "RQ1 safety outcome",
+                note = "Timeout and watchdog failures are separate outcomes. firstTimeoutCaptureNumber is right " +
+                    "censored at captureCount when timeoutRightCensored is true.",
+            ),
+            ReplayNote(
+                topic = "RQ1 feature outcome",
+                note = "M is represented by the Bokeh workload and S by the Filter workload in this implementation. " +
+                    "Completed means the admitted node produced an observed positive duration; it is an execution " +
+                    "proxy, not a perceptual image-quality score.",
+            ),
+            ReplayNote(
+                topic = "RQ2 cost outcome",
+                note = "Shot-to-shot and applied pacing delay distributions quantify user-visible pacing cost. " +
+                    "Skip counts separate admission-related feature loss from pacing-related waiting.",
+            ),
+            ReplayNote(
+                topic = "RQ3 prediction outcome",
+                note = "Upper-bound coverage uses only fully observed suffixes. Online skips have no actual workload " +
+                    "duration, so unnecessary-skip claims require shadow execution or a separate offline oracle.",
+            ),
+            ReplayNote(
+                topic = "RQ3 transition outcome",
+                note = "RQ3Timeline aligns thermal, memory, prediction, admission, pacing, and deadline outcomes by " +
+                    "trial capture number to analyze cold start and throttle ramps.",
+            ),
+            ReplayNote(
+                topic = "Cross-session statistics",
+                note = "Aggregate rates, confidence intervals, and time-to-first-timeout survival analysis must use " +
+                    "each exported workbook/session as the independent unit, not individual captures.",
+            ),
+        )
+
+        private fun rate(count: Int, total: Int): Double? {
+            if (total <= 0) {
+                return null
+            }
+            return count.toDouble() / total.toDouble()
+        }
+
+        private fun mean(values: List<Double>): Double? {
+            if (values.isEmpty()) {
+                return null
+            }
+            return values.average()
+        }
+
+        /** Linear interpolation between adjacent sorted values (the common R-7/Excel inclusive percentile form). */
+        private fun percentile(values: List<Double>, probability: Double): Double? {
+            if (values.isEmpty()) {
+                return null
+            }
+            val sorted = values.sorted()
+            val boundedProbability = probability.coerceIn(0.0, 1.0)
+            val position = boundedProbability * (sorted.size - 1)
+            val lowerIndex = floor(position).toInt()
+            val upperIndex = ceil(position).toInt()
+            if (lowerIndex == upperIndex) {
+                return sorted[lowerIndex]
+            }
+            val fraction = position - lowerIndex
+            return sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex]) * fraction
+        }
+
+        private fun <T> oneBasedFirstIndex(items: List<T>, predicate: (T) -> Boolean): Int? {
+            return items.indexOfFirst(predicate).takeIf { index -> index >= 0 }?.plus(1)
+        }
+
+        private fun firstNodePreExecutionMetrics(run: EvaluationRun): List<PreExecutionMetrics> {
+            return run.captureRows.mapNotNull { capture ->
+                capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics
+            }
+        }
+
+        private fun overheatLevels(run: EvaluationRun): List<Int> {
+            return firstNodePreExecutionMetrics(run).map { metrics -> metrics.thermalSnapshot.overheatLevel }
+        }
+
+        private fun admissionSheetRow(capture: CaptureRow, nodeRow: NodeRow?): NodeSheetRow? {
+            nodeRow ?: return null
+            val index = capture.nodeRows.indexOf(nodeRow)
+            if (index < 0) {
+                return null
+            }
+            return NodeSheetRow(capture, index + 1, nodeRow)
+        }
+
+        private fun ceilingErrorsMs(run: EvaluationRun): List<Double> {
+            return run.captures.mapNotNull { capture ->
+                val ceilingMs = capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+                val draftWallMs = capture.row.draftWallMs
+                if (ceilingMs == null || draftWallMs == null) {
+                    null
+                } else {
+                    ceilingMs - draftWallMs
+                }
+            }
+        }
+
+        private fun queuePricingErrorsMs(run: EvaluationRun): List<Double> {
+            return run.captures.mapNotNull(::queuePricingErrorMs)
+        }
+
+        /**
+         * Positive means the persisted backlog clock under-priced the real queue wait observed by this capture.
+         * New metrics record observedSojournMs directly; legacy rows without it are intentionally excluded.
+         */
+        private fun queuePricingErrorMs(capture: EnrichedCaptureRow): Double? {
+            val pacing = capture.row.pacingReplay?.before ?: return null
+            val observedSojournMs = pacing.observedSojournMs ?: return null
+            val draftStartMs = capture.row.draftStartUptimeMs ?: return null
+            val releaseMs = pacing.decisionUptimeMs + pacing.appliedDelayMs
+            val realQueueWaitMs = (draftStartMs - releaseMs).coerceAtLeast(0L)
+            val pricedQueueWaitMs = pacing.backlogMs + observedSojournMs
+            return realQueueWaitMs.toDouble() - pricedQueueWaitMs.toDouble()
         }
 
         private fun buildAdmissionReplayColumns(): List<Column<NodeSheetRow>> = listOf(
