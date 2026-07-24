@@ -22,22 +22,29 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  */
 class DraftSequenceExecutionPredictor {
 
-    // Point model as a multiplicative decomposition: duration(size) ≈ baseline(size) × condition(family).
-    // The per-size baseline is the duration with the transient condition divided out (structural, stable); the family
-    // condition carries the transient throttling shared across sizes, so a size not shot under it is corrected by it.
+    // Point model as a multiplicative decomposition: duration(size) ≈ baseline(size) × condition.
+    // The per-size baseline is the duration with the transient condition divided out (structural, stable); the one
+    // shared condition carries the transient throttling across sizes, so a size not shot under it is corrected by it.
     private val workloadKeyBaselineMap = mutableMapOf<WorkloadKey, BaselineMean>()
-    private val familyConditionMap = mutableMapOf<Class<*>, EwmaTrend>()
+    // Condition = weighted MEDIAN of recent duration/baseline ratios: decay ([SCORE_WEIGHT_DECAY]) weights recent
+    // shots more (a burst's later shots outweigh its first), while the median keeps one stalled draft (GC/transient)
+    // from distorting it - the EWMA it replaces chased such a spike. Reuses the residual model's decay + weighted
+    // quantile, so no new constant.
+    private val conditionSamples = mutableListOf<ResidualSample>()
 
     private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
     private val globalResidualSamples = mutableListOf<ResidualSample>()
 
     /**
      * Whole-draft time the per-workload point sum does not capture: inter-node gaps, deinit, and scheduling between
-     * node executions. EWMA-tracked like a workload duration so the pacer can price a queued draft by its real
-     * pipeline occupancy (point sum + this) instead of node processing alone. Sequence-independent by construction,
-     * so it is a single trend rather than a per-sequence one.
+     * node executions. The pacer prices a queued draft by its real pipeline occupancy (point sum + this) instead of
+     * node processing alone. Tracked as the decay-weighted mean of recent samples: recency-weighted like the old EWMA
+     * (a later shot outweighs the first) but reusing the residual model's decay, so no standalone alpha. The mean (not
+     * the condition's median) because a right-skewed overhead's median under-prices, and under-pricing this clock term
+     * risks a timeout; a single unpredictable spike is absorbed by the pacer's ceiling, not chased here.
+     * Sequence-independent by construction, so it is a single sample list rather than a per-sequence one.
      */
-    private val draftOverheadTrend = EwmaTrend()
+    private val overheadSamples = mutableListOf<ResidualSample>()
 
     @Synchronized
     fun predictAdmission(
@@ -86,8 +93,12 @@ class DraftSequenceExecutionPredictor {
         return admit
     }
 
+    /** Shared thermal condition: weighted median of the recent duration/baseline ratios (1.0 until any is seen). */
+    private fun conditionFactor(): Double =
+        computeWeightedQuantileScore(conditionSamples, MEDIAN_QUANTILE).takeIf { it > 0.0 } ?: 1.0
+
     private fun estimateWorkloadMs(workloadKey: WorkloadKey): Double {
-        val condition = familyConditionMap[workloadKey.javaClass]?.value() ?: 1.0
+        val condition = conditionFactor()
         workloadKeyBaselineMap[workloadKey]?.let { return it.meanMs() * condition }
 
         // Cold size (never observed): scale a same-family sibling's baseline by the linear megapixel ratio, then apply
@@ -144,21 +155,22 @@ class DraftSequenceExecutionPredictor {
 
     private fun estimateResidualScore(workloadSequenceKey: WorkloadSequenceKey): Double {
         val sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey]
-        return computeWeightedQuantileScore(
-            if (sequenceSamples.isNullOrEmpty()) globalResidualSamples else sequenceSamples,
-        )
+        val samples = if (sequenceSamples.isNullOrEmpty()) globalResidualSamples else sequenceSamples
+        val effectiveSampleSize = computeEffectiveSampleSize(samples.filter { it.weight > 0.0 }.map { it.weight })
+        return computeWeightedQuantileScore(samples, computeQuantileForSampleSize(effectiveSampleSize))
     }
 
-    private fun computeWeightedQuantileScore(samples: List<ResidualSample>): Double {
+    /**
+     * Weighted score at [quantileFraction] of the decayed samples. The residual upper bound passes a high adaptive
+     * quantile (safety tail); the condition passes the median ([MEDIAN_QUANTILE], a robust central estimate).
+     */
+    private fun computeWeightedQuantileScore(samples: List<ResidualSample>, quantileFraction: Double): Double {
         val weightedSamples = samples.filter { it.weight > 0.0 }
         if (weightedSamples.isEmpty()) {
             return 0.0
         }
 
-        val totalWeight = weightedSamples.sumOf { it.weight }
-        val targetWeight = totalWeight * computeQuantileForSampleSize(
-            computeEffectiveSampleSize(weightedSamples.map { it.weight }),
-        )
+        val targetWeight = weightedSamples.sumOf { it.weight } * quantileFraction
         var cumulativeWeight = 0.0
         for (sample in weightedSamples.sortedBy { it.score }) {
             cumulativeWeight += sample.weight
@@ -231,27 +243,30 @@ class DraftSequenceExecutionPredictor {
 
         addResidualSamples(validWorkloadDurations, admissionDecisions)
 
-        // Multiplicative decomposition update. Each observation refreshes the family's shared condition (from how
-        // far it deviates from this size's own baseline) and the size's condition-stripped baseline - both read from
-        // PRE-update snapshots so the two do not feed back within one observation. The condition (fast EWMA) carries
-        // a thermal ramp across sizes; the baseline (running mean) stays a stable per-size structural anchor. This
-        // shares only the transient movement, without the double-count that inflated a sibling being shot concurrently.
+        // Multiplicative decomposition update. The shared condition ages once per capture (like the residual model),
+        // then takes this capture's duration/baseline ratios; each size's condition-stripped baseline updates from the
+        // pre-update condition snapshot. Reading PRE-update snapshots keeps the two from feeding back within one
+        // observation: the condition (weighted median) carries a thermal ramp across sizes, the baseline (running
+        // mean) stays a stable per-size anchor, and only the transient movement is shared - no concurrent-sibling
+        // double-count.
+        val conditionSnapshot = conditionFactor()
+        conditionSamples.decayAndPrune()
         validWorkloadDurations.forEach { (workloadKey, durationMs) ->
             val observedMs = durationMs.toDouble()
-            val family = workloadKey.javaClass
-            val conditionSnapshot = familyConditionMap[family]?.value() ?: 1.0
             val baselineSnapshot = workloadKeyBaselineMap[workloadKey]?.meanMs()
             if (baselineSnapshot != null && baselineSnapshot > 0.0) {
-                familyConditionMap.getOrPut(family) { EwmaTrend() }.observe(observedMs / baselineSnapshot)
+                conditionSamples += ResidualSample(score = observedMs / baselineSnapshot)
             }
             workloadKeyBaselineMap.getOrPut(workloadKey) { BaselineMean() }.observe(observedMs / conditionSnapshot)
         }
 
         // Everything in the draft wall not accounted for by node processing is the between-node overhead the point
-        // sum misses. Learn it only from fully measured drafts (both terms positive), never below zero.
+        // sum misses. Learn it only from fully measured drafts (both terms positive), never below zero. Ages once per
+        // capture like the residual/condition models, then takes this capture's overhead.
         val nodeProcessingMs = validWorkloadDurations.values.sum()
         if (draftWallMs > 0L && nodeProcessingMs > 0L) {
-            draftOverheadTrend.observe((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            overheadSamples.decayAndPrune()
+            overheadSamples += ResidualSample(score = (draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
         }
     }
 
@@ -339,37 +354,28 @@ class DraftSequenceExecutionPredictor {
                     reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
                 )
             },
-            draftOverheadMs = draftOverheadTrend.value(),
+            draftOverheadMs = overheadMean(),
         )
     }
 
     /**
-     * Floored EWMA of a positive series: alpha = max([WORKLOAD_EWMA_ALPHA], 1/n), so recent samples keep at least a
-     * ~30% weight and the estimate tracks drift instead of settling into a flat mean. The first sample seeds it
-     * (alpha = 1 at n = 1, overwriting the 0.0 start). Used for both the family thermal-condition multiplier (~1.0 at
-     * reference, higher under throttling; fed duration/baseline ratios pooled across a family's sizes) and the
-     * between-node draft overhead (fed ms) - identical math, so one class serves both.
+     * Between-node draft overhead: the decay-weighted mean of recent (draftWall - nodeSum) samples, 0.0 until any is
+     * seen. Recency-weighted via the shared [SCORE_WEIGHT_DECAY] (a later burst shot outweighs the first) without a
+     * standalone alpha; the mean rather than a quantile so a right-skewed overhead is not systematically under-priced.
      */
-    private class EwmaTrend {
-        private var sampleCount: Int = 0
-        private var estimate: Double = 0.0
-
-        fun value(): Double = estimate
-
-        fun observe(sample: Double) {
-            if (sample <= 0.0) {
-                return
-            }
-            sampleCount++
-            estimate += maxOf(WORKLOAD_EWMA_ALPHA, 1.0 / sampleCount) * (sample - estimate)
+    private fun overheadMean(): Double {
+        val weighted = overheadSamples.filter { it.weight > 0.0 }
+        if (weighted.isEmpty()) {
+            return 0.0
         }
+        return weighted.sumOf { it.score * it.weight } / weighted.sumOf { it.weight }
     }
 
     /**
      * One size's structural duration baseline with the shared thermal condition divided out: the running mean of
-     * (observed / condition-at-observation). Unlike [EwmaTrend] every sample weighs 1/n, so it converges to a stable
-     * average and never chases the condition within a sample - a stale size keeps its true baseline while [EwmaTrend]
-     * carries the transient throttling.
+     * (observed / condition-at-observation). Every sample weighs 1/n, so it converges to a stable average and never
+     * chases the condition within a sample - a stale size keeps its true baseline while the shared condition
+     * ([conditionSamples], a decayed weighted median) carries the transient throttling.
      */
     private class BaselineMean {
         private var sampleCount: Int = 0
@@ -408,12 +414,12 @@ class DraftSequenceExecutionPredictor {
             return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
         }
 
-        // Decoupled: alpha tracks the transient condition (responsive enough for thermal-throttle ramps);
-        // decay sets the residual memory / safety quantile (effective ESS=(1+d)/(1-d) -> ~95th-pct bound at 0.9),
-        // which self-calibrates to each device's throttling magnitude. Do not re-couple decay to 1 - alpha.
-        private const val WORKLOAD_EWMA_ALPHA = 0.30
+        // One recency control for every learned trend: decay sets the residual safety quantile, the condition's
+        // recency, and the overhead mean's recency (effective ESS=(1+d)/(1-d) -> ~19 recent captures at 0.9),
+        // self-calibrating to each device. MEDIAN_QUANTILE is the median (a robust centre), not a tunable knob.
         private const val SCORE_WEIGHT_DECAY = 0.90
         private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
+        private const val MEDIAN_QUANTILE = 0.50
     }
 }
 
