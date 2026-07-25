@@ -292,7 +292,7 @@ private class MetricsRecorder(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?, pacerSessionId: Int) {
+    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?, pacerSessionId: Long) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.draftStartUptimeMs = SystemClock.uptimeMillis()
             draftSequenceMetrics.pacerSessionId = pacerSessionId

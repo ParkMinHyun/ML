@@ -74,7 +74,7 @@ data class DraftSequenceMetricsEntity(
     val draftEndUptimeMs: Long?,
 
     @ColumnInfo(name = "pacer_session_id")
-    val pacerSessionId: Int?,
+    val pacerSessionId: Long?,
 
     @Embedded(prefix = "pacing_")
     val pacingSnapshot: CaptureAvailablePacingMetricsEntity?,
@@ -110,9 +110,6 @@ data class CaptureAvailablePacingMetricsEntity(
 
     @ColumnInfo(name = "draft_start_budget_ms")
     val draftStartBudgetMs: Long,
-
-    @ColumnInfo(name = "mandatory_reserve_upper_bound_ms")
-    val mandatoryReserveUpperBoundMs: Double,
 
     @ColumnInfo(name = "session_planned_predicted_ms")
     val sessionPlannedPredictedMs: Double,

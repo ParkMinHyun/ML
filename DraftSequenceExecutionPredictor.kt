@@ -14,7 +14,7 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  * margin is a multiplicative residual calibrated from positive residual ratios captured before model updates; exact
  * decision-sequence residuals win, with global residuals as the cold-sequence fallback.
  *
- * Besides admission, [estimateDraftSequence] snapshots the model for [CaptureAvailablePacer], which owns
+ * Besides admission, [estimateDraftSequenceMs] snapshots the model for [CaptureAvailablePacer], which owns
  * captureAvailable pacing and only consumes these estimates.
  *
  * Owned by the draft-saving task manager and shared by the profilers it creates across captures, so the model
@@ -134,26 +134,14 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Point estimate for [workloadSequenceKey] plus its mandatory RESERVED-work upper bound, read in one consistent
-     * model snapshot - the inputs [CaptureAvailablePacer] paces captureAvailable callbacks with. The sequence's own
-     * upper bound is deliberately not offered: pacing bounds a capture by observed draft wall time, not by this
+     * Point estimate for [workloadSequenceKey] - the one input [CaptureAvailablePacer] paces captureAvailable
+     * callbacks with. No upper bound is offered: pacing bounds a capture by observed draft wall time, not by this
      * model, so exposing one only invites re-coupling the two (see the pacer's sessionPlannedCeilingMs).
      */
     @Synchronized
-    fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {
+    fun estimateDraftSequenceMs(workloadSequenceKey: WorkloadSequenceKey): Double {
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
-        val reservedWorkloadKeys = selectReservedWorkloadKeys(workloadSequenceKey)
-        return DraftSequenceEstimate(
-            predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
-            mandatoryReserveUpperBoundMs = if (reservedWorkloadKeys.isEmpty()) {
-                0.0
-            } else {
-                estimateUpperBoundMs(
-                    WorkloadSequenceKey(reservedWorkloadKeys),
-                    reservedWorkloadKeys.associateWith(workloadPredictedMs::getValue),
-                )
-            },
-        )
+        return sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
     }
 
     /**
@@ -346,10 +334,3 @@ data class WatchdogTimeoutDecision(
     val decision: AdmissionDecision?,
 )
 
-/**
- * One consistent Predictor snapshot for a draft sequence: its point sum and mandatory RESERVED-tail upper bound.
- */
-data class DraftSequenceEstimate(
-    val predictedMs: Double,
-    val mandatoryReserveUpperBoundMs: Double,
-)

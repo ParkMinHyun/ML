@@ -28,8 +28,12 @@ data class DraftSequenceMetrics @JvmOverloads constructor(
     var draftStartUptimeMs: Long? = null,
     /** Uptime when the draft sequence completed; with the timeout deadline it scores the pacing outcome. */
     var draftEndUptimeMs: Long? = null,
-    /** Burst-session ordinal from [CaptureAvailablePacer]; increments each time the drained pipeline clears it. */
-    var pacerSessionId: Int? = null,
+    /**
+     * Burst-session identity from [CaptureAvailablePacer]: the uptime that session began at, so it takes a new value
+     * each time the drained pipeline clears the pacer and never repeats across pacer instances. Offline grouping
+     * treats a change as a session boundary, so only its inequality matters, not its magnitude.
+     */
+    var pacerSessionId: Long? = null,
     /**
      * Runtime pacing decision consumed at this capture's draft start - the captureAvailable delay that gated this
      * capture. Null when nothing gated it (first capture of a burst, or fresh process).
@@ -66,8 +70,6 @@ data class CaptureAvailablePacingMetrics(
     /** Session max measured draft wall time at decision time; null on rows persisted before recording. */
     val observedMaxDraftMs: Long?,
     val draftStartBudgetMs: Long,
-    /** Model upper bound of the RESERVED tail alone; log severity only, never part of the delay. */
-    val mandatoryReserveUpperBoundMs: Double,
     val sessionPlannedPredictedMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
     val sessionPlannedDraftOverheadMs: Double,

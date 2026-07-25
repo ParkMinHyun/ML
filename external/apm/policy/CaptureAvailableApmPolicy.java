@@ -39,7 +39,7 @@ import java.util.List;
  * Policy that paces captureAvailable callbacks by learned deficits only: the delay is the larger of the observed
  * budget deficit and the admitted-backlog deficit against the capture timeout. An empty draft pipeline is never
  * delayed, so burst responsiveness is preserved until the timeout allowance is genuinely spent; no tuned constant
- * or threshold is involved. The mandatory reserve upper bound only classifies log severity.
+ * or threshold is involved.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
@@ -126,7 +126,6 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 pacingDecider != null ? pacingDecider.decideDelay(maxDraftTimeMs, captureAvailableTimeMs) : null;
 
         long appliedDelayMs = 0L;
-        boolean warning = false;
         String reason = pacingDecider != null
                 ? "captureAvailable pacing waits for the first draft prediction"
                 : "no pacing decider published - no pacing";
@@ -136,11 +135,8 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             final CaptureAvailablePacingPrediction pacingPrediction = pacingDecision.getPrediction();
 
             appliedDelayMs = pacingDecision.getDelayMs();
-            warning = pacingPrediction.getDraftStartBudgetMs() < pacingPrediction.getMandatoryReserveUpperBoundMs();
 
-            if (warning) {
-                reason = "mandatory reserve at risk - pace draft sequence by " + appliedDelayMs + "ms";
-            } else if (appliedDelayMs > pacingDecision.getLevelDeficitMs()) {
+            if (appliedDelayMs > pacingDecision.getLevelDeficitMs()) {
                 reason = "pace admitted draft backlog by " + appliedDelayMs + "ms";
             } else if (appliedDelayMs > 0L) {
                 reason = "pace draft sequence by " + appliedDelayMs + "ms";
@@ -149,7 +145,6 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             }
 
             pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
-                    + ", mandatoryReserveUpperBound=" + pacingPrediction.getMandatoryReserveUpperBoundMs() + "ms"
                     + ", sessionPlannedPredicted=" + pacingPrediction.getSessionPlannedPredictedMs() + "ms"
                     + ", sessionPlannedDraftOverhead=" + pacingPrediction.getSessionPlannedDraftOverheadMs() + "ms"
                     + ", sessionPlannedCeiling=" + pacingPrediction.getSessionPlannedCeilingMs() + "ms"
@@ -165,11 +160,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 + pacingDetails
                 + ", scheduled=" + scheduled;
 
-        if (warning) {
-            PLog.e(TAG, message);
-        } else {
-            PLog.d(TAG, message);
-        }
+        PLog.d(TAG, message);
         return scheduled;
     }
 

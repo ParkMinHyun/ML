@@ -2,6 +2,29 @@ package com.samsung.android.camera.core2.ml
 
 import android.util.Size
 
+/**
+ * Runtime pacing decision into the [CaptureMetrics] observability model - the one conversion here that reads a live
+ * type rather than a stored one, so the pacer's runtime records never reach the store unprojected.
+ */
+fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAvailablePacingMetrics {
+    return CaptureAvailablePacingMetrics(
+        decisionUptimeMs = decisionUptimeMs,
+        appliedDelayMs = delayMs,
+        levelDeficitMs = levelDeficitMs,
+        backlogDeficitMs = backlogDeficitMs,
+        backlogMs = backlogMs,
+        queuedDraftCount = queuedDraftCount,
+        queuedPredictedWorkMs = queuedPredictedWorkMs,
+        observedSojournMs = observedSojournMs,
+        observedMaxDraftMs = observedMaxDraftMs,
+        draftStartBudgetMs = prediction.draftStartBudgetMs,
+        sessionPlannedPredictedMs = prediction.sessionPlannedPredictedMs,
+        sessionPlannedDraftOverheadMs = prediction.sessionPlannedDraftOverheadMs,
+        sessionPlannedCeilingMs = prediction.sessionPlannedCeilingMs,
+        sessionPlannedSequenceKey = prediction.sessionPlannedSequenceKey,
+    )
+}
+
 fun CaptureMetrics.toCaptureEntity(): CaptureMetricsEntity {
     return CaptureMetricsEntity(
         ppSequenceId = ppSequenceId,
@@ -41,7 +64,6 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         observedSojournMs = observedSojournMs,
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
-        mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         sessionPlannedPredictedMs = sessionPlannedPredictedMs,
         sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
         sessionPlannedCeilingMs = sessionPlannedCeilingMs,
@@ -202,7 +224,6 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         observedSojournMs = observedSojournMs,
         observedMaxDraftMs = observedMaxDraftMs,
         draftStartBudgetMs = draftStartBudgetMs,
-        mandatoryReserveUpperBoundMs = mandatoryReserveUpperBoundMs,
         sessionPlannedPredictedMs = sessionPlannedPredictedMs,
         sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
         sessionPlannedCeilingMs = sessionPlannedCeilingMs,

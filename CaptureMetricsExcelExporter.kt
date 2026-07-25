@@ -2197,9 +2197,6 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeSessionPlannedSequenceKey") { it.row.pacingReplay?.before?.sessionPlannedSequenceKey },
             Column("beforeDraftStartBudgetMs") { it.row.pacingReplay?.before?.draftStartBudgetMs },
-            Column("beforeMandatoryReserveUpperBoundMs") {
-                it.row.pacingReplay?.before?.mandatoryReserveUpperBoundMs
-            },
             Column("beforeSessionPlannedPredictedMs") {
                 it.row.pacingReplay?.before?.sessionPlannedPredictedMs
             },
@@ -2414,7 +2411,7 @@ class CaptureMetricsExcelExporter(
             Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
             Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
-            Column("totalShotCount") { "#" + it.sessionSummary.sessionShotCount },
+            Column("sessionShotCount") { it.sessionSummary.sessionShotCount },
             Column("timeoutShotCount") { it.sessionSummary.sessionTimeoutShotCount?.let { count -> "#" + count } },
             Column("bokehAdmitCount") { it.sessionSummary.sessionBokehAdmitCount },
             Column("bokehTotalCount") { it.sessionSummary.sessionBokehTotalCount },
