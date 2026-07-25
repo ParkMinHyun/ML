@@ -31,6 +31,8 @@ class CaptureAvailablePacer(
 
     private var observedMaxDraftMs = 0L
     private var observedSojournMs = 0L
+    /** Pipeline-lifetime learned state; [clear] resets only its session snapshot, not this history. */
+    private val draftDurationOverhead = DraftDurationOverhead()
 
     /**
      * Observed max draft wall per draft size, fed by the draft pipeline at completion ([observeDraftMeasured]) where
@@ -43,22 +45,21 @@ class CaptureAvailablePacer(
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
-     * capture's point prediction plus the session's learned between-node overhead ([draftOverheadMs]), never by its
-     * ceiling. The point sum alone under-prices real pipeline occupancy (it omits the inter-node/deinit time), and
-     * that shortfall compounds with queue depth into a timeout; adding the overhead prices each queued draft by its
-     * real occupancy. The ceiling is still avoided here - summing k ceilings would price a queue at k times the
-     * session worst case, which no observed burst reaches. The timeout margin comes from the ceiling that
+     * capture's point prediction plus the session's learned between-node overhead ([sessionDraftOverheadMs]), never
+     * by its ceiling. The point sum alone under-prices real pipeline occupancy (it omits the inter-node/deinit
+     * time), and that shortfall compounds with queue depth into a timeout; adding the overhead prices each queued
+     * draft by its real occupancy. The ceiling is still avoided here - summing k ceilings would price a queue at k
+     * times the session worst case, which no observed burst reaches. The timeout margin comes from the ceiling that
      * [decideDelay] adds for the single capture being paced; underruns here do not accumulate because every draft
      * start rebases this clock onto the real one.
      */
     private var busyUntilUptimeMs = 0L
 
     /**
-     * Session snapshot of the predictor's learned between-node draft overhead, refreshed at each draft start. Added
-     * once per queued draft to [busyUntilUptimeMs] so the backlog clock tracks whole-draft occupancy, not just node
-     * processing. Sequence-independent, so one scalar covers every queued draft.
+     * Session snapshot of [draftDurationOverhead], refreshed at each draft start. Added once per queued draft to
+     * [busyUntilUptimeMs] so the backlog clock tracks whole-draft occupancy, not just node processing.
      */
-    private var draftOverheadMs = 0.0
+    private var sessionDraftOverheadMs = 0.0
 
     /**
      * Refreshes the pacing prediction and consumes the oldest admitted callback. A null key means a draft with no
@@ -72,7 +73,7 @@ class CaptureAvailablePacer(
         }
         val sessionPlannedSequenceKey = admissionPolicy.resolveSessionPlannedSequenceKey(plannedSequenceKey)
         val sessionPlannedEstimate = predictor.estimateDraftSequence(sessionPlannedSequenceKey)
-        draftOverheadMs = sessionPlannedEstimate.draftOverheadMs
+        sessionDraftOverheadMs = draftDurationOverhead.estimateMs()
         val demotedWorkloadMs = if (sessionPlannedSequenceKey == plannedSequenceKey) {
             0.0
         } else {
@@ -90,7 +91,7 @@ class CaptureAvailablePacer(
             draftStartBudgetMs = budgetMs,
             mandatoryReserveUpperBoundMs = sessionPlannedEstimate.mandatoryReserveUpperBoundMs,
             sessionPlannedPredictedMs = sessionPlannedEstimate.predictedMs,
-            sessionPlannedDraftOverheadMs = draftOverheadMs,
+            sessionPlannedDraftOverheadMs = sessionDraftOverheadMs,
             sessionPlannedCeilingMs = sessionPlannedCeilingMs,
             sessionPlannedSequenceKey = sessionPlannedSequenceKey.toReplayString(),
         )
@@ -141,20 +142,20 @@ class CaptureAvailablePacer(
         )
         pendingDecisions.addLast(decision)
         busyUntilUptimeMs = maxOf(nowUptimeMs + delayMs, busyUntilUptimeMs) +
-            ceil(prediction.sessionPlannedPredictedMs + draftOverheadMs).toLong()
+            ceil(prediction.sessionPlannedPredictedMs + sessionDraftOverheadMs).toLong()
         return decision
     }
 
     /**
-     * Records one completed draft's real wall against its own size, fed by the draft pipeline (which knows both) so
-     * the per-size ceiling stays free of the size-agnostic windowed max the APM callback would otherwise attribute to
-     * whatever draft is currently paced.
+     * Records one completed draft's real wall against its own size and learns the wall time outside node processing.
+     * Both values come from the draft pipeline at completion, where the draft size, wall, and node sum are aligned.
      */
     @Synchronized
-    fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
+    fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long, nodeProcessingMs: Long) {
         if (draftWallMs > 0L) {
             observedMaxDraftMsBySize[sizeBucket] = maxOf(observedMaxDraftMsBySize[sizeBucket] ?: 0L, draftWallMs)
         }
+        draftDurationOverhead.observe(nodeProcessingMs, draftWallMs)
     }
 
     /** Burst-session ordinal for metrics: increments every time the drained pipeline clears the pacer. */
@@ -170,7 +171,7 @@ class CaptureAvailablePacer(
         observedMaxDraftMsBySize.clear()
         observedSojournMs = 0L
         busyUntilUptimeMs = 0L
-        draftOverheadMs = 0.0
+        sessionDraftOverheadMs = 0.0
         sessionId++
     }
 
@@ -178,7 +179,7 @@ class CaptureAvailablePacer(
     private fun rebaseBacklogOnDraftStart(startingPredictedMs: Double): CaptureAvailablePacingDecision? {
         val gatingDecision = pendingDecisions.removeFirstOrNull()
         busyUntilUptimeMs = SystemClock.uptimeMillis() +
-            ceil(startingPredictedMs + draftOverheadMs + sumQueuedDraftWorkMs()).toLong()
+            ceil(startingPredictedMs + sessionDraftOverheadMs + sumQueuedDraftWorkMs()).toLong()
         return gatingDecision
     }
 
@@ -190,7 +191,28 @@ class CaptureAvailablePacer(
 
     /** Queued point work plus one between-node overhead per queued draft - the clock's view of pending occupancy. */
     private fun sumQueuedDraftWorkMs(): Double {
-        return sumQueuedPredictedWorkMs() + draftOverheadMs * pendingDecisions.size
+        return sumQueuedPredictedWorkMs() + sessionDraftOverheadMs * pendingDecisions.size
+    }
+
+    /**
+     * Whole-draft time outside node processing: inter-node gaps, deinit, and scheduling. The recency-weighted mean
+     * prices each queued draft's real pipeline occupancy; a median would under-price its right-skewed distribution.
+     */
+    private class DraftDurationOverhead {
+        private val overheadScores = RecencyWeightedDistribution()
+        private var learnedOverheadMs = 0.0
+
+        fun estimateMs(): Double = learnedOverheadMs
+
+        fun observe(nodeProcessingMs: Long, draftWallMs: Long) {
+            if (draftWallMs <= 0L || nodeProcessingMs <= 0L) {
+                return
+            }
+
+            overheadScores.decay()
+            overheadScores.add((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            learnedOverheadMs = overheadScores.mean()
+        }
     }
 
     companion object {

@@ -171,7 +171,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    /** Completes the RESERVED workload, lets Predictor learn from the capture, and records whether it timed out. */
+    /** Completes RESERVED work, updates the learned duration/pacing models, and records whether it timed out. */
     fun completeDraftSequenceExecution(): Boolean {
         pendingCompleteSession?.complete()
         pendingCompleteSession = null
@@ -181,11 +181,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         } else {
             0L
         }
-        modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
-            predictor.learnFromCapture(workloadDurations, admissionDecisions, draftWallMs)
-        }
-        // Attribute this wall to its own draft size so the pacer's per-size ceiling is not contaminated by other sizes.
-        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs)
+        val nodeProcessingMs = modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
+            predictor.learnFromCapture(workloadDurations, admissionDecisions)
+            workloadDurations.values.sumOf { durationMs -> durationMs.coerceAtLeast(0L) }
+        } ?: 0L
+        // Keep the size-scoped ceiling and learned non-node occupancy aligned to this completed draft.
+        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs, nodeProcessingMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()

@@ -10,9 +10,9 @@ private const val TAG = "DraftSequenceExecutionPredictor"
 /**
  * Sequence-aware, phase-aware, adaptive upper bound.
  *
- * Point prediction is the sum of per-workload EWMA values. The safety margin is a multiplicative residual calibrated
- * from positive residual ratios captured before workload EWMA updates; exact decision-sequence residuals win, with
- * global residuals as the cold-sequence fallback.
+ * Point prediction is the sum of per-workload baselines multiplied by one shared thermal-condition factor. The safety
+ * margin is a multiplicative residual calibrated from positive residual ratios captured before model updates; exact
+ * decision-sequence residuals win, with global residuals as the cold-sequence fallback.
  *
  * Besides admission, [estimateDraftSequence] snapshots the model for [CaptureAvailablePacer], which owns
  * captureAvailable pacing and only consumes these estimates.
@@ -22,38 +22,16 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  */
 class DraftSequenceExecutionPredictor {
 
-    // Point model as a multiplicative decomposition: duration(size) ≈ baseline(size) × condition.
-    // The per-size baseline is the duration with the transient condition divided out (structural, stable); the one
-    // shared condition carries the transient throttling across sizes, so a size not shot under it is corrected by it.
-    private val workloadKeyBaselineMap = mutableMapOf<WorkloadKey, BaselineMean>()
-    // Condition = weighted MEDIAN of recent duration/baseline ratios: decay ([SCORE_WEIGHT_DECAY]) weights recent
-    // shots more (a burst's later shots outweigh its first), while the median keeps one stalled draft (GC/transient)
-    // from distorting it - the EWMA it replaces chased such a spike. Reuses the residual model's decay + weighted
-    // quantile, so no new constant.
-    private val conditionSamples = mutableListOf<ResidualSample>()
-
-    private val workloadSequenceKeyResidualMap = mutableMapOf<WorkloadSequenceKey, MutableList<ResidualSample>>()
-    private val globalResidualSamples = mutableListOf<ResidualSample>()
-
-    /**
-     * Whole-draft time the per-workload point sum does not capture: inter-node gaps, deinit, and scheduling between
-     * node executions. The pacer prices a queued draft by its real pipeline occupancy (point sum + this) instead of
-     * node processing alone. Tracked as the decay-weighted mean of recent samples: recency-weighted like the old EWMA
-     * (a later shot outweighs the first) but reusing the residual model's decay, so no standalone alpha. The mean (not
-     * the condition's median) because a right-skewed overhead's median under-prices, and under-pricing this clock term
-     * risks a timeout; a single unpredictable spike is absorbed by the pacer's ceiling, not chased here.
-     * Sequence-independent by construction, so it is a single sample list rather than a per-sequence one.
-     */
-    private val overheadSamples = mutableListOf<ResidualSample>()
+    private val workloadDurationTrend = WorkloadDurationTrend()
+    private val workloadSequenceResidual = WorkloadSequenceResidual()
 
     @Synchronized
     fun predictAdmission(
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        // Memoized per decision: estimateWorkloadMs scans sibling models, and estimateUpperBoundMs would otherwise
-        // rescan them O(n^2) through the suffix walk.
-        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
+        // Memoized per decision: cold-workload estimates scan sibling baselines, and the suffix walk reuses the result.
+        val workloadPredictedMs = workloadDurationTrend.estimateAll(workloadSequenceKey.workloadKeys)
         val sequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
@@ -93,33 +71,13 @@ class DraftSequenceExecutionPredictor {
         return admit
     }
 
-    /** Shared thermal condition: weighted median of the recent duration/baseline ratios (1.0 until any is seen). */
-    private fun conditionFactor(): Double =
-        computeWeightedQuantileScore(conditionSamples, MEDIAN_QUANTILE).takeIf { it > 0.0 } ?: 1.0
-
-    private fun estimateWorkloadMs(workloadKey: WorkloadKey): Double {
-        val condition = conditionFactor()
-        workloadKeyBaselineMap[workloadKey]?.let { return it.meanMs() * condition }
-
-        // Cold size (never observed): scale a same-family sibling's baseline by the linear megapixel ratio, then apply
-        // the shared condition. A plain ratio is the cold-start prior (a 24MP sibling prices cold 12MP at half), used
-        // only until this size is observed once, after which the branch above returns its exact baseline.
-        val sibling = workloadKeyBaselineMap.entries
-            .filter { (siblingKey, _) -> siblingKey.isWorkloadFamily(workloadKey) }
-            .maxByOrNull { (_, baseline) -> baseline.meanMs() }
-            ?: return 0.0
-        val megaPixelRatio =
-            workloadKey.sizeBucket.megaPixels.toDouble() / sibling.key.sizeBucket.megaPixels.toDouble()
-        return sibling.value.meanMs() * megaPixelRatio * condition
-    }
-
     private fun estimateUpperBoundMs(
         workloadSequenceKey: WorkloadSequenceKey,
         workloadPredictedMs: Map<WorkloadKey, Double>,
     ): Double {
         // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
-        // head EWMA plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1, the
-        // tail step max() already returns the raw bound, so no special case for the last workload is needed.)
+        // head estimate plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1,
+        // the tail step max() already returns the raw bound, so no special case for the last workload is needed.)
         val workloadKeys = workloadSequenceKey.workloadKeys
         var corrected = 0.0
         var suffixPredictedMs = 0.0
@@ -143,7 +101,7 @@ class DraftSequenceExecutionPredictor {
             return 0.0
         }
 
-        return predictedMs * exp(estimateResidualScore(workloadSequenceKey))
+        return predictedMs * exp(workloadSequenceResidual.estimateScore(workloadSequenceKey))
     }
 
     private fun sumPredictedMs(
@@ -151,52 +109,6 @@ class DraftSequenceExecutionPredictor {
         workloadPredictedMs: Map<WorkloadKey, Double>,
     ): Double {
         return workloadSequenceKey.workloadKeys.sumOf { workloadPredictedMs.getValue(it) }
-    }
-
-    private fun estimateResidualScore(workloadSequenceKey: WorkloadSequenceKey): Double {
-        val sequenceSamples = workloadSequenceKeyResidualMap[workloadSequenceKey]
-        val samples = if (sequenceSamples.isNullOrEmpty()) globalResidualSamples else sequenceSamples
-        val effectiveSampleSize = computeEffectiveSampleSize(samples.filter { it.weight > 0.0 }.map { it.weight })
-        return computeWeightedQuantileScore(samples, computeQuantileForSampleSize(effectiveSampleSize))
-    }
-
-    /**
-     * Weighted score at [quantileFraction] of the decayed samples. The residual upper bound passes a high adaptive
-     * quantile (safety tail); the condition passes the median ([MEDIAN_QUANTILE], a robust central estimate).
-     */
-    private fun computeWeightedQuantileScore(samples: List<ResidualSample>, quantileFraction: Double): Double {
-        val weightedSamples = samples.filter { it.weight > 0.0 }
-        if (weightedSamples.isEmpty()) {
-            return 0.0
-        }
-
-        val targetWeight = weightedSamples.sumOf { it.weight } * quantileFraction
-        var cumulativeWeight = 0.0
-        for (sample in weightedSamples.sortedBy { it.score }) {
-            cumulativeWeight += sample.weight
-            if (cumulativeWeight >= targetWeight) {
-                return sample.score
-            }
-        }
-
-        return weightedSamples.maxOf { it.score }
-    }
-
-    private fun computeQuantileForSampleSize(sampleSize: Double): Double {
-        if (sampleSize <= 0.0) {
-            return 0.0
-        }
-        return 1.0 - 1.0 / (sampleSize + 1.0)
-    }
-
-    private fun computeEffectiveSampleSize(weights: List<Double>): Double {
-        val sumW = weights.sum()
-        val sumW2 = weights.sumOf { it * it }
-        if (sumW <= 0.0 || sumW2 <= 0.0) {
-            return 0.0
-        }
-
-        return (sumW * sumW) / sumW2
     }
 
     /**
@@ -237,101 +149,10 @@ class DraftSequenceExecutionPredictor {
     fun learnFromCapture(
         workloadDurations: Map<WorkloadKey, Long>,
         admissionDecisions: Collection<AdmissionDecision>,
-        draftWallMs: Long,
     ) {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
-
-        addResidualSamples(validWorkloadDurations, admissionDecisions)
-
-        // Multiplicative decomposition update. The shared condition ages once per capture (like the residual model),
-        // then takes this capture's duration/baseline ratios; each size's condition-stripped baseline updates from the
-        // pre-update condition snapshot. Reading PRE-update snapshots keeps the two from feeding back within one
-        // observation: the condition (weighted median) carries a thermal ramp across sizes, the baseline (running
-        // mean) stays a stable per-size anchor, and only the transient movement is shared - no concurrent-sibling
-        // double-count.
-        val conditionSnapshot = conditionFactor()
-        conditionSamples.decayAndPrune()
-        validWorkloadDurations.forEach { (workloadKey, durationMs) ->
-            val observedMs = durationMs.toDouble()
-            val baselineSnapshot = workloadKeyBaselineMap[workloadKey]?.meanMs()
-            if (baselineSnapshot != null && baselineSnapshot > 0.0) {
-                conditionSamples += ResidualSample(score = observedMs / baselineSnapshot)
-            }
-            workloadKeyBaselineMap.getOrPut(workloadKey) { BaselineMean() }.observe(observedMs / conditionSnapshot)
-        }
-
-        // Everything in the draft wall not accounted for by node processing is the between-node overhead the point
-        // sum misses. Learn it only from fully measured drafts (both terms positive), never below zero. Ages once per
-        // capture like the residual/condition models, then takes this capture's overhead.
-        val nodeProcessingMs = validWorkloadDurations.values.sum()
-        if (draftWallMs > 0L && nodeProcessingMs > 0L) {
-            overheadSamples.decayAndPrune()
-            overheadSamples += ResidualSample(score = (draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
-        }
-    }
-
-    private fun addResidualSamples(
-        workloadDurations: Map<WorkloadKey, Long>,
-        admissionDecisions: Collection<AdmissionDecision>,
-    ) {
-        val samples = admissionDecisions.mapNotNull { decision ->
-            val actualMs = computeClampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
-            val score = computeLogResidualScore(
-                predictedMs = decision.executionPrediction.sequencePredictedDurationMs,
-                actualMs = actualMs,
-            ) ?: return@mapNotNull null
-            decision.workloadSequenceKey to ResidualSample(score = score)
-        }
-
-        if (samples.isEmpty()) {
-            return
-        }
-
-        decayResidualWeights()
-        samples.forEach { (workloadSequenceKey, sample) ->
-            globalResidualSamples += sample
-            workloadSequenceKeyResidualMap.getOrPut(workloadSequenceKey) { mutableListOf() } += sample
-        }
-    }
-
-    /**
-     * Containment-scoped actual: each workload contributes max(its decision-time prediction, its actual), so a
-     * single workload's overrun is reflected at the sequence's scale even when another workload happened to run
-     * fast that capture. Returns null if any workload in the sequence did not run (incomplete sequence cannot be
-     * scored).
-     */
-    private fun computeClampedActualMs(
-        decision: AdmissionDecision,
-        workloadDurations: Map<WorkloadKey, Long>,
-    ): Double? {
-        var total = 0.0
-        for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
-            val actualMs = workloadDurations[workloadKey] ?: return null
-            val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
-            total += maxOf(predictedMs, actualMs.toDouble())
-        }
-        return total.takeIf { it > 0.0 }
-    }
-
-    private fun computeLogResidualScore(predictedMs: Double, actualMs: Double): Double? {
-        if (predictedMs <= 0.0 || actualMs <= 0.0) {
-            return null
-        }
-        return maxOf(0.0, ln(actualMs / predictedMs))
-    }
-
-    private fun decayResidualWeights() {
-        globalResidualSamples.decayAndPrune()
-        workloadSequenceKeyResidualMap.values.forEach { it.decayAndPrune() }
-    }
-
-    private fun MutableList<ResidualSample>.decayAndPrune() {
-        for (index in indices) {
-            this[index] = this[index].decay(SCORE_WEIGHT_DECAY)
-        }
-        // ponytail: drop the negligible tail so this long-lived model's sample lists stay bounded.
-        // At decay=0.9 a sample older than ~130 captures weighs < 1e-6 and no longer moves any quantile.
-        removeAll { it.weight < SCORE_WEIGHT_PRUNE_THRESHOLD }
+        workloadSequenceResidual.observe(validWorkloadDurations, admissionDecisions)
+        workloadDurationTrend.observe(validWorkloadDurations)
     }
 
     /**
@@ -342,7 +163,7 @@ class DraftSequenceExecutionPredictor {
      */
     @Synchronized
     fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {
-        val workloadPredictedMs = workloadSequenceKey.workloadKeys.associateWith(::estimateWorkloadMs)
+        val workloadPredictedMs = workloadDurationTrend.estimateAll(workloadSequenceKey.workloadKeys)
         val reserveWorkloadKeys = selectMandatoryReserveWorkloadKeys(workloadSequenceKey)
         return DraftSequenceEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
@@ -354,49 +175,161 @@ class DraftSequenceExecutionPredictor {
                     reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
                 )
             },
-            draftOverheadMs = overheadMean(),
         )
     }
 
     /**
-     * Between-node draft overhead: the decay-weighted mean of recent (draftWall - nodeSum) samples, 0.0 until any is
-     * seen. Recency-weighted via the shared [SCORE_WEIGHT_DECAY] (a later burst shot outweighs the first) without a
-     * standalone alpha; the mean rather than a quantile so a right-skewed overhead is not systematically under-priced.
+     * Per-workload duration trend as a multiplicative decomposition:
+     * duration(size) ≈ baseline(size) × shared condition.
+     *
+     * The per-size baseline is condition-stripped and structurally stable. The shared condition is the recency-
+     * weighted median of recent duration/baseline ratios, robust to one stalled draft while carrying sustained
+     * thermal throttling across workload families and sizes.
      */
-    private fun overheadMean(): Double {
-        val weighted = overheadSamples.filter { it.weight > 0.0 }
-        if (weighted.isEmpty()) {
-            return 0.0
+    private class WorkloadDurationTrend {
+        private val baselineByWorkload = mutableMapOf<WorkloadKey, BaselineMean>()
+        private val conditionScores = RecencyWeightedDistribution()
+        private var learnedConditionFactor = 1.0
+
+        /** Reads one condition snapshot and estimates every workload without recomputing its weighted median. */
+        fun estimateAll(workloadKeys: List<WorkloadKey>): Map<WorkloadKey, Double> {
+            val conditionSnapshot = learnedConditionFactor
+            return workloadKeys.associateWith { workloadKey -> estimate(workloadKey, conditionSnapshot) }
         }
-        return weighted.sumOf { it.score * it.weight } / weighted.sumOf { it.weight }
+
+        fun observe(workloadDurations: Map<WorkloadKey, Long>) {
+            // Both halves read the PRE-update condition so they cannot feed back within one capture.
+            val conditionSnapshot = learnedConditionFactor
+            conditionScores.decay()
+            workloadDurations.forEach { (workloadKey, durationMs) ->
+                val observedMs = durationMs.toDouble()
+                val baselineSnapshot = baselineByWorkload[workloadKey]?.meanMs()
+                if (baselineSnapshot != null && baselineSnapshot > 0.0) {
+                    conditionScores.add(observedMs / baselineSnapshot)
+                }
+                baselineByWorkload.getOrPut(workloadKey) { BaselineMean() }.observe(observedMs / conditionSnapshot)
+            }
+            learnedConditionFactor = conditionScores.median().takeIf { it > 0.0 } ?: 1.0
+        }
+
+        private fun estimate(workloadKey: WorkloadKey, conditionFactor: Double): Double {
+            baselineByWorkload[workloadKey]?.let { return it.meanMs() * conditionFactor }
+
+            // A cold size scales the slowest same-family sibling by megapixel ratio until its first observation.
+            val sibling = findSlowestSibling(workloadKey) ?: return 0.0
+            val megaPixelRatio =
+                workloadKey.sizeBucket.megaPixels.toDouble() / sibling.key.sizeBucket.megaPixels.toDouble()
+            return sibling.value.meanMs() * megaPixelRatio * conditionFactor
+        }
+
+        private fun findSlowestSibling(workloadKey: WorkloadKey): Map.Entry<WorkloadKey, BaselineMean>? {
+            var slowestSibling: Map.Entry<WorkloadKey, BaselineMean>? = null
+            for (candidate in baselineByWorkload.entries) {
+                if (!candidate.key.isWorkloadFamily(workloadKey)) {
+                    continue
+                }
+                val currentSlowest = slowestSibling
+                if (currentSlowest == null || candidate.value.meanMs() > currentSlowest.value.meanMs()) {
+                    slowestSibling = candidate
+                }
+            }
+            return slowestSibling
+        }
+
+        /** Running mean of duration with the capture's shared condition divided out. */
+        private class BaselineMean {
+            private var sampleCount: Int = 0
+            private var mean: Double = 0.0
+
+            fun meanMs(): Double = mean
+
+            fun observe(baselineSampleMs: Double) {
+                if (baselineSampleMs <= 0.0) {
+                    return
+                }
+                sampleCount++
+                mean += (baselineSampleMs - mean) / sampleCount
+            }
+        }
     }
 
     /**
-     * One size's structural duration baseline with the shared thermal condition divided out: the running mean of
-     * (observed / condition-at-observation). Every sample weighs 1/n, so it converges to a stable average and never
-     * chases the condition within a sample - a stale size keeps its true baseline while the shared condition
-     * ([conditionSamples], a decayed weighted median) carries the transient throttling.
+     * Sequence-specific upper-bound residual distributions with a global cold-sequence fallback: a sequence shot
+     * often enough to have its own residual history is bounded by it, everything else by the pooled one.
      */
-    private class BaselineMean {
-        private var sampleCount: Int = 0
-        private var mean: Double = 0.0
+    private class WorkloadSequenceResidual {
+        private val residualsBySequence = mutableMapOf<WorkloadSequenceKey, RecencyWeightedDistribution>()
+        private val globalResiduals = RecencyWeightedDistribution()
 
-        fun meanMs(): Double = mean
+        fun estimateScore(workloadSequenceKey: WorkloadSequenceKey): Double {
+            val sequenceResiduals = residualsBySequence[workloadSequenceKey]
+            val residuals = if (sequenceResiduals == null || sequenceResiduals.isEmpty()) {
+                globalResiduals
+            } else {
+                sequenceResiduals
+            }
+            val quantileFraction = computeQuantileForSampleSize(residuals.effectiveSampleSize())
+            return residuals.quantile(quantileFraction)
+        }
 
-        fun observe(baselineSampleMs: Double) {
-            if (baselineSampleMs <= 0.0) {
+        fun observe(
+            workloadDurations: Map<WorkloadKey, Long>,
+            admissionDecisions: Collection<AdmissionDecision>,
+        ) {
+            val scores = admissionDecisions.mapNotNull { decision ->
+                val actualMs = computeClampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
+                val predictedMs = decision.executionPrediction.sequencePredictedDurationMs
+                if (predictedMs <= 0.0) {
+                    return@mapNotNull null
+                }
+                decision.workloadSequenceKey to maxOf(0.0, ln(actualMs / predictedMs))
+            }
+            if (scores.isEmpty()) {
                 return
             }
-            sampleCount++
-            mean += (baselineSampleMs - mean) / sampleCount
-        }
-    }
 
-    private data class ResidualSample(
-        val score: Double,
-        val weight: Double = 1.0,
-    ) {
-        fun decay(factor: Double): ResidualSample = copy(weight = weight * factor)
+            decay()
+            scores.forEach { (workloadSequenceKey, score) ->
+                globalResiduals.add(score)
+                residualsBySequence.getOrPut(workloadSequenceKey) { RecencyWeightedDistribution() }.add(score)
+            }
+        }
+
+        /**
+         * Containment-scoped actual: each workload contributes max(decision-time prediction, actual), so one overrun
+         * is retained even when another workload happened to run fast. Incomplete sequences cannot be scored.
+         */
+        private fun computeClampedActualMs(
+            decision: AdmissionDecision,
+            workloadDurations: Map<WorkloadKey, Long>,
+        ): Double? {
+            var total = 0.0
+            for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
+                val actualMs = workloadDurations[workloadKey] ?: return null
+                val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
+                total += maxOf(predictedMs, actualMs.toDouble())
+            }
+            return total.takeIf { it > 0.0 }
+        }
+
+        private fun decay() {
+            globalResiduals.decay()
+            val sequenceIterator = residualsBySequence.values.iterator()
+            while (sequenceIterator.hasNext()) {
+                val sequenceResiduals = sequenceIterator.next()
+                sequenceResiduals.decay()
+                if (sequenceResiduals.isEmpty()) {
+                    sequenceIterator.remove()
+                }
+            }
+        }
+
+        private fun computeQuantileForSampleSize(sampleSize: Double): Double {
+            if (sampleSize <= 0.0) {
+                return 0.0
+            }
+            return 1.0 - 1.0 / (sampleSize + 1.0)
+        }
     }
 
     companion object {
@@ -413,13 +346,6 @@ class DraftSequenceExecutionPredictor {
         ): Boolean {
             return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
         }
-
-        // One recency control for every learned trend: decay sets the residual safety quantile, the condition's
-        // recency, and the overhead mean's recency (effective ESS=(1+d)/(1-d) -> ~19 recent captures at 0.9),
-        // self-calibrating to each device. MEDIAN_QUANTILE is the median (a robust centre), not a tunable knob.
-        private const val SCORE_WEIGHT_DECAY = 0.90
-        private const val SCORE_WEIGHT_PRUNE_THRESHOLD = 1e-6
-        private const val MEDIAN_QUANTILE = 0.50
     }
 }
 
@@ -444,11 +370,9 @@ data class WatchdogTimeoutDecision(
 )
 
 /**
- * One consistent model snapshot for a draft sequence: point sum, the mandatory RESERVED tail's upper bound, and the
- * learned between-node overhead the point sum omits (added to the point sum when pricing pipeline occupancy).
+ * One consistent Predictor snapshot for a draft sequence: its point sum and mandatory RESERVED-tail upper bound.
  */
 data class DraftSequenceEstimate(
     val predictedMs: Double,
     val mandatoryReserveUpperBoundMs: Double,
-    val draftOverheadMs: Double,
 )
