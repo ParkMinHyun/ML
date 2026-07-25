@@ -93,7 +93,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             preExecutionMetrics = preExecutionMetrics,
         )
 
-        val modelDecision = predictor.predictAdmission(workloadSequenceKey, preExecutionMetrics)
+        val modelDecision = predictor.decideAdmission(workloadSequenceKey, preExecutionMetrics)
         val decision = modelDecision.copy(
             executionPrediction = modelDecision.executionPrediction.copy(
                 admit = admissionPolicy.admit(

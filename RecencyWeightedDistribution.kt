@@ -6,12 +6,12 @@ package com.samsung.android.camera.core2.ml
  * outweigh its first without any trend carrying its own smoothing factor. Bounded, because ageing prunes the
  * samples that can no longer move a read.
  *
- * Every learned trend keeps one of these and reads the statistic its role calls for - [quantile] at the median for
- * a robust centre, [quantile] at an adaptive high fraction for a safety bound, [mean] for a right-skewed quantity
- * that must not be under-estimated.
+ * Every learned trend keeps one of these and reads the statistic its role calls for - [median] for a robust centre,
+ * [mean] for a right-skewed quantity that must not be under-estimated, [expectedMaximum] for a safety bound. Each is a
+ * named statistic rather than a tunable fraction, so no caller has a percentile to pick.
  *
- * Scores are kept in ascending order on insertion, so a quantile read walks the samples once and never filters,
- * maps, or sorts them. Mean reads are order-independent and share the same ordered storage.
+ * Scores are kept in ascending order on insertion, so a read walks the samples once and never filters, maps, or
+ * sorts them. Mean reads are order-independent and share the same ordered storage.
  */
 internal class RecencyWeightedDistribution {
 
@@ -31,25 +31,8 @@ internal class RecencyWeightedDistribution {
             sample.weight *= WEIGHT_DECAY
         }
         // ponytail: drop the negligible tail so this long-lived history stays bounded. At decay 0.9 a sample older
-        // than ~130 captures weighs < 1e-6 and can no longer move any quantile or mean.
+        // than ~130 captures weighs < 1e-6 and can no longer move any read.
         samples.removeAll { it.weight < WEIGHT_PRUNE_THRESHOLD }
-    }
-
-    /** Score at [fraction] of the total weight; 0.0 while empty. Samples are already score-ordered. */
-    fun quantile(fraction: Double): Double {
-        if (samples.isEmpty()) {
-            return 0.0
-        }
-
-        val targetWeight = samples.sumOf { it.weight } * fraction
-        var cumulativeWeight = 0.0
-        for (sample in samples) {
-            cumulativeWeight += sample.weight
-            if (cumulativeWeight >= targetWeight) {
-                return sample.score
-            }
-        }
-        return samples.last().score
     }
 
     /** Robust centre: the score with half the weight on either side. Prefer over [mean] for a spike-prone quantity. */
@@ -69,8 +52,14 @@ internal class RecencyWeightedDistribution {
         return weightedScoreSum / weightSum
     }
 
-    /** Kish effective sample size of the decayed weights - how many captures the history effectively still holds. */
-    fun effectiveSampleSize(): Double {
+    /**
+     * The largest score n effective samples are expected to produce, 0.0 while empty: with n of them the maximum
+     * sits at quantile n / (n + 1). So a thin history stays near its centre instead of extrapolating a tail it has
+     * never observed, and reaches further out only as it earns the samples to justify it (n = 19 -> ~p95). That
+     * makes it the safety bound a caller wants, self-calibrating, with no fixed percentile to tune per device.
+     */
+    fun expectedMaximum(): Double {
+        // Kish effective sample size: how many captures the decayed history effectively still counts as.
         var weightSum = 0.0
         var squaredWeightSum = 0.0
         for (sample in samples) {
@@ -80,7 +69,25 @@ internal class RecencyWeightedDistribution {
         if (weightSum <= 0.0 || squaredWeightSum <= 0.0) {
             return 0.0
         }
-        return (weightSum * weightSum) / squaredWeightSum
+        val effectiveSampleCount = (weightSum * weightSum) / squaredWeightSum
+        return quantile(1.0 - 1.0 / (effectiveSampleCount + 1.0))
+    }
+
+    /** Score at [fraction] of the total weight; 0.0 while empty. Samples are already score-ordered. */
+    private fun quantile(fraction: Double): Double {
+        if (samples.isEmpty()) {
+            return 0.0
+        }
+
+        val targetWeight = samples.sumOf { it.weight } * fraction
+        var cumulativeWeight = 0.0
+        for (sample in samples) {
+            cumulativeWeight += sample.weight
+            if (cumulativeWeight >= targetWeight) {
+                return sample.score
+            }
+        }
+        return samples.last().score
     }
 
     /** Mutated in place by [decay]: ageing the whole history must not allocate once per sample per capture. */
@@ -91,9 +98,9 @@ internal class RecencyWeightedDistribution {
     private companion object {
         /**
          * The one recency control behind every learned trend, so none of them carries its own smoothing factor.
-         * It also sets the residual safety quantile through [effectiveSampleSize]: ESS = (1 + d) / (1 - d) ≈ 19 at
-         * 0.9, so the adaptive quantile 1 - 1 / (ESS + 1) lands on ≈ p95 - the standard safety bound, self-calibrating
-         * to each device. Lowering it thins that tail (0.8 → p90); raising it only adds delay (0.98 → p99).
+         * It also sets how far [expectedMaximum] may reach: the effective sample count it derives is (1 + d)/(1 - d),
+         * so 0.9 counts ~19 captures and bounds at ~p95 - the standard safety quantile, self-calibrating to each
+         * device. Lowering it thins that tail (0.8 -> p90); raising it only adds delay (0.98 -> p99).
          */
         const val WEIGHT_DECAY = 0.90
         const val WEIGHT_PRUNE_THRESHOLD = 1e-6

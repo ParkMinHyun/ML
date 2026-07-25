@@ -26,21 +26,24 @@ class DraftSequenceExecutionPredictor {
     private val workloadSequenceResidual = WorkloadSequenceResidual()
 
     @Synchronized
-    fun predictAdmission(
+    fun decideAdmission(
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
         // Memoized per decision: cold-workload estimates scan sibling baselines, and the suffix walk reuses the result.
-        val workloadPredictedMs = workloadDurationTrend.estimateAll(workloadSequenceKey.workloadKeys)
+        val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         val sequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         val sequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
+        // Only OPTIONAL work is gated, and only by the learned sequence upper bound: budget deficits are observed
+        // separately and consumed by [CaptureAvailablePacer] as the captureAvailable pacing delay. Since the other
+        // policies always admit, a rejection here is by definition an OPTIONAL one.
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
-            WorkloadPolicy.OPTIONAL -> fitsUpperBoundBudget(
-                sequencePredictedMs,
-                sequenceUpperBoundMs,
-                preExecutionMetrics.budgetMs,
-            )
+            WorkloadPolicy.OPTIONAL ->
+                admitsOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, preExecutionMetrics.budgetMs)
             WorkloadPolicy.REQUIRED, WorkloadPolicy.RESERVED -> true
+        }
+        if (!admit) {
+            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, preExecutionMetrics.budgetMs)
         }
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
@@ -54,54 +57,29 @@ class DraftSequenceExecutionPredictor {
         )
     }
 
-    /**
-     * OPTIONAL gate. Admission is bounded by the learned sequence upper bound only; budget deficits are observed
-     * separately and consumed by [CaptureAvailablePacer] as the captureAvailable pacing delay.
-     */
-    private fun fitsUpperBoundBudget(
-        sequencePredictedMs: Double,
-        sequenceUpperBoundMs: Double,
-        budgetMs: Long,
-    ): Boolean {
-        val admit = admitsOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
-        if (!admit) {
-            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, budgetMs)
-        }
-
-        return admit
-    }
-
     private fun estimateUpperBoundMs(
         workloadSequenceKey: WorkloadSequenceKey,
         workloadPredictedMs: Map<WorkloadKey, Double>,
     ): Double {
-        // Walk tail -> head. Monotonic inclusion: each suffix's bound is at least its own raw bound and at least its
-        // head estimate plus the already-corrected tail, so nested-sequence bounds never invert. (Since exp(C) >= 1,
-        // the tail step max() already returns the raw bound, so no special case for the last workload is needed.)
+        // Walk tail -> head. Monotonic inclusion: each suffix is bounded by at least its own residual-inflated bound
+        // and at least its head estimate plus the already-corrected tail, so nested-sequence bounds never invert.
+        // (Since exp(C) >= 1, the tail step's max() already returns that bound - the last workload needs no case.)
         val workloadKeys = workloadSequenceKey.workloadKeys
-        var corrected = 0.0
+        var correctedUpperBoundMs = 0.0
         var suffixPredictedMs = 0.0
         for (index in workloadKeys.indices.reversed()) {
-            val workloadEstimateMs = workloadPredictedMs.getValue(workloadKeys[index])
-            suffixPredictedMs += workloadEstimateMs
-            val suffixRawUpperBoundMs = estimateRawUpperBoundMs(
-                WorkloadSequenceKey(workloadKeys.subList(index, workloadKeys.size)),
-                suffixPredictedMs,
-            )
-            corrected = maxOf(suffixRawUpperBoundMs, workloadEstimateMs + corrected)
+            val headPredictedMs = workloadPredictedMs.getValue(workloadKeys[index])
+            suffixPredictedMs += headPredictedMs
+            // This suffix's own bound: its point sum inflated by the residual margin learned for that exact suffix.
+            val suffixKey = WorkloadSequenceKey(workloadKeys.subList(index, workloadKeys.size))
+            val suffixUpperBoundMs = if (suffixPredictedMs <= 0.0) {
+                0.0
+            } else {
+                suffixPredictedMs * exp(workloadSequenceResidual.estimateScore(suffixKey))
+            }
+            correctedUpperBoundMs = maxOf(suffixUpperBoundMs, headPredictedMs + correctedUpperBoundMs)
         }
-        return corrected
-    }
-
-    private fun estimateRawUpperBoundMs(
-        workloadSequenceKey: WorkloadSequenceKey,
-        predictedMs: Double,
-    ): Double {
-        if (predictedMs <= 0.0) {
-            return 0.0
-        }
-
-        return predictedMs * exp(workloadSequenceResidual.estimateScore(workloadSequenceKey))
+        return correctedUpperBoundMs
     }
 
     private fun sumPredictedMs(
@@ -122,13 +100,13 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): WatchdogTimeoutDecision {
-        val reserveWorkloadKeys = selectMandatoryReserveWorkloadKeys(workloadSequenceKey)
-        if (reserveWorkloadKeys.isEmpty()) {
+        val reservedWorkloadKeys = selectReservedWorkloadKeys(workloadSequenceKey)
+        if (reservedWorkloadKeys.isEmpty()) {
             return WatchdogTimeoutDecision(timeoutMs = preExecutionMetrics.budgetMs.coerceAtLeast(0L), decision = null)
         }
 
         // The reserve is RESERVED-only, so this internal decision's admit bit is unused.
-        val decision = predictAdmission(WorkloadSequenceKey(reserveWorkloadKeys), preExecutionMetrics)
+        val decision = decideAdmission(WorkloadSequenceKey(reservedWorkloadKeys), preExecutionMetrics)
         val remainingBudgetMs = preExecutionMetrics.budgetMs - decision.executionPrediction.sequencePredictedUpperBoundMs
         val timeoutMs = when {
             remainingBudgetMs.isNaN() || remainingBudgetMs <= 0.0 -> 0L
@@ -140,7 +118,7 @@ class DraftSequenceExecutionPredictor {
     }
 
     /** RESERVED workloads in the observed draft sequence, including a RESERVED head for encoding-only captures. */
-    private fun selectMandatoryReserveWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
+    private fun selectReservedWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
     }
@@ -163,16 +141,16 @@ class DraftSequenceExecutionPredictor {
      */
     @Synchronized
     fun estimateDraftSequence(workloadSequenceKey: WorkloadSequenceKey): DraftSequenceEstimate {
-        val workloadPredictedMs = workloadDurationTrend.estimateAll(workloadSequenceKey.workloadKeys)
-        val reserveWorkloadKeys = selectMandatoryReserveWorkloadKeys(workloadSequenceKey)
+        val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
+        val reservedWorkloadKeys = selectReservedWorkloadKeys(workloadSequenceKey)
         return DraftSequenceEstimate(
             predictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs),
-            mandatoryReserveUpperBoundMs = if (reserveWorkloadKeys.isEmpty()) {
+            mandatoryReserveUpperBoundMs = if (reservedWorkloadKeys.isEmpty()) {
                 0.0
             } else {
                 estimateUpperBoundMs(
-                    WorkloadSequenceKey(reserveWorkloadKeys),
-                    reserveWorkloadKeys.associateWith(workloadPredictedMs::getValue),
+                    WorkloadSequenceKey(reservedWorkloadKeys),
+                    reservedWorkloadKeys.associateWith(workloadPredictedMs::getValue),
                 )
             },
         )
@@ -187,14 +165,14 @@ class DraftSequenceExecutionPredictor {
      * thermal throttling across workload families and sizes.
      */
     private class WorkloadDurationTrend {
-        private val baselineByWorkload = mutableMapOf<WorkloadKey, BaselineMean>()
+        private val baselineByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
         private val conditionScores = RecencyWeightedDistribution()
         private var learnedConditionFactor = 1.0
 
         /** Reads one condition snapshot and estimates every workload without recomputing its weighted median. */
-        fun estimateAll(workloadKeys: List<WorkloadKey>): Map<WorkloadKey, Double> {
+        fun estimateDurationMsByWorkload(workloadKeys: List<WorkloadKey>): Map<WorkloadKey, Double> {
             val conditionSnapshot = learnedConditionFactor
-            return workloadKeys.associateWith { workloadKey -> estimate(workloadKey, conditionSnapshot) }
+            return workloadKeys.associateWith { workloadKey -> estimateDurationMs(workloadKey, conditionSnapshot) }
         }
 
         fun observe(workloadDurations: Map<WorkloadKey, Long>) {
@@ -207,37 +185,44 @@ class DraftSequenceExecutionPredictor {
                 if (baselineSnapshot != null && baselineSnapshot > 0.0) {
                     conditionScores.add(observedMs / baselineSnapshot)
                 }
-                baselineByWorkload.getOrPut(workloadKey) { BaselineMean() }.observe(observedMs / conditionSnapshot)
+                baselineByWorkload.getOrPut(workloadKey) { EqualWeightedMean() }.observe(observedMs / conditionSnapshot)
             }
             learnedConditionFactor = conditionScores.median().takeIf { it > 0.0 } ?: 1.0
         }
 
-        private fun estimate(workloadKey: WorkloadKey, conditionFactor: Double): Double {
+        private fun estimateDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
             baselineByWorkload[workloadKey]?.let { return it.meanMs() * conditionFactor }
-
-            // A cold size scales the slowest same-family sibling by megapixel ratio until its first observation.
-            val sibling = findSlowestSibling(workloadKey) ?: return 0.0
-            val megaPixelRatio =
-                workloadKey.sizeBucket.megaPixels.toDouble() / sibling.key.sizeBucket.megaPixels.toDouble()
-            return sibling.value.meanMs() * megaPixelRatio * conditionFactor
+            return estimateColdDurationMs(workloadKey, conditionFactor)
         }
 
-        private fun findSlowestSibling(workloadKey: WorkloadKey): Map.Entry<WorkloadKey, BaselineMean>? {
-            var slowestSibling: Map.Entry<WorkloadKey, BaselineMean>? = null
-            for (candidate in baselineByWorkload.entries) {
-                if (!candidate.key.isWorkloadFamily(workloadKey)) {
-                    continue
-                }
-                val currentSlowest = slowestSibling
-                if (currentSlowest == null || candidate.value.meanMs() > currentSlowest.value.meanMs()) {
-                    slowestSibling = candidate
+        /**
+         * A size with no baseline yet: scale the slowest same-family sibling by the megapixel ratio, so a cold size
+         * is priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero
+         * when the family has never run at any size - the only case this model cannot price. Runs until this size
+         * is observed once, after which [estimateDurationMs] returns its own baseline and never comes back here.
+         */
+        private fun estimateColdDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
+            var siblingBaselineMs = 0.0
+            var siblingMegaPixels = 0
+            for ((candidateKey, candidateBaseline) in baselineByWorkload) {
+                if (candidateKey.isWorkloadFamily(workloadKey) && candidateBaseline.meanMs() > siblingBaselineMs) {
+                    siblingBaselineMs = candidateBaseline.meanMs()
+                    siblingMegaPixels = candidateKey.sizeBucket.megaPixels
                 }
             }
-            return slowestSibling
+            if (siblingMegaPixels <= 0) {
+                return 0.0
+            }
+            val megaPixelRatio = workloadKey.sizeBucket.megaPixels.toDouble() / siblingMegaPixels.toDouble()
+            return siblingBaselineMs * megaPixelRatio * conditionFactor
         }
 
-        /** Running mean of duration with the capture's shared condition divided out. */
-        private class BaselineMean {
+        /**
+         * Running mean of duration with the capture's shared condition divided out. Every sample weighs 1/n, the
+         * deliberate opposite of the recency-weighted condition it is paired with: the baseline converges to a stable
+         * per-size anchor instead of chasing a transient, so a size not shot for a while keeps its true structure.
+         */
+        private class EqualWeightedMean {
             private var sampleCount: Int = 0
             private var mean: Double = 0.0
 
@@ -268,28 +253,27 @@ class DraftSequenceExecutionPredictor {
             } else {
                 sequenceResiduals
             }
-            val quantileFraction = computeQuantileForSampleSize(residuals.effectiveSampleSize())
-            return residuals.quantile(quantileFraction)
+            return residuals.expectedMaximum()
         }
 
         fun observe(
             workloadDurations: Map<WorkloadKey, Long>,
             admissionDecisions: Collection<AdmissionDecision>,
         ) {
-            val scores = admissionDecisions.mapNotNull { decision ->
-                val actualMs = computeClampedActualMs(decision, workloadDurations) ?: return@mapNotNull null
+            val residualScores = admissionDecisions.mapNotNull { decision ->
+                val actualMs = sumFlooredActualMs(decision, workloadDurations) ?: return@mapNotNull null
                 val predictedMs = decision.executionPrediction.sequencePredictedDurationMs
                 if (predictedMs <= 0.0) {
                     return@mapNotNull null
                 }
                 decision.workloadSequenceKey to maxOf(0.0, ln(actualMs / predictedMs))
             }
-            if (scores.isEmpty()) {
+            if (residualScores.isEmpty()) {
                 return
             }
 
             decay()
-            scores.forEach { (workloadSequenceKey, score) ->
+            residualScores.forEach { (workloadSequenceKey, score) ->
                 globalResiduals.add(score)
                 residualsBySequence.getOrPut(workloadSequenceKey) { RecencyWeightedDistribution() }.add(score)
             }
@@ -299,17 +283,17 @@ class DraftSequenceExecutionPredictor {
          * Containment-scoped actual: each workload contributes max(decision-time prediction, actual), so one overrun
          * is retained even when another workload happened to run fast. Incomplete sequences cannot be scored.
          */
-        private fun computeClampedActualMs(
+        private fun sumFlooredActualMs(
             decision: AdmissionDecision,
             workloadDurations: Map<WorkloadKey, Long>,
         ): Double? {
-            var total = 0.0
+            var flooredTotalMs = 0.0
             for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
                 val actualMs = workloadDurations[workloadKey] ?: return null
                 val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
-                total += maxOf(predictedMs, actualMs.toDouble())
+                flooredTotalMs += maxOf(predictedMs, actualMs.toDouble())
             }
-            return total.takeIf { it > 0.0 }
+            return flooredTotalMs.takeIf { it > 0.0 }
         }
 
         private fun decay() {
@@ -322,13 +306,6 @@ class DraftSequenceExecutionPredictor {
                     sequenceIterator.remove()
                 }
             }
-        }
-
-        private fun computeQuantileForSampleSize(sampleSize: Double): Double {
-            if (sampleSize <= 0.0) {
-                return 0.0
-            }
-            return 1.0 - 1.0 / (sampleSize + 1.0)
         }
     }
 
