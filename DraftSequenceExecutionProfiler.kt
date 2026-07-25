@@ -59,7 +59,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
             classifyWorkloadKey(plannedNode, requireReadyToRun = false)
         }
-        val gatingPacingDecision = captureAvailablePacer.observeDraftStart(
+        val gatingPacingDecision = captureAvailablePacer.startDraftSequence(
             plannedWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
             readBudgetMs(),
         )

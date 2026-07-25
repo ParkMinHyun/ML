@@ -23,12 +23,14 @@ internal class CaptureAvailablePacingSession {
 
     /**
      * Latest draft-start snapshot the next [CaptureAvailablePacer.decideDelay] prices against; null until this
-     * session's first draft start, which is what makes an idle pipeline answer "no delay".
+     * session's first draft start, which is what makes an idle pipeline answer "no delay". Only
+     * [startDraftSequence] writes it, so the stored prediction and the clock it rebased can never disagree.
      */
     var pacingPrediction: CaptureAvailablePacingPrediction? = null
+        private set
 
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
-    private val observedMaxDraftMsBySize = mutableMapOf<SizeBucket, Long>()
+    private val maxDraftSequenceDurationMsBySize = mutableMapOf<SizeBucket, Long>()
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
@@ -39,48 +41,56 @@ internal class CaptureAvailablePacingSession {
      * times the session worst case, which no observed burst reaches. The timeout margin comes from the ceiling that
      * [CaptureAvailablePacer.decideDelay] adds for the single capture being paced; underruns here do not accumulate
      * because every draft start rebases this clock onto the real one.
+     *
+     * An absolute uptime, unlike the durations around it: [backlogMsAt] is what turns it into "how much is left".
      */
-    private var busyUntilUptimeMs = 0L
+    private var backlogEndTimeMs = 0L
 
-    var observedMaxDraftMs = 0L
+    /** Longest whole draft sequence measured this session, over every size - the fallback a cold size prices by. */
+    var maxDraftSequenceDurationMs = 0L
         private set
-    var observedSojournMs = 0L
+
+    /** Longest shutter-to-draft-start wait observed this session; the part of the queue wait the backlog cannot see. */
+    var maxDraftStartLatencyMs = 0L
         private set
 
     val queuedDraftCount: Int get() = pendingDecisions.size
 
-    /** Records one capture's APM timings into the session maxima; non-positive values mean no observation. */
-    fun observeApmTimings(draftWallMs: Long, sojournMs: Long) {
-        if (draftWallMs > 0L) {
-            observedMaxDraftMs = maxOf(observedMaxDraftMs, draftWallMs)
+    /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
+    val queuedPredictedWorkMs: Double
+        get() = pendingDecisions.sumOf { it.prediction.sessionPlannedPredictedMs }
+
+    /** Raises the session maxima by one capture's observed timings; non-positive values mean no observation. */
+    fun observeCaptureTimings(draftSequenceDurationMs: Long, draftStartLatencyMs: Long) {
+        if (draftSequenceDurationMs > 0L) {
+            maxDraftSequenceDurationMs = maxOf(maxDraftSequenceDurationMs, draftSequenceDurationMs)
         }
-        if (sojournMs > 0L) {
-            observedSojournMs = maxOf(observedSojournMs, sojournMs)
+        if (draftStartLatencyMs > 0L) {
+            maxDraftStartLatencyMs = maxOf(maxDraftStartLatencyMs, draftStartLatencyMs)
         }
     }
 
-    /** Records one completed draft's real wall against its own size; non-positive means no observation. */
-    fun observeDraftWall(sizeBucket: SizeBucket, draftWallMs: Long) {
-        if (draftWallMs <= 0L) {
+    /** Records one completed draft's real duration against its own size; non-positive means no observation. */
+    fun observeDraftSequenceDuration(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+        if (draftSequenceDurationMs <= 0L) {
             return
         }
-        observedMaxDraftMsBySize[sizeBucket] = maxOf(observedMaxDraftMsBySize[sizeBucket] ?: 0L, draftWallMs)
+        maxDraftSequenceDurationMsBySize[sizeBucket] =
+            maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
     }
 
     /**
-     * Observed max draft wall to price [sizeBucket] by, fed by the draft pipeline at completion ([observeDraftWall])
-     * where both the size and the real wall are known. Reading the current draft's own size keeps a heavy other-size
-     * draft (a MP24 burst) from inflating a MP12 capture's reserve; a size not yet measured this session falls back
-     * to the size-agnostic max - conservative for a genuinely cold size, exact once its own size has run.
+     * Measured max duration to price [sizeBucket] by, fed by the draft pipeline at completion
+     * ([observeDraftSequenceDuration]) where both the size and the real duration are known. Reading the current
+     * draft's own size keeps a heavy other-size draft (a MP24 burst) from inflating a MP12 capture's reserve; a size
+     * not yet measured this session falls back to the size-agnostic max - conservative for a genuinely cold size,
+     * exact once its own size has run.
      */
-    fun observedMaxDraftMsFor(sizeBucket: SizeBucket?): Long =
-        sizeBucket?.let { observedMaxDraftMsBySize[it] } ?: observedMaxDraftMs
+    fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket?): Long =
+        sizeBucket?.let { maxDraftSequenceDurationMsBySize[it] } ?: maxDraftSequenceDurationMs
 
     /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
-    fun backlogMsAt(nowUptimeMs: Long): Long = (busyUntilUptimeMs - nowUptimeMs).coerceAtLeast(0L)
-
-    /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
-    fun queuedPredictedWorkMs(): Double = pendingDecisions.sumOf { it.prediction.sessionPlannedPredictedMs }
+    fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
 
     /**
      * Queues one admitted callback and advances the clock past the draft it admits. Everything is read back off the
@@ -90,21 +100,30 @@ internal class CaptureAvailablePacingSession {
         pendingDecisions.addLast(decision)
         val prediction = decision.prediction
         val draftWorkMs = prediction.sessionPlannedPredictedMs + prediction.sessionPlannedDraftOverheadMs
-        busyUntilUptimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, busyUntilUptimeMs) +
+        backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) +
             ceil(draftWorkMs).toLong()
     }
 
     /**
-     * Reuses the decision FIFO as the admitted-work FIFO instead of maintaining a second queue: pops the admission
-     * this draft start consumes, then restarts the clock from the draft starting now plus everything still queued
-     * behind it, each priced at its point work plus one between-node overhead - so one overhead per queued draft,
-     * and one more for the starting draft.
+     * Adopts the starting draft's prediction and rebases the clock onto it. Reuses the decision FIFO as the
+     * admitted-work FIFO instead of maintaining a second queue: pops the admission this draft start consumes, then
+     * restarts the clock from the draft starting now plus everything still queued behind it, each priced at its point
+     * work plus one between-node overhead - so one overhead per queued draft, and one more for the starting draft.
+     *
+     * A null [draftStartPrediction] is a draft with no predictable workloads (e.g. JPEG passthrough): it contributes
+     * zero starting work and leaves the previous prediction standing, so the next pacing decision still has one.
      */
-    fun rebaseBacklogOnDraftStart(startingPredictedMs: Double): CaptureAvailablePacingDecision? {
+    fun startDraftSequence(
+        draftStartPrediction: CaptureAvailablePacingPrediction?,
+    ): CaptureAvailablePacingDecision? {
+        if (draftStartPrediction != null) {
+            pacingPrediction = draftStartPrediction
+        }
         val gatingDecision = pendingDecisions.removeFirstOrNull()
+        val startingPredictedMs = draftStartPrediction?.sessionPlannedPredictedMs ?: 0.0
         val draftOverheadMs = pacingPrediction?.sessionPlannedDraftOverheadMs ?: 0.0
-        val pendingDraftWorkMs = queuedPredictedWorkMs() + draftOverheadMs * (pendingDecisions.size + 1)
-        busyUntilUptimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
+        val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
+        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
         return gatingDecision
     }
 }

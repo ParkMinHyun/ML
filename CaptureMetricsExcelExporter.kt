@@ -635,59 +635,54 @@ class CaptureMetricsExcelExporter(
         val before: CaptureAvailablePacingMetrics,
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
-        private val backlogBaseWithoutSojournMs =
+        private val backlogBaseWithoutLatencyMs =
             before.backlogMs + before.sessionPlannedCeilingMs - captureTimeoutMs
 
-        val inferredObservedSojournMs: Long? = if (before.backlogDeficitMs > 0L) {
-            (before.backlogDeficitMs - ceil(backlogBaseWithoutSojournMs).toLong()).coerceAtLeast(0L)
+        val inferredDraftStartLatencyMs: Long? = if (before.backlogDeficitMs > 0L) {
+            (before.backlogDeficitMs - ceil(backlogBaseWithoutLatencyMs).toLong()).coerceAtLeast(0L)
         } else {
             null
         }
 
         /** Recorded runtime input wins; inference only covers rows persisted before the field existed. */
-        private val knownObservedSojournMs: Long? = before.observedSojournMs ?: inferredObservedSojournMs
-        val observedSojournMinMs: Long = knownObservedSojournMs ?: 0L
-        val observedSojournMaxMs: Long = knownObservedSojournMs ?: floor(
+        private val knownDraftStartLatencyMs: Long? =
+            before.maxDraftStartLatencyMs ?: inferredDraftStartLatencyMs
+        val draftStartLatencyMinMs: Long = knownDraftStartLatencyMs ?: 0L
+        val draftStartLatencyMaxMs: Long = knownDraftStartLatencyMs ?: floor(
             (captureTimeoutMs - before.backlogMs - before.sessionPlannedCeilingMs).coerceAtLeast(0.0),
         ).toLong()
-        val observedSojournInference: String = when {
-            before.observedSojournMs != null -> PACING_SOJOURN_RECORDED
-            inferredObservedSojournMs != null -> PACING_SOJOURN_EXACT
-            else -> PACING_SOJOURN_BOUNDED
+        val draftStartLatencyInference: String = when {
+            before.maxDraftStartLatencyMs != null -> PACING_LATENCY_RECORDED
+            inferredDraftStartLatencyMs != null -> PACING_LATENCY_EXACT
+            else -> PACING_LATENCY_BOUNDED
         }
 
-        val afterLevelDeficitMs: Long = CaptureAvailablePacer.computeCaptureAvailableLevelDeficitMs(
+        val afterLevelDeficitMs: Long = computeCaptureAvailableLevelDeficitMs(
             draftStartBudgetMs = before.draftStartBudgetMs,
             sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
-        val afterBacklogDeficitMinMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMinMs: Long = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
-            observedSojournMs = observedSojournMinMs,
+            maxDraftStartLatencyMs = draftStartLatencyMinMs,
             sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
-        val afterBacklogDeficitMaxMs: Long = CaptureAvailablePacer.computeCaptureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMaxMs: Long = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
-            observedSojournMs = observedSojournMaxMs,
+            maxDraftStartLatencyMs = draftStartLatencyMaxMs,
             sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
         }
-        val afterAppliedDelayMinMs: Long = CaptureAvailablePacer.computeCaptureAvailableDelayMs(
-            afterLevelDeficitMs,
-            afterBacklogDeficitMinMs,
-        )
-        val afterAppliedDelayMaxMs: Long = CaptureAvailablePacer.computeCaptureAvailableDelayMs(
-            afterLevelDeficitMs,
-            afterBacklogDeficitMaxMs,
-        )
+        val afterAppliedDelayMinMs: Long = maxOf(afterLevelDeficitMs, afterBacklogDeficitMinMs)
+        val afterAppliedDelayMaxMs: Long = maxOf(afterLevelDeficitMs, afterBacklogDeficitMaxMs)
         val afterAppliedDelayMs: Long? = afterAppliedDelayMinMs.takeIf { minimum ->
             minimum == afterAppliedDelayMaxMs
         }
         val delayDeltaMs: Long? = afterAppliedDelayMs?.minus(before.appliedDelayMs)
         val pacingChanged: Boolean? = afterAppliedDelayMs?.let { delayMs -> delayMs != before.appliedDelayMs }
         val replayStatus: String = when {
-            knownObservedSojournMs != null -> PACING_REPLAY_EXACT
+            knownDraftStartLatencyMs != null -> PACING_REPLAY_EXACT
             afterAppliedDelayMs != null -> PACING_REPLAY_BOUNDED_DETERMINISTIC
             else -> PACING_REPLAY_BOUNDED
         }
@@ -982,9 +977,9 @@ class CaptureMetricsExcelExporter(
         private const val AFTER_CORRECT_SKIP = "Correct Skip"
         private const val SESSION_BOUNDARY_PACER = "runtime pacer session id"
         private const val SESSION_BOUNDARY_TIMEOUT_PROXY = "timeout-delimited proxy"
-        private const val PACING_SOJOURN_RECORDED = "Recorded runtime input"
-        private const val PACING_SOJOURN_EXACT = "Exact from positive backlog deficit"
-        private const val PACING_SOJOURN_BOUNDED = "Bounded because backlog deficit was zero"
+        private const val PACING_LATENCY_RECORDED = "Recorded runtime input"
+        private const val PACING_LATENCY_EXACT = "Exact from positive backlog deficit"
+        private const val PACING_LATENCY_BOUNDED = "Bounded because backlog deficit was zero"
         private const val PACING_REPLAY_EXACT = "Exact"
         private const val PACING_REPLAY_BOUNDED_DETERMINISTIC = "Bounded input, deterministic delay"
         private const val PACING_REPLAY_BOUNDED = "Bounded delay"
@@ -1515,7 +1510,9 @@ class CaptureMetricsExcelExporter(
             Column("pacingDominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
             Column("pacingBacklogMs") { it.capture.row.pacingReplay?.before?.backlogMs },
             Column("pacingQueuedDraftCount") { it.capture.row.pacingReplay?.before?.queuedDraftCount },
-            Column("pacingObservedSojournMs") { it.capture.row.pacingReplay?.before?.observedSojournMs },
+            Column("pacingMaxDraftStartLatencyMs") {
+                it.capture.row.pacingReplay?.before?.maxDraftStartLatencyMs
+            },
             Column("pacingSessionPlannedCeilingMs") {
                 it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
             },
@@ -1727,7 +1724,9 @@ class CaptureMetricsExcelExporter(
             Column("anyUpperBoundMiss") { upperBoundMissed(it.capture.row) },
             Column("pacingDominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
             Column("pacingBacklogMs") { it.capture.row.pacingReplay?.before?.backlogMs },
-            Column("pacingObservedSojournMs") { it.capture.row.pacingReplay?.before?.observedSojournMs },
+            Column("pacingMaxDraftStartLatencyMs") {
+                it.capture.row.pacingReplay?.before?.maxDraftStartLatencyMs
+            },
             Column("pacingQueuedDraftCount") { it.capture.row.pacingReplay?.before?.queuedDraftCount },
             Column("appliedPacingDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
         )
@@ -1789,8 +1788,8 @@ class CaptureMetricsExcelExporter(
             val pacingReplay = capture.pacingReplay
             val pacing = pacingReplay?.before
             if (pacing != null) {
-                val backlogPlusSojournMs = pacing.backlogMs + (pacing.observedSojournMs ?: 0L)
-                if (pacingReplay.beforeDominantDeficit == PACING_DOMINANT_BACKLOG && backlogPlusSojournMs > 0L) {
+                val backlogPlusLatencyMs = pacing.backlogMs + (pacing.maxDraftStartLatencyMs ?: 0L)
+                if (pacingReplay.beforeDominantDeficit == PACING_DOMINANT_BACKLOG && backlogPlusLatencyMs > 0L) {
                     return CAUSE_CROSS_SHOT_BACKLOG
                 }
             }
@@ -2023,15 +2022,15 @@ class CaptureMetricsExcelExporter(
 
         /**
          * Positive means the persisted backlog clock under-priced the real queue wait observed by this capture.
-         * New metrics record observedSojournMs directly; legacy rows without it are intentionally excluded.
+         * New metrics record maxDraftStartLatencyMs directly; legacy rows without it are intentionally excluded.
          */
         private fun queuePricingErrorMs(capture: EnrichedCaptureRow): Double? {
             val pacing = capture.row.pacingReplay?.before ?: return null
-            val observedSojournMs = pacing.observedSojournMs ?: return null
+            val maxDraftStartLatencyMs = pacing.maxDraftStartLatencyMs ?: return null
             val draftStartMs = capture.row.draftStartUptimeMs ?: return null
             val releaseMs = pacing.decisionUptimeMs + pacing.appliedDelayMs
             val realQueueWaitMs = (draftStartMs - releaseMs).coerceAtLeast(0L)
-            val pricedQueueWaitMs = pacing.backlogMs + observedSojournMs
+            val pricedQueueWaitMs = pacing.backlogMs + maxDraftStartLatencyMs
             return realQueueWaitMs.toDouble() - pricedQueueWaitMs.toDouble()
         }
 
@@ -2211,8 +2210,10 @@ class CaptureMetricsExcelExporter(
             Column("beforeQueuedPredictedWorkMs") {
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
             },
-            Column("beforeObservedSojournMs") { it.row.pacingReplay?.before?.observedSojournMs },
-            Column("beforeObservedMaxDraftMs") { it.row.pacingReplay?.before?.observedMaxDraftMs },
+            Column("beforeMaxDraftStartLatencyMs") { it.row.pacingReplay?.before?.maxDraftStartLatencyMs },
+            Column("beforeMaxDraftSequenceDurationMs") {
+                it.row.pacingReplay?.before?.maxDraftSequenceDurationMs
+            },
             Column("beforeLevelDeficitMs") { it.row.pacingReplay?.before?.levelDeficitMs },
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
@@ -2264,7 +2265,7 @@ class CaptureMetricsExcelExporter(
                 if (actualMs != null && freshestMs != null) actualMs - freshestMs else null
             },
             // Ground-truth pipeline wait this capture actually hit (draft start minus its release = decision + applied
-            // delay): the real backlog to compare against the priced beforeBacklogMs + beforeObservedSojournMs.
+            // delay): the real backlog to compare against the priced beforeBacklogMs + beforeMaxDraftStartLatencyMs.
             Column("realQueueWaitMs") {
                 val draftStartMs = it.row.draftStartUptimeMs
                 val decisionMs = it.row.pacingReplay?.before?.decisionUptimeMs
@@ -2281,16 +2282,16 @@ class CaptureMetricsExcelExporter(
             // MP24 draft raising an MP12 capture's reserve. Clamped at 0 (when obsMax is below this size's own max, or
             // freshly reset to 0, the ceiling is not cross-size inflated).
             Column("ceilingCrossSizeContaminationMs") {
-                val obsMaxMs = it.row.pacingReplay?.before?.observedMaxDraftMs
+                val obsMaxMs = it.row.pacingReplay?.before?.maxDraftSequenceDurationMs
                 val sizeScopedMs = it.wallBase.sizeScopedObservedMaxDraftMs
                 if (obsMaxMs != null && sizeScopedMs != null) (obsMaxMs - sizeScopedMs).coerceAtLeast(0L) else null
             },
             Column("") { "" },
             Column("captureTimeoutMs") { it.row.pacingReplay?.captureTimeoutMs },
-            Column("observedSojournInference") { it.row.pacingReplay?.observedSojournInference },
-            Column("inferredObservedSojournMs") { it.row.pacingReplay?.inferredObservedSojournMs },
-            Column("observedSojournMinMs") { it.row.pacingReplay?.observedSojournMinMs },
-            Column("observedSojournMaxMs") { it.row.pacingReplay?.observedSojournMaxMs },
+            Column("draftStartLatencyInference") { it.row.pacingReplay?.draftStartLatencyInference },
+            Column("inferredDraftStartLatencyMs") { it.row.pacingReplay?.inferredDraftStartLatencyMs },
+            Column("draftStartLatencyMinMs") { it.row.pacingReplay?.draftStartLatencyMinMs },
+            Column("draftStartLatencyMaxMs") { it.row.pacingReplay?.draftStartLatencyMaxMs },
             Column("afterReplayStatus") { it.row.pacingReplay?.replayStatus },
             Column("") { "" },
             Column("afterLevelDeficitMs") { it.row.pacingReplay?.afterLevelDeficitMs },
@@ -2325,9 +2326,9 @@ class CaptureMetricsExcelExporter(
                     "sessionBoundarySource says which grouping was used.",
             ),
             ReplayNote(
-                topic = "Pacing sojourn",
-                note = "observed sojourn is read from the recorded runtime input (beforeObservedSojournMs) when " +
-                    "present. On legacy rows without it, a positive backlog deficit recovers it exactly; a zero " +
+                topic = "Pacing draft-start latency",
+                note = "draft-start latency is read from the recorded runtime input (beforeMaxDraftStartLatencyMs) " +
+                    "when present. On legacy rows without it, a positive backlog deficit recovers it exactly; a zero " +
                     "deficit only provides a min/max range, so after delay is reported as a range unless both bounds " +
                     "produce the same result.",
             ),
@@ -2351,7 +2352,7 @@ class CaptureMetricsExcelExporter(
                     "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
                     "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
                     "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
-                    "(compare to beforeBacklogMs + beforeObservedSojournMs). ceilingCrossSizeContaminationMs " +
+                    "(compare to beforeBacklogMs + beforeMaxDraftStartLatencyMs). ceilingCrossSizeContaminationMs " +
                     "(beforeObservedMaxDraftMs minus sizeScopedObservedMaxDraftMs) is how much a heavier other-size " +
                     "draft inflates this capture's ceiling - the mixed-size over-pacing channel left after the point " +
                     "prediction is made size-aware.",

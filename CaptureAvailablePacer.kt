@@ -11,7 +11,7 @@ import kotlin.math.ceil
  * concurrent captureAvailable callbacks would double-admit against a stale backlog.
  */
 fun interface CaptureAvailablePacingDecider {
-    fun decideDelay(observedDraftWallMs: Long, observedSojournMs: Long): CaptureAvailablePacingDecision?
+    fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision?
 }
 
 /**
@@ -43,10 +43,10 @@ class CaptureAvailablePacer(
      * with draft starts, but it contributes zero predicted work and leaves the pacing prediction as-is.
      */
     @Synchronized
-    fun observeDraftStart(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
+    fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
         val session = activeSession()
         if (plannedSequenceKey == null) {
-            return session.rebaseBacklogOnDraftStart(0.0)
+            return session.startDraftSequence(null)
         }
         val sessionPlannedSequenceKey = admissionPolicy.resolveSessionPlannedSequenceKey(plannedSequenceKey)
         val sessionPlannedPredictedMs = predictor.estimateDraftSequenceMs(sessionPlannedSequenceKey)
@@ -58,18 +58,19 @@ class CaptureAvailablePacer(
         }
         val currentSizeBucket = plannedSequenceKey.workloadKeys.firstOrNull()?.sizeBucket
         val sessionPlannedCeilingMs = maxOf(
-            session.observedMaxDraftMsFor(currentSizeBucket).toDouble() - demotedWorkloadMs,
+            session.maxDraftSequenceDurationMs(currentSizeBucket).toDouble() - demotedWorkloadMs,
             sessionPlannedPredictedMs,
         )
 
-        session.pacingPrediction = CaptureAvailablePacingPrediction(
-            draftStartBudgetMs = budgetMs,
-            sessionPlannedPredictedMs = sessionPlannedPredictedMs,
-            sessionPlannedDraftOverheadMs = draftDurationOverhead.estimateMs(),
-            sessionPlannedCeilingMs = sessionPlannedCeilingMs,
-            sessionPlannedSequenceKey = sessionPlannedSequenceKey.toReplayString(),
+        return session.startDraftSequence(
+            CaptureAvailablePacingPrediction(
+                draftStartBudgetMs = budgetMs,
+                sessionPlannedPredictedMs = sessionPlannedPredictedMs,
+                sessionPlannedDraftOverheadMs = draftDurationOverhead.estimateMs(),
+                sessionPlannedCeilingMs = sessionPlannedCeilingMs,
+                sessionPlannedSequenceKey = sessionPlannedSequenceKey.toReplayString(),
+            ),
         )
-        return session.rebaseBacklogOnDraftStart(sessionPlannedPredictedMs)
     }
 
     /**
@@ -78,9 +79,9 @@ class CaptureAvailablePacer(
      * queued as the admission record consumed by the next draft start.
      */
     @Synchronized
-    override fun decideDelay(draftWallMs: Long, sojournMs: Long): CaptureAvailablePacingDecision? {
+    override fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision? {
         val session = activeSession()
-        session.observeApmTimings(draftWallMs, sojournMs)
+        session.observeCaptureTimings(draftSequenceDurationMs, draftStartLatencyMs)
 
         val prediction = session.pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
@@ -92,19 +93,19 @@ class CaptureAvailablePacer(
         )
         val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
-            observedSojournMs = session.observedSojournMs,
+            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
             sessionPlannedCeilingMs = sessionPlannedCeilingMs,
         )
 
         val decision = CaptureAvailablePacingDecision(
-            delayMs = computeCaptureAvailableDelayMs(levelDeficitMs, backlogDeficitMs),
+            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
             backlogMs = backlogMs,
             levelDeficitMs = levelDeficitMs,
             backlogDeficitMs = backlogDeficitMs,
             queuedDraftCount = session.queuedDraftCount,
-            queuedPredictedWorkMs = session.queuedPredictedWorkMs(),
-            observedSojournMs = session.observedSojournMs,
-            observedMaxDraftMs = session.observedMaxDraftMs,
+            queuedPredictedWorkMs = session.queuedPredictedWorkMs,
+            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+            maxDraftSequenceDurationMs = session.maxDraftSequenceDurationMs,
             decisionUptimeMs = nowUptimeMs,
             prediction = prediction,
         )
@@ -118,7 +119,7 @@ class CaptureAvailablePacer(
      */
     @Synchronized
     fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long, nodeProcessingMs: Long) {
-        activeSession().observeDraftWall(sizeBucket, draftWallMs)
+        activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
         draftDurationOverhead.observe(nodeProcessingMs, draftWallMs)
     }
 
@@ -160,37 +161,26 @@ class CaptureAvailablePacer(
             learnedOverheadMs = overheadScores.mean()
         }
     }
-
-    companion object {
-        /**
-         * The two deficits and their max, stateless so a decision can be re-derived from persisted pacing inputs
-         * alone. Offline replay calls these exact functions to answer "what would today's pacing delay be"; a copy
-         * of this arithmetic would let the two drift and report a pacing change as no change.
-         */
-        internal fun computeCaptureAvailableLevelDeficitMs(
-            draftStartBudgetMs: Long,
-            sessionPlannedCeilingMs: Double,
-        ): Long {
-            return ceilToPositiveMs(sessionPlannedCeilingMs - draftStartBudgetMs.coerceAtLeast(0L))
-        }
-
-        internal fun computeCaptureAvailableBacklogDeficitMs(
-            backlogMs: Long,
-            observedSojournMs: Long,
-            sessionPlannedCeilingMs: Double,
-        ): Long {
-            return ceilToPositiveMs(
-                backlogMs + observedSojournMs + sessionPlannedCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS,
-            )
-        }
-
-        internal fun computeCaptureAvailableDelayMs(levelDeficitMs: Long, backlogDeficitMs: Long): Long {
-            return maxOf(levelDeficitMs, backlogDeficitMs)
-        }
-
-        private fun ceilToPositiveMs(valueMs: Double): Long = ceil(valueMs).toLong().coerceAtLeast(0L)
-    }
 }
+
+/**
+ * The two deficits, stateless so a decision can be re-derived from persisted pacing inputs alone. Offline replay
+ * calls these exact functions to answer "what would today's pacing delay be"; a copy of this arithmetic would let the
+ * two drift and report a pacing change as no change. The delay they feed is their plain max, written out at both call
+ * sites - a wrapper around `maxOf` is not arithmetic that can drift.
+ */
+internal fun computeCaptureAvailableLevelDeficitMs(
+    draftStartBudgetMs: Long,
+    sessionPlannedCeilingMs: Double,
+): Long = ceil(sessionPlannedCeilingMs - draftStartBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
+
+internal fun computeCaptureAvailableBacklogDeficitMs(
+    backlogMs: Long,
+    maxDraftStartLatencyMs: Long,
+    sessionPlannedCeilingMs: Double,
+): Long = ceil(backlogMs + maxDraftStartLatencyMs + sessionPlannedCeilingMs - MakerFeature.CAPTURE_TIMEOUT_MS)
+    .toLong()
+    .coerceAtLeast(0L)
 
 /** Latest runtime prediction for captureAvailable pacing. */
 data class CaptureAvailablePacingPrediction(
@@ -216,10 +206,10 @@ data class CaptureAvailablePacingDecision(
     val backlogDeficitMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** Session max pre-draft latency consumed by the backlog deficit at decision time. */
-    val observedSojournMs: Long,
-    /** Session max measured draft wall time at decision time, before re-projection onto the demoted shape. */
-    val observedMaxDraftMs: Long,
+    /** Session max shutter-to-draft-start wait consumed by the backlog deficit at decision time. */
+    val maxDraftStartLatencyMs: Long,
+    /** Session max measured draft sequence duration at decision time, before re-projection onto the demoted shape. */
+    val maxDraftSequenceDurationMs: Long,
     val decisionUptimeMs: Long,
     val prediction: CaptureAvailablePacingPrediction,
 )

@@ -65,10 +65,10 @@ data class CaptureAvailablePacingMetrics(
     val backlogMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** Session max pre-draft latency consumed by the backlog deficit; null on rows persisted before recording. */
-    val observedSojournMs: Long?,
-    /** Session max measured draft wall time at decision time; null on rows persisted before recording. */
-    val observedMaxDraftMs: Long?,
+    /** Session max shutter-to-draft-start wait the backlog deficit used; null on rows persisted before recording. */
+    val maxDraftStartLatencyMs: Long?,
+    /** Session max measured draft sequence duration at decision time; null on rows persisted before recording. */
+    val maxDraftSequenceDurationMs: Long?,
     val draftStartBudgetMs: Long,
     val sessionPlannedPredictedMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */

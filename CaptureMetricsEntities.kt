@@ -102,11 +102,11 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "queued_predicted_work_ms")
     val queuedPredictedWorkMs: Double,
 
-    @ColumnInfo(name = "observed_sojourn_ms")
-    val observedSojournMs: Long?,
+    @ColumnInfo(name = "max_draft_start_latency_ms")
+    val maxDraftStartLatencyMs: Long?,
 
-    @ColumnInfo(name = "observed_max_draft_ms")
-    val observedMaxDraftMs: Long?,
+    @ColumnInfo(name = "max_draft_sequence_duration_ms")
+    val maxDraftSequenceDurationMs: Long?,
 
     @ColumnInfo(name = "draft_start_budget_ms")
     val draftStartBudgetMs: Long,
