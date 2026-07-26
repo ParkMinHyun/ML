@@ -105,6 +105,15 @@ class CaptureMetricsExcelExporter(
         val run: EvaluationRun,
     )
 
+    private data class EvaluationReadinessRow(
+        val researchQuestion: String,
+        val metric: String,
+        val status: String,
+        val evidenceSource: String,
+        val limitation: String,
+        val requiredAction: String,
+    )
+
     /**
      * Cross-capture measurements for evaluating a future draft-wall-time-based pacing clock. They quantify the two
      * obstacles a wall-based clock hits: completion-lag (the freshest wall observable at a decision lags the drafts
@@ -235,33 +244,33 @@ class CaptureMetricsExcelExporter(
             writeSheet(
                 workbook,
                 styles,
-                "RQ1Effectiveness",
+                "RQ1EndToEnd",
                 listOf(evaluationRun),
-                buildRq1Columns(),
+                buildRq1EndToEndColumns(),
                 optimizeColumnWidths = true,
             )
             writeSheet(
                 workbook,
                 styles,
-                "RQ2Tradeoff",
+                "RQ2Admission",
                 listOf(evaluationRun),
-                buildRq2Columns(),
+                buildRq2AdmissionQualityColumns(),
                 optimizeColumnWidths = true,
             )
             writeSheet(
                 workbook,
                 styles,
-                "RQ3Robustness",
+                "RQ3Pacing",
                 listOf(evaluationRun),
-                buildRq3Columns(),
+                buildRq3PacingEffectColumns(),
                 optimizeColumnWidths = true,
             )
             writeSheet(
                 workbook,
                 styles,
-                "RQ3Timeline",
+                "SessionTimeline",
                 evaluationRun.timelineRows,
-                buildRq3TimelineColumns(),
+                buildSessionTimelineColumns(),
                 optimizeColumnWidths = true,
             )
             writeSheet(
@@ -293,6 +302,22 @@ class CaptureMetricsExcelExporter(
                 styles,
                 "EvaluationNotes",
                 buildEvaluationNotes(),
+                buildReplayNoteColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "DataReadiness",
+                buildEvaluationReadinessRows(evaluationRun),
+                buildEvaluationReadinessColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "MetricDefinitions",
+                buildMetricDefinitions(),
                 buildReplayNoteColumns(),
                 optimizeColumnWidths = true,
             )
@@ -451,8 +476,10 @@ class CaptureMetricsExcelExporter(
         optimizeColumnWidths: Boolean = false,
     ) {
         val sheet = workbook.createSheet(sheetName)
+        sheet.setDisplayGridlines(false)
 
         val headerRow = sheet.createRow(0)
+        headerRow.heightInPoints = 32f
         columns.forEachIndexed { index, column ->
             headerRow.createCell(index).apply {
                 cellStyle = styles.headerStyle
@@ -476,9 +503,22 @@ class CaptureMetricsExcelExporter(
         if (optimizeColumnWidths) {
             columns.indices.forEach { columnIndex ->
                 sheet.autoSizeColumn(columnIndex)
+                val minimumWidth = 12 * 256
+                if (sheet.getColumnWidth(columnIndex) < minimumWidth) {
+                    sheet.setColumnWidth(columnIndex, minimumWidth)
+                }
                 if (sheet.getColumnWidth(columnIndex) > MAX_EVALUATION_COLUMN_WIDTH) {
                     sheet.setColumnWidth(columnIndex, MAX_EVALUATION_COLUMN_WIDTH)
                 }
+            }
+        } else {
+            columns.forEachIndexed { columnIndex, column ->
+                val widthInCharacters = if (column.title.isBlank()) {
+                    3
+                } else {
+                    (column.title.length + 2).coerceIn(12, 48)
+                }
+                sheet.setColumnWidth(columnIndex, widthInCharacters * 256)
             }
         }
     }
@@ -503,7 +543,8 @@ class CaptureMetricsExcelExporter(
 
         var suffix = 2
         while (true) {
-            val candidate = base.take(MAX_SHEET_NAME_LENGTH - 2) + "_" + suffix
+            val suffixText = "_$suffix"
+            val candidate = base.take(MAX_SHEET_NAME_LENGTH - suffixText.length) + suffixText
             if (workbook.getSheet(candidate) == null) {
                 return candidate
             }
@@ -628,6 +669,18 @@ class CaptureMetricsExcelExporter(
                 return decisionRows.any { predictedBudgetOverrun(it) == true }
             }
 
+        /** Shutter acceptance inferred from the hard deadline written as acceptance + capture-timeout. */
+        val acceptedUptimeMs: Long?
+            get() = metrics.timeoutTimestampMs?.minus(MakerFeature.CAPTURE_TIMEOUT_MS)
+
+        /** Acceptance-to-Draft-completion latency used by the paper's deadline-slack definition. */
+        val completionLatencyMs: Long?
+            get() {
+                val acceptedMs = acceptedUptimeMs ?: return null
+                val completedMs = draftEndUptimeMs ?: return null
+                return (completedMs - acceptedMs).takeIf { latencyMs -> latencyMs >= 0L }
+            }
+
         fun policyOutcome(): PolicyOutcome {
             if (hasTimeoutFailure) {
                 return PolicyOutcome.TIMEOUT_FAILURE
@@ -642,9 +695,11 @@ class CaptureMetricsExcelExporter(
             val filterCompleted = filterDecision?.wasCompleted == true
             val bokehSkipped = bokehDecision?.wasSkipped == true
             val filterSkipped = filterDecision?.wasSkipped == true
+            val configuredFeatures = listOfNotNull(bokehDecision, filterDecision)
 
             return when {
-                bokehCompleted && filterCompleted -> PolicyOutcome.FULL_FEATURE_SUCCESS
+                configuredFeatures.isNotEmpty() && configuredFeatures.all { row -> row.wasCompleted } ->
+                    PolicyOutcome.FULL_FEATURE_SUCCESS
                 bokehSkipped && filterCompleted -> PolicyOutcome.SELECTIVE_BOKEH_SKIP_SUCCESS
                 bokehDecision?.wasAdmitted == true && filterDecision != null && !filterCompleted ->
                     PolicyOutcome.OBSERVED_FILTER_LOSS_AFTER_BOKEH_ADMIT
@@ -791,21 +846,100 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        fun observedActualFeasible(): Boolean? {
-            if (!isFullyObservedSuffix()) {
-                return null
+        /**
+         * The instant at which [PreExecutionMetrics.budgetMs] was read. With a persisted deadline this is exact:
+         * budget = deadline - now. Older rows without a deadline fall back to the immediately following node-start
+         * timestamp and are explicitly labelled as such by [admissionGroundTruthSource].
+         */
+        fun decisionUptimeMs(): Long? {
+            val deadlineMs = capture.metrics.timeoutTimestampMs
+            if (deadlineMs != null) {
+                return deadlineMs - nodeRow.node.preExecutionMetrics.budgetMs
             }
-            val actualDurationMs = nodeRow.sequenceActualDurationMs ?: return null
-            return actualDurationMs <= nodeRow.node.preExecutionMetrics.budgetMs
+            return nodeRow.node.startUptimeMs
         }
 
+        /**
+         * Factual remaining wall cost of the configuration that actually ran, including predictor/admission time,
+         * inter-node gaps, scheduling, and the mandatory tail. Skipped decisions remain unobserved until a future
+         * audit persists an explicit per-decision forced-execution flag.
+         */
+        fun observedRemainingWallMs(): Long? {
+            nodeRow.prediction ?: return null
+            if (nodeRow.wasAdmitted != true) {
+                return null
+            }
+            if (nodeRow.nodeActualDurationMs == null) {
+                return null
+            }
+            val decisionMs = decisionUptimeMs() ?: return null
+            val completedMs = capture.draftEndUptimeMs ?: return null
+            return (completedMs - decisionMs).takeIf { durationMs -> durationMs >= 0L }
+        }
+
+        fun admissionGroundTruthSource(): String {
+            nodeRow.prediction ?: return ADMISSION_GROUND_TRUTH_UNOBSERVED
+            if (nodeRow.wasAdmitted != true) {
+                return ADMISSION_GROUND_TRUTH_UNOBSERVED
+            }
+            if (observedRemainingWallMs() == null) {
+                return ADMISSION_GROUND_TRUTH_UNOBSERVED
+            }
+            return if (capture.metrics.timeoutTimestampMs != null) {
+                ADMISSION_GROUND_TRUTH_FACTUAL_WALL
+            } else {
+                ADMISSION_GROUND_TRUTH_NODE_START_FALLBACK
+            }
+        }
+
+        fun observedActualFeasible(): Boolean? {
+            val actualRemainingMs = observedRemainingWallMs() ?: return null
+            return actualRemainingMs <= nodeRow.node.preExecutionMetrics.budgetMs
+        }
+
+        fun exactWallUpperBoundSlackMs(): Double? {
+            if (nodeRow.isControllableOptionalDecision != true || !plannedSuffixFullyExecuted()) {
+                return null
+            }
+            if (admissionGroundTruthSource() != ADMISSION_GROUND_TRUTH_FACTUAL_WALL) {
+                return null
+            }
+            val prediction = nodeRow.prediction ?: return null
+            val actualRemainingMs = observedRemainingWallMs() ?: return null
+            return prediction.sequencePredictedUpperBoundMs - actualRemainingMs
+        }
+
+        fun exactWallUpperBoundMiss(): Boolean? =
+            exactWallUpperBoundSlackMs()?.let { slackMs -> slackMs < 0.0 }
+
         fun sequenceUpperBoundMiss(): Boolean? {
-            if (!isFullyObservedSuffix()) {
+            if (nodeRow.isControllableOptionalDecision != true ||
+                nodeRow.wasAdmitted != true ||
+                !plannedSuffixFullyExecuted()
+            ) {
                 return null
             }
             val prediction = nodeRow.prediction ?: return null
             val actualDurationMs = nodeRow.sequenceActualDurationMs ?: return null
             return actualDurationMs > prediction.sequencePredictedUpperBoundMs
+        }
+
+        fun fullyObservedSequenceUpperBoundSlackMs(): Double? {
+            if (nodeRow.isControllableOptionalDecision != true ||
+                nodeRow.wasAdmitted != true ||
+                !plannedSuffixFullyExecuted()
+            ) {
+                return null
+            }
+            return nodeRow.sequenceUpperBoundSlackMs()
+        }
+
+        fun admittedSuffixWatchdogTimedOut(): Boolean {
+            if (nodeRow.wasAdmitted != true) {
+                return false
+            }
+            return capture.nodeRows.drop(nodeOrder - 1)
+                .any { suffixRow -> suffixRow.node.watchdogTimedOut == true }
         }
 
         fun decisionOutcome(): DecisionOutcome? {
@@ -816,11 +950,11 @@ class CaptureMetricsExcelExporter(
             if (!prediction.admit) {
                 return DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
             }
-            if (capture.hasTimeoutOrWatchdogFailure || nodeRow.node.watchdogTimedOut == true) {
+            if (admittedSuffixWatchdogTimedOut()) {
                 return DecisionOutcome.UNSAFE_ADMIT
             }
-
-            val actualFeasible = observedActualFeasible() ?: return DecisionOutcome.ADMIT_OUTCOME_NOT_FULLY_OBSERVED
+            val actualFeasible = observedActualFeasible()
+                ?: return DecisionOutcome.ADMIT_OUTCOME_NOT_FULLY_OBSERVED
             return if (actualFeasible) {
                 DecisionOutcome.CORRECT_ADMIT
             } else {
@@ -899,6 +1033,28 @@ class CaptureMetricsExcelExporter(
             val suffixRows = capture.nodeRows.drop(nodeOrder - 1)
             return suffixRows.isNotEmpty() && suffixRows.all { it.nodeActualDurationMs != null }
         }
+
+        /**
+         * Whether the decision-time planned suffix is exactly the suffix that was later profiled. Planned workloads
+         * that were skipped before profiling exist only in workloadSequenceKey, so comparing recorded rows alone
+         * would silently score a smaller realized configuration against the larger plan's upper bound.
+         */
+        fun plannedSuffixKeyMatch(): Boolean? {
+            val serializedPlan = nodeRow.prediction?.workloadSequenceKey ?: return null
+            val plannedKeys = serializedPlan.split('>')
+            if (plannedKeys.any { key -> key.isBlank() }) {
+                return null
+            }
+            val suffixRows = capture.nodeRows.drop(nodeOrder - 1)
+            if (suffixRows.isEmpty() || suffixRows.any { row -> row.node.workloadKey == null }) {
+                return null
+            }
+            val observedKeys = suffixRows.mapNotNull { row -> row.node.workloadKey }
+            return observedKeys == plannedKeys
+        }
+
+        fun plannedSuffixFullyExecuted(): Boolean =
+            plannedSuffixKeyMatch() == true && isFullyObservedSuffix()
     }
 
     private class NodeRow(
@@ -928,6 +1084,18 @@ class CaptureMetricsExcelExporter(
 
         val isAdmissionWorkload: Boolean
             get() = isBokehWorkload || isDecodingWorkload || isFilterWorkload || isOverlayWatermarkWorkload
+
+        val isControllableOptionalDecision: Boolean?
+            get() {
+                if (!isAdmissionWorkload) {
+                    return false
+                }
+                if (!isDecodingWorkload) {
+                    return true
+                }
+                val workloadSequenceKey = prediction?.workloadSequenceKey ?: return null
+                return !workloadSequenceKey.contains(WATERMARK_TYPE_FRAME)
+            }
 
         val wasAdmitted: Boolean?
             get() = prediction?.admit
@@ -962,8 +1130,8 @@ class CaptureMetricsExcelExporter(
     }
 
     private enum class DecisionOutcome(val label: String) {
-        CORRECT_ADMIT("Correct Admit"),
-        UNSAFE_ADMIT("Unsafe Admit"),
+        CORRECT_ADMIT("Admit, Capture Deadline Met"),
+        UNSAFE_ADMIT("Admit, Capture/Suffix Failure"),
         ADMIT_OUTCOME_NOT_FULLY_OBSERVED("Admit Outcome Not Fully Observed"),
         SKIP_REQUIRES_OFFLINE_ORACLE("Skip Requires Offline Oracle"),
     }
@@ -982,7 +1150,18 @@ class CaptureMetricsExcelExporter(
     private class Styles(workbook: Workbook) {
         private val dataFormat = workbook.createDataFormat()
         val headerStyle: CellStyle = workbook.createCellStyle().apply {
-            setFont(workbook.createFont().apply { bold = true })
+            setFont(
+                workbook.createFont().apply {
+                    bold = true
+                    color = org.apache.poi.ss.usermodel.IndexedColors.WHITE.index
+                },
+            )
+            fillForegroundColor = org.apache.poi.ss.usermodel.IndexedColors.DARK_BLUE.index
+            fillPattern = org.apache.poi.ss.usermodel.FillPatternType.SOLID_FOREGROUND
+            alignment = org.apache.poi.ss.usermodel.HorizontalAlignment.CENTER
+            verticalAlignment = org.apache.poi.ss.usermodel.VerticalAlignment.CENTER
+            wrapText = true
+            borderBottom = org.apache.poi.ss.usermodel.BorderStyle.THIN
         }
         private val msStyle: CellStyle = workbook.createCellStyle().apply {
             dataFormat = this@Styles.dataFormat.getFormat("0\" ms\"")
@@ -993,13 +1172,23 @@ class CaptureMetricsExcelExporter(
         private val rateStyle: CellStyle = workbook.createCellStyle().apply {
             dataFormat = this@Styles.dataFormat.getFormat("0.0%")
         }
+        private val integerStyle: CellStyle = workbook.createCellStyle().apply {
+            dataFormat = this@Styles.dataFormat.getFormat("#,##0")
+        }
+        private val plainIntegerStyle: CellStyle = workbook.createCellStyle().apply {
+            dataFormat = this@Styles.dataFormat.getFormat("0")
+        }
         private val wrapTextStyle: CellStyle = workbook.createCellStyle().apply {
             wrapText = true
             verticalAlignment = org.apache.poi.ss.usermodel.VerticalAlignment.TOP
         }
 
         fun styleFor(columnTitle: String, value: Any?): CellStyle? {
-            if (columnTitle.equals("note", ignoreCase = true)) {
+            if (columnTitle.equals("note", ignoreCase = true) ||
+                columnTitle.equals("limitation", ignoreCase = true) ||
+                columnTitle.equals("requiredAction", ignoreCase = true) ||
+                columnTitle.equals("evidenceSource", ignoreCase = true)
+            ) {
                 return wrapTextStyle
             }
             if (value !is Number) {
@@ -1009,6 +1198,13 @@ class CaptureMetricsExcelExporter(
                 columnTitle.endsWith("Ms", ignoreCase = true) -> msStyle
                 columnTitle.endsWith("Percent", ignoreCase = true) -> percentStyle
                 columnTitle.endsWith("Rate", ignoreCase = true) -> rateStyle
+                columnTitle.endsWith("Id", ignoreCase = true) ||
+                    columnTitle.endsWith("Index", ignoreCase = true) ||
+                    columnTitle.endsWith("Number", ignoreCase = true) ||
+                    columnTitle.endsWith("Width", ignoreCase = true) ||
+                    columnTitle.endsWith("Height", ignoreCase = true) ||
+                    columnTitle.endsWith("Level", ignoreCase = true) -> plainIntegerStyle
+                value is Byte || value is Short || value is Int || value is Long -> integerStyle
                 else -> null
             }
         }
@@ -1031,6 +1227,10 @@ class CaptureMetricsExcelExporter(
         private const val ADMISSION_STAGE_OVERLAY_WATERMARK = "OverlayWatermark"
         private const val ADMISSION_SKIP_REASON_UPPER_BOUND = "upper bound"
         private const val ADMISSION_SKIP_REASON_SESSION_DEMOTION = "session demotion"
+        private const val ADMISSION_GROUND_TRUTH_FACTUAL_WALL = "FACTUAL_SELECTED_CONFIG_WALL"
+        private const val ADMISSION_GROUND_TRUTH_NODE_START_FALLBACK =
+            "FACTUAL_SELECTED_CONFIG_NODE_START_FALLBACK"
+        private const val ADMISSION_GROUND_TRUTH_UNOBSERVED = "UNOBSERVED"
         private const val AFTER_ADMIT_REQUIRES_OFFLINE_REPLAY = "After Admit Requires Offline Replay"
         private const val AFTER_SKIP_REQUIRES_OFFLINE_REPLAY = "After Skip Requires Offline Replay"
         private const val AFTER_SKIP_EVALUATED_FROM_RECORDED_ADMIT = "After Skip Evaluated from Recorded Admit"
@@ -1049,6 +1249,20 @@ class CaptureMetricsExcelExporter(
         private const val PACING_OUTCOME_RECORDED_REUSABLE = "Recorded outcome reusable"
         private const val PACING_OUTCOME_REQUIRES_REPLAY = "Changed delay requires offline replay"
         private const val PACING_OUTCOME_BOUNDED = "Delay range requires offline replay"
+        private const val PACING_ORACLE_NONE = "NONE_UNTIL_VALIDATED_CLOSED_LOOP_TRACE_REPLAY"
+
+        private const val OPTIONAL_OUTCOME_M_AND_S = "M+S"
+        private const val OPTIONAL_OUTCOME_M_ONLY = "M-only"
+        private const val OPTIONAL_OUTCOME_S_ONLY = "S-only"
+        private const val OPTIONAL_OUTCOME_MANDATORY_ONLY = "mandatory-only"
+
+        private const val REQUIREMENT_SAFE_WITH_RECORDED_WORK = "SafeWithRecordedWork"
+        private const val REQUIREMENT_ADMISSION = "AdmissionRequiredDiagnostic"
+        private const val REQUIREMENT_PACING = "PacingRequiredDiagnostic"
+        private const val REQUIREMENT_BOTH = "BothRequiredDiagnostic"
+
+        private const val STATE_SAMPLING_DRAFT_START_SHARED = "Draft-start snapshot shared across node rows"
+        private const val EVALUATION_SCHEMA_VERSION = 2
 
         // ---- SEIP evaluation additions: run context, static-guard baseline, failure attribution ----
         // Production static thermal guard from Section 2.4: optional Draft processing is skipped at this overheat
@@ -1069,22 +1283,23 @@ class CaptureMetricsExcelExporter(
         private const val AUDIT_MAX_THERMAL_HEADROOM_DELTA = 0.25f
         private const val AUDIT_MAX_RAM_AVAILABLE_PERCENT_DELTA = 10
 
-        private const val AUDIT_BASIS_FACTUAL_ADMIT = "Factual admitted suffix"
+        private const val AUDIT_BASIS_FACTUAL_ADMIT = "Factual admitted remaining wall"
         private const val AUDIT_BASIS_PREVIOUS_EXACT_SEQUENCE = "Previous exact-sequence observed suffix"
         private const val AUDIT_BASIS_PREVIOUS_WORKLOAD = "Previous same-workload own-deadline proxy"
         private const val AUDIT_BASIS_FUTURE_EXACT_SEQUENCE_ONLY = "Future exact-sequence sensitivity only"
         private const val AUDIT_BASIS_FUTURE_WORKLOAD_ONLY = "Future same-workload sensitivity only"
         private const val AUDIT_BASIS_NO_COMPARABLE_OBSERVATION = "No comparable observation"
 
-        private const val AUDIT_VERDICT_OBSERVED_FEASIBLE_ADMIT = "Observed Feasible Admit"
-        private const val AUDIT_VERDICT_OBSERVED_INFEASIBLE_ADMIT = "Observed Infeasible Admit"
+        private const val AUDIT_VERDICT_OBSERVED_FEASIBLE_ADMIT = "Admitted, Capture Deadline Met"
+        private const val AUDIT_VERDICT_OBSERVED_INFEASIBLE_ADMIT = "Admitted, Capture Deadline Missed"
         private const val AUDIT_VERDICT_OBSERVED_UNSAFE_ADMIT_FEASIBILITY_UNKNOWN =
-            "Observed Unsafe Admit, Feasibility Unknown"
+            "Admitted, Failure Observed, Deadline Feasibility Unknown"
         private const val AUDIT_VERDICT_OBSERVED_ADMIT_INCOMPLETE = "Observed Admit, Incomplete Suffix"
-        private const val AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP = "Likely Unnecessary Skip"
-        private const val AUDIT_VERDICT_LIKELY_CORRECT_SKIP = "Likely Correct Skip"
-        private const val AUDIT_VERDICT_UNCERTAIN_TRANSITION = "Uncertain: Previous/Next Disagree"
-        private const val AUDIT_VERDICT_UNIDENTIFIABLE_SKIP = "Unidentifiable Skip"
+        private const val AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP = "History Proxy: Likely Non-binding Skip"
+        private const val AUDIT_VERDICT_LIKELY_CORRECT_SKIP = "History Proxy: Likely Binding Skip"
+        private const val AUDIT_VERDICT_UNCERTAIN_TRANSITION =
+            "History Proxy: Uncertain, Previous/Next Disagree"
+        private const val AUDIT_VERDICT_UNIDENTIFIABLE_SKIP = "History Proxy: Unidentifiable Skip"
 
         private const val AUDIT_CONFIDENCE_HIGH = "High"
         private const val AUDIT_CONFIDENCE_MEDIUM = "Medium"
@@ -1117,12 +1332,12 @@ class CaptureMetricsExcelExporter(
         private const val TARGET_CONFIG_S_ONLY = "S-only"
         private const val TARGET_CONFIG_NONE = "none"
 
-        // Controller arm inferred from observed behavior only; a skip implies admission ran, a nonzero delay implies
-        // pacing ran. It cannot tell an inactive mechanism from an active one that never triggered - armLabel wins.
-        private const val ARM_FULL = "FULL (admission + pacing)"
-        private const val ARM_ADMISSION_ONLY = "ADMISSION_ONLY (skip observed, no delay)"
-        private const val ARM_PACING_ONLY = "PACING_ONLY (delay observed, no skip)"
-        private const val ARM_INACTIVE = "NONE_OR_INACTIVE (no skip and no delay observed)"
+        // Positive-trigger activity inferred from observed behavior only; a skip is evidence of admission activity and
+        // a nonzero delay of pacing activity. Absence cannot distinguish a disabled mechanism from one that never fired.
+        private const val ACTIVITY_SKIP_AND_DELAY = "SKIP_AND_DELAY_OBSERVED"
+        private const val ACTIVITY_SKIP_ONLY = "SKIP_OBSERVED_NO_DELAY"
+        private const val ACTIVITY_DELAY_ONLY = "DELAY_OBSERVED_NO_SKIP"
+        private const val ACTIVITY_NO_TRIGGER = "NO_SKIP_OR_DELAY_OBSERVED"
 
         private const val GUARD_CELL_RECOVERED_M_SAFE = "RecoveredM_Safe: guard suppresses, controller ran M, no timeout"
         private const val GUARD_CELL_ADMITTED_M_TIMEOUT = "AdmittedM_Timeout: guard suppresses, controller ran M, timeout"
@@ -1252,6 +1467,161 @@ class CaptureMetricsExcelExporter(
             }
         }
 
+        private fun <T> mergeColumns(vararg groups: List<Column<T>>): List<Column<T>> {
+            val seenTitles = mutableSetOf<String>()
+            return groups.flatMap { columns -> columns }
+                .filter { column -> column.title.isBlank() || seenTitles.add(column.title) }
+        }
+
+        /** Intervals wholly inside this burst. The first row may still contain the previous burst's gap. */
+        private fun inSessionShotToShotTimesMs(run: EvaluationRun): List<Long> =
+            run.captureRows.drop(1)
+                .mapNotNull { capture -> capture.metrics.shotToShotTimeMs }
+                .filter { intervalMs -> intervalMs >= 0L }
+
+        private fun captureAcceptanceSpanMs(run: EvaluationRun): Long? {
+            if (run.captureRows.size < 2) {
+                return null
+            }
+            val firstAcceptedMs = run.captureRows.first().acceptedUptimeMs ?: return null
+            val lastAcceptedMs = run.captureRows.last().acceptedUptimeMs ?: return null
+            return (lastAcceptedMs - firstAcceptedMs).takeIf { durationMs -> durationMs >= 0L }
+        }
+
+        private fun processingMakespanMs(run: EvaluationRun): Long? {
+            val firstAcceptedMs = run.captureRows.firstOrNull()?.acceptedUptimeMs ?: return null
+            val completedTimesMs = run.captureRows.mapNotNull { capture -> capture.draftEndUptimeMs }
+            if (completedTimesMs.size != run.captureRows.size) {
+                return null
+            }
+            val lastCompletedMs = completedTimesMs.maxOrNull() ?: return null
+            return (lastCompletedMs - firstAcceptedMs).takeIf { durationMs -> durationMs >= 0L }
+        }
+
+        private fun acceptanceRateWithinObservedSpanPerMinute(run: EvaluationRun): Double? {
+            if (run.captureRows.size < 2 ||
+                run.captureRows.any { capture -> capture.acceptedUptimeMs == null }
+            ) {
+                return null
+            }
+            val captureSpanMs = captureAcceptanceSpanMs(run)
+                ?.takeIf { durationMs -> durationMs > 0L }
+                ?: return null
+            return (run.captureRows.size - 1) * 60_000.0 / captureSpanMs
+        }
+
+        private fun optionalWorkOutcome(capture: CaptureRow): String? {
+            val mConfigured = capture.bokehDecisionRow != null
+            val sConfigured = capture.filterDecisionRow != null
+            if (!mConfigured && !sConfigured) {
+                return null
+            }
+            val mCompleted = capture.bokehDecisionRow?.wasCompleted == true
+            val sCompleted = capture.filterDecisionRow?.wasCompleted == true
+            return when {
+                mCompleted && sCompleted -> OPTIONAL_OUTCOME_M_AND_S
+                mCompleted -> OPTIONAL_OUTCOME_M_ONLY
+                sCompleted -> OPTIONAL_OUTCOME_S_ONLY
+                else -> OPTIONAL_OUTCOME_MANDATORY_ONLY
+            }
+        }
+
+        private fun optionalWorkOutcomeCount(run: EvaluationRun, outcome: String): Int =
+            run.captureRows.count { capture -> optionalWorkOutcome(capture) == outcome }
+
+        private fun optionalWorkOutcomeRate(run: EvaluationRun, outcome: String): Double? {
+            val observed = run.captureRows.mapNotNull(::optionalWorkOutcome)
+            return rate(observed.count { value -> value == outcome }, observed.size)
+        }
+
+        private fun timeoutFreeAtCaptureCount(run: EvaluationRun, targetCaptureCount: Int): Boolean? {
+            if (!run.isWholeBurstSession) {
+                return null
+            }
+            val evaluated = run.captureRows.take(targetCaptureCount)
+            if (evaluated.any { capture -> capture.hasTimeoutFailure }) {
+                return false
+            }
+            return true.takeIf { run.captureRows.size >= targetCaptureCount }
+        }
+
+        private fun failureFreeAtCaptureCount(run: EvaluationRun, targetCaptureCount: Int): Boolean? {
+            if (!run.isWholeBurstSession) {
+                return null
+            }
+            val evaluated = run.captureRows.take(targetCaptureCount)
+            if (evaluated.any { capture -> capture.hasTimeoutOrWatchdogFailure }) {
+                return false
+            }
+            return true.takeIf { run.captureRows.size >= targetCaptureCount }
+        }
+
+        private fun controllerRequirementDiagnostic(capture: CaptureRow): String {
+            val admissionRequired = listOf(
+                capture.bokehObservedBudgetOverrun,
+                capture.filterObservedBudgetOverrun,
+            ).any { overrun -> overrun == true }
+            val pacingRequired = capture.pacingReplay?.before?.backlogDeficitMs?.let { deficitMs ->
+                deficitMs > 0L
+            } == true
+            return when {
+                admissionRequired && pacingRequired -> REQUIREMENT_BOTH
+                admissionRequired -> REQUIREMENT_ADMISSION
+                pacingRequired -> REQUIREMENT_PACING
+                else -> REQUIREMENT_SAFE_WITH_RECORDED_WORK
+            }
+        }
+
+        private fun buildRq1EndToEndColumns(): List<Column<EvaluationRun>> = mergeColumns(
+            buildRunContextColumns(),
+            listOf(
+                Column("timeoutFreeAt30Captures") { timeoutFreeAtCaptureCount(it, 30) },
+                Column("failureFreeAt30Captures") { failureFreeAtCaptureCount(it, 30) },
+            ),
+            buildRq1Columns(),
+            listOf(
+                Column("mAndSCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_M_AND_S) },
+                Column("mAndSCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_M_AND_S) },
+                Column("mOnlyCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_M_ONLY) },
+                Column("mOnlyCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_M_ONLY) },
+                Column("sOnlyCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_S_ONLY) },
+                Column("sOnlyCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_S_ONLY) },
+                Column("mandatoryOnlyCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_MANDATORY_ONLY) },
+                Column("mandatoryOnlyRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_MANDATORY_ONLY) },
+                Column("inSessionShotToShotObservedCount") { inSessionShotToShotTimesMs(it).size },
+                Column("captureAcceptanceSpanMs") { captureAcceptanceSpanMs(it) },
+                Column("processingMakespanMs") { processingMakespanMs(it) },
+                Column("medianShotToShotTimeMs") { run ->
+                    percentile(
+                        inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
+                        0.50,
+                    )
+                },
+                Column("p95ShotToShotTimeMs") { run ->
+                    percentile(
+                        inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
+                        0.95,
+                    )
+                },
+                Column("p99ShotToShotTimeMs") { run ->
+                    percentile(
+                        inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
+                        0.99,
+                    )
+                },
+                Column("acceptanceRateWithinObservedSpanPerMinute") {
+                    acceptanceRateWithinObservedSpanPerMinute(it)
+                },
+                Column("totalRequestedPacingDelayMs") { run ->
+                    run.pacingRows.sumOf { pacing -> pacing.before.appliedDelayMs }
+                },
+                Column("p95RequestedPacingDelayMs") { run ->
+                    percentile(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() }, 0.95)
+                },
+            ),
+            buildEnvironmentDiagnosticColumns(),
+        )
+
         private fun buildRq1Columns(): List<Column<EvaluationRun>> = listOf(
             Column("deviceModel") { Build.MODEL },
             Column("captureCount") { it.captureRows.size },
@@ -1358,36 +1728,41 @@ class CaptureMetricsExcelExporter(
             // is what shows the controller is not just uniformly stricter or looser than the fixed threshold.
             Column("mBokehCompletionLevelGE4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = true) },
             Column("mBokehCompletionLevelLT4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = false) },
-            Column("guardFalsePositiveFixCount") { guardFalsePositiveFixCount(it) },
-            Column("guardFalseNegativeExposedCount") { guardFalseNegativeExposedCount(it) },
+            Column("offlineGuardRecoveryCandidateCount") { offlineGuardRecoveryCandidateCount(it) },
+            Column("offlineGuardBlindTimeoutCandidateCount") { offlineGuardBlindTimeoutCandidateCount(it) },
         )
 
-        private fun buildRq2Columns(): List<Column<EvaluationRun>> = listOf(
+        private fun buildRq2AdmissionQualityColumns(): List<Column<EvaluationRun>> = mergeColumns(
+            buildRunContextColumns(),
+            buildAdmissionCalibrationColumns(),
+        )
+
+        private fun buildPacingCostColumns(): List<Column<EvaluationRun>> = listOf(
             Column("deviceModel") { Build.MODEL },
             Column("captureCount") { it.captureRows.size },
             Column("shotToShotObservedCount") { run ->
-                run.captureRows.count { capture -> capture.metrics.shotToShotTimeMs != null }
+                inSessionShotToShotTimesMs(run).size
             },
             Column("totalShotToShotTimeMs") { run ->
-                run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs }.sum()
+                inSessionShotToShotTimesMs(run).sum()
             },
             Column("meanShotToShotTimeMs") { run ->
-                mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+                mean(inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() })
             },
             Column("medianShotToShotTimeMs") { run ->
                 percentile(
-                    run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
                     0.50,
                 )
             },
             Column("p95ShotToShotTimeMs") { run ->
                 percentile(
-                    run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
                     0.95,
                 )
             },
             Column("maximumShotToShotTimeMs") { run ->
-                run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs }.maxOrNull()
+                inSessionShotToShotTimesMs(run).maxOrNull()
             },
             Column("pacingDecisionCount") { it.pacingRows.size },
             Column("firstNonzeroPacingDelayCaptureNumber") { run ->
@@ -1450,7 +1825,7 @@ class CaptureMetricsExcelExporter(
             Column("backlogRecoveryDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_BACKLOG) },
             Column("coDominantDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_EQUAL) },
             Column("effectiveShotsPerSecond") { run ->
-                val meanMs = mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+                val meanMs = mean(inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() })
                 if (meanMs != null && meanMs > 0.0) 1000.0 / meanMs else null
             },
             // What the paced captures realized, as cost context: margins in the near-miss band mean the shutter time
@@ -1480,18 +1855,45 @@ class CaptureMetricsExcelExporter(
             },
         )
 
-        private fun buildRq3Columns(): List<Column<EvaluationRun>> = listOf(
-            Column("deviceModel") { Build.MODEL },
-            Column("captureCount") { it.captureRows.size },
-            Column("observedResolutions") { run ->
-                run.captureRows.map { capture ->
-                    "${capture.metrics.resultImageSize.width}x${capture.metrics.resultImageSize.height}"
-                }.distinct().sorted().joinToString("|")
-            },
-            Column("observedStartingOverheatLevel") { run -> overheatLevels(run).firstOrNull() },
-            Column("minimumObservedOverheatLevel") { run -> overheatLevels(run).minOrNull() },
-            Column("maximumObservedOverheatLevel") { run -> overheatLevels(run).maxOrNull() },
-            Column("finalObservedOverheatLevel") { run -> overheatLevels(run).lastOrNull() },
+        private fun buildRq3PacingEffectColumns(): List<Column<EvaluationRun>> = mergeColumns(
+            buildRunContextColumns(),
+            buildRunScorecardColumns(),
+            listOf(
+                Column("acceptedTimestampObservedCount") { run ->
+                    run.captureRows.count { capture -> capture.acceptedUptimeMs != null }
+                },
+                Column("meanQueuedDraftCount") { run ->
+                    mean(run.pacingRows.map { pacing -> pacing.before.queuedDraftCount.toDouble() })
+                },
+                Column("maximumQueuedDraftCount") { run ->
+                    run.pacingRows.maxOfOrNull { pacing -> pacing.before.queuedDraftCount }
+                },
+                Column("safeWithRecordedWorkDiagnosticCount") { run ->
+                    run.captureRows.count { capture ->
+                        controllerRequirementDiagnostic(capture) == REQUIREMENT_SAFE_WITH_RECORDED_WORK
+                    }
+                },
+                Column("admissionRequiredDiagnosticCount") { run ->
+                    run.captureRows.count { capture ->
+                        controllerRequirementDiagnostic(capture) == REQUIREMENT_ADMISSION
+                    }
+                },
+                Column("pacingRequiredDiagnosticCount") { run ->
+                    run.captureRows.count { capture ->
+                        controllerRequirementDiagnostic(capture) == REQUIREMENT_PACING
+                    }
+                },
+                Column("bothRequiredDiagnosticCount") { run ->
+                    run.captureRows.count { capture ->
+                        controllerRequirementDiagnostic(capture) == REQUIREMENT_BOTH
+                    }
+                },
+            ),
+            buildPacingCostColumns(),
+            buildPacingDiagnosticColumns(),
+        )
+
+        private fun buildEnvironmentDiagnosticColumns(): List<Column<EvaluationRun>> = listOf(
             Column("overheatLevelChangeCount") { run ->
                 overheatLevels(run).zipWithNext().count { (before, after) -> before != after }
             },
@@ -1509,11 +1911,6 @@ class CaptureMetricsExcelExporter(
                     firstNodePreExecutionMetrics(run).size,
                 )
             },
-            Column("minimumRamAvailablePercent") { run ->
-                firstNodePreExecutionMetrics(run).minOfOrNull { metrics ->
-                    metrics.memorySnapshot.ramAvailablePercent
-                }
-            },
             Column("maximumJavaHeapUsedPercent") { run ->
                 firstNodePreExecutionMetrics(run).maxOfOrNull { metrics ->
                     metrics.memorySnapshot.javaHeapUsedPercent
@@ -1529,7 +1926,22 @@ class CaptureMetricsExcelExporter(
                     metrics.thermalSnapshot.thermalHeadroom
                 }
             },
+        )
+
+        private fun buildAdmissionCalibrationColumns(): List<Column<EvaluationRun>> = listOf(
             Column("admissionDecisionCount") { it.admissionRows.size },
+            Column("controllableOptionalDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == true }
+            },
+            Column("controllabilityUnknownDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == null }
+            },
+            Column("admittedDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.wasAdmitted == true }
+            },
+            Column("skippedDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.wasSkipped }
+            },
             Column("zeroPointPredictionCount") { run ->
                 run.admissionRows.count { row ->
                     row.nodeRow.prediction?.sequencePredictedDurationMs?.let { duration -> duration <= 0.0 } == true
@@ -1551,8 +1963,120 @@ class CaptureMetricsExcelExporter(
                     }
                 }
             },
-            Column("fullyObservedAdmissionDecisionCount") { run ->
-                run.admissionRows.count { row -> row.isFullyObservedSuffix() }
+            // Primary RQ2 outcome: on controllable admits whose planned suffix fully ran, did the upper bound cover
+            // the exact decision-to-Draft-end wall cost?
+            Column("exactWallUpperBoundEligibleControllableAdmittedDecisionCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.capture.metrics.timeoutTimestampMs != null
+                }
+            },
+            Column("exactWallUpperBoundObservationCount") { run ->
+                run.admissionRows.count { row -> row.exactWallUpperBoundSlackMs() != null }
+            },
+            Column("exactWallUpperBoundIncompleteCount") { run ->
+                val eligible = run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.capture.metrics.timeoutTimestampMs != null
+                }
+                val observed = run.admissionRows.count { row -> row.exactWallUpperBoundSlackMs() != null }
+                (eligible - observed).coerceAtLeast(0)
+            },
+            Column("plannedSuffixKeyMismatchEligibleDecisionCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.capture.metrics.timeoutTimestampMs != null &&
+                        row.plannedSuffixKeyMatch() == false
+                }
+            },
+            Column("plannedSuffixKeyUnknownEligibleDecisionCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.capture.metrics.timeoutTimestampMs != null &&
+                        row.plannedSuffixKeyMatch() == null
+                }
+            },
+            Column("exactWallUpperBoundMissCount") { run ->
+                run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true }
+            },
+            Column("observedExactWallUpperBoundMissRate") { run ->
+                rate(
+                    run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true },
+                    run.admissionRows.count { row -> row.exactWallUpperBoundMiss() != null },
+                )
+            },
+            Column("observedExactWallUpperBoundCoverageRate") { run ->
+                val observed = run.admissionRows.count { row -> row.exactWallUpperBoundMiss() != null }
+                val misses = run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true }
+                rate(observed - misses, observed)
+            },
+            Column("worstCaseExactWallUpperBoundMissRate") { run ->
+                val eligible = run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.capture.metrics.timeoutTimestampMs != null
+                }
+                val observed = run.admissionRows.count { row -> row.exactWallUpperBoundMiss() != null }
+                val misses = run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true }
+                rate(misses + (eligible - observed).coerceAtLeast(0), eligible)
+            },
+            Column("minimumExactWallUpperBoundSlackMs") { run ->
+                run.admissionRows.mapNotNull { row -> row.exactWallUpperBoundSlackMs() }.minOrNull()
+            },
+            Column("p05ExactWallUpperBoundSlackMs") { run ->
+                percentile(run.admissionRows.mapNotNull { row -> row.exactWallUpperBoundSlackMs() }, 0.05)
+            },
+            Column("medianExactWallUpperBoundExcessMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row ->
+                        row.exactWallUpperBoundSlackMs()?.takeIf { slackMs -> slackMs >= 0.0 }
+                    },
+                    0.50,
+                )
+            },
+            Column("medianExactWallUpperBoundMissMagnitudeMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row ->
+                        row.exactWallUpperBoundSlackMs()
+                            ?.takeIf { slackMs -> slackMs < 0.0 }
+                            ?.let { slackMs -> -slackMs }
+                    },
+                    0.50,
+                )
+            },
+            Column("p95ExactWallUpperBoundMissMagnitudeMs") { run ->
+                percentile(
+                    run.admissionRows.mapNotNull { row ->
+                        row.exactWallUpperBoundSlackMs()
+                            ?.takeIf { slackMs -> slackMs < 0.0 }
+                            ?.let { slackMs -> -slackMs }
+                    },
+                    0.95,
+                )
+            },
+            // Secondary predictor calibration: node-duration suffix only, on fully observed controllable admits.
+            Column("fullyObservedControllableAdmittedDecisionCount") { run ->
+                run.admissionRows.count { row -> row.fullyObservedSequenceUpperBoundSlackMs() != null }
+            },
+            Column("incompleteControllableAdmittedDecisionCount") { run ->
+                val admitted = run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                }
+                val fullyObserved =
+                    run.admissionRows.count { row -> row.fullyObservedSequenceUpperBoundSlackMs() != null }
+                (admitted - fullyObserved).coerceAtLeast(0)
+            },
+            Column("fullyObservedControllableAdmittedDecisionRate") { run ->
+                rate(
+                    run.admissionRows.count { row -> row.fullyObservedSequenceUpperBoundSlackMs() != null },
+                    run.admissionRows.count { row ->
+                        row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                    },
+                )
             },
             Column("sequenceUpperBoundMissCount") { run ->
                 run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
@@ -1569,18 +2093,22 @@ class CaptureMetricsExcelExporter(
                 rate(observed - misses, observed)
             },
             Column("minimumSequenceUpperBoundSlackMs") { run ->
-                run.admissionRows.mapNotNull { row -> row.nodeRow.sequenceUpperBoundSlackMs() }.minOrNull()
+                run.admissionRows.mapNotNull { row -> row.fullyObservedSequenceUpperBoundSlackMs() }.minOrNull()
             },
             Column("p05SequenceUpperBoundSlackMs") { run ->
                 percentile(
-                    run.admissionRows.mapNotNull { row -> row.nodeRow.sequenceUpperBoundSlackMs() },
+                    run.admissionRows.mapNotNull { row -> row.fullyObservedSequenceUpperBoundSlackMs() },
                     0.05,
                 )
             },
             Column("medianAbsolutePredictionErrorMs") { run ->
                 percentile(
                     run.admissionRows.mapNotNull { row ->
-                        row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                        if (row.fullyObservedSequenceUpperBoundSlackMs() == null) {
+                            null
+                        } else {
+                            row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                        }
                     },
                     0.50,
                 )
@@ -1588,100 +2116,121 @@ class CaptureMetricsExcelExporter(
             Column("p95AbsolutePredictionErrorMs") { run ->
                 percentile(
                     run.admissionRows.mapNotNull { row ->
-                        row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                        if (row.fullyObservedSequenceUpperBoundSlackMs() == null) {
+                            null
+                        } else {
+                            row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                        }
                     },
                     0.95,
                 )
             },
-            Column("correctAdmitCount") { run ->
-                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT }
-            },
-            Column("unsafeAdmitCount") { run ->
-                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT }
-            },
-            Column("unsafeAdmitRateAmongObservedAdmits") { run ->
-                val correct = run.admissionRows.count {
-                    row -> row.decisionOutcome() == DecisionOutcome.CORRECT_ADMIT
-                }
-                val unsafe = run.admissionRows.count {
-                    row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT
-                }
-                rate(unsafe, correct + unsafe)
-            },
-            // Feasibility is kept separate from capture safety: a timeout caused by inherited backlog must not by
-            // itself turn a budget-feasible admission into evidence that the admission gate was wrong.
-            Column("observedFeasibleAdmitDecisionCount") { run ->
-                run.admissionRows.count { row -> row.observedActualFeasible() == true }
-            },
-            Column("observedInfeasibleAdmitDecisionCount") { run ->
-                run.admissionRows.count { row -> row.observedActualFeasible() == false }
-            },
-            Column("observedAdmitFeasibilityRate") { run ->
-                val observed = run.admissionRows.mapNotNull { row -> row.observedActualFeasible() }
-                rate(observed.count { feasible -> feasible }, observed.size)
-            },
-            Column("skipRequiresOfflineOracleCount") { run ->
-                run.admissionRows.count {
-                    row -> row.decisionOutcome() == DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
+            // Secondary failure phenotypes. Suffix watchdog counts decisions, not distinct watchdog events.
+            Column("controllableAdmittedNodeWatchdogTimeoutCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.nodeRow.wasAdmitted == true &&
+                        row.nodeRow.node.watchdogTimedOut == true
                 }
             },
-            // The skip half of decision quality. unsafeAdmitCount already scores admits against the observed
-            // outcome; these price each skip from captures that ran the same workload, so an over-strict controller
-            // is visible instead of hiding behind "skip requires offline oracle".
-            //
-            // Past-only is the decision-time-faithful primary audit. Future-only never supplies the primary verdict;
-            // it only shows whether a nearby later observation would reverse the retrospective conclusion.
-            Column("previousPricedSkipCaptureCount") { run ->
+            Column("controllableAdmittedNodeWatchdogTimeoutRate") { run ->
+                rate(
+                    run.admissionRows.count { row ->
+                        row.nodeRow.isControllableOptionalDecision == true &&
+                            row.nodeRow.wasAdmitted == true &&
+                            row.nodeRow.node.watchdogTimedOut == true
+                    },
+                    run.admissionRows.count { row ->
+                        row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                    },
+                )
+            },
+            Column("controllableAdmittedDecisionWithSuffixWatchdogTimeoutCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.admittedSuffixWatchdogTimedOut()
+                }
+            },
+            Column("controllableAdmittedDecisionWithSuffixWatchdogTimeoutRate") { run ->
+                rate(
+                    run.admissionRows.count { row ->
+                        row.nodeRow.isControllableOptionalDecision == true && row.admittedSuffixWatchdogTimedOut()
+                    },
+                    run.admissionRows.count { row ->
+                        row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                    },
+                )
+            },
+            Column("captureDeadlineMissSharedControllableAdmitDecisionCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.admissionGroundTruthSource() == ADMISSION_GROUND_TRUTH_FACTUAL_WALL &&
+                        row.observedActualFeasible() == false
+                }
+            },
+            Column("captureDeadlineMissSharedControllableAdmitDecisionRate") { run ->
+                val observed = run.admissionRows.filter { row ->
+                    row.nodeRow.isControllableOptionalDecision == true &&
+                        row.admissionGroundTruthSource() == ADMISSION_GROUND_TRUTH_FACTUAL_WALL
+                }
+                rate(observed.count { row -> row.observedActualFeasible() == false }, observed.size)
+            },
+            // Exploratory matched-history sensitivity only; it is not factual skip ground truth.
+            Column("skipRequiresExplicitAuditDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.wasSkipped }
+            },
+            Column("historyProxySkippedCaptureCount") { run ->
+                run.captureRows.count { capture ->
+                    capture.nodeRows.any { row -> row.isAdmissionWorkload && row.wasSkipped }
+                }
+            },
+            Column("historyProxyPricedSkipCaptureCount") { run ->
                 directionalSkipCounterfactualSlacksMs(run, previous = true).size
             },
-            Column("previousOwnDeadlineUnnecessarySkipCount") { run ->
+            Column("historyProxyCoverageRate") { run ->
+                val skippedCaptureCount = run.captureRows.count { capture ->
+                    capture.nodeRows.any { row -> row.isAdmissionWorkload && row.wasSkipped }
+                }
+                rate(directionalSkipCounterfactualSlacksMs(run, previous = true).size, skippedCaptureCount)
+            },
+            Column("historyProxyOwnDeadlineNonBindingSkipCount") { run ->
                 directionalSkipCounterfactualSlacksMs(run, previous = true)
                     .count { slackMs -> slackMs >= 0.0 }
             },
-            Column("previousOwnDeadlineUnnecessarySkipRate") { run ->
+            Column("historyProxyOwnDeadlineNonBindingSkipRate") { run ->
                 val slacksMs = directionalSkipCounterfactualSlacksMs(run, previous = true)
                 rate(slacksMs.count { slackMs -> slackMs >= 0.0 }, slacksMs.size)
             },
-            Column("medianPreviousSkipCounterfactualSlackMs") { run ->
+            Column("medianHistoryProxySlackMs") { run ->
                 percentile(directionalSkipCounterfactualSlacksMs(run, previous = true), 0.50)
             },
-            Column("nextSensitivityPricedSkipCaptureCount") { run ->
-                directionalSkipCounterfactualSlacksMs(run, previous = false).size
-            },
-            Column("previousNextSkipEvidenceComparedCount") { run ->
+            Column("historyProxySensitivityComparedCount") { run ->
                 run.captureRows.count { capture -> directionalSkipEvidenceAgreement(run, capture) != null }
             },
-            Column("previousNextSkipEvidenceAgreementRate") { run ->
+            Column("historyProxySensitivityAgreementRate") { run ->
                 val compared = run.captureRows.mapNotNull { capture ->
                     directionalSkipEvidenceAgreement(run, capture)
                 }
                 rate(compared.count { agrees -> agrees }, compared.size)
             },
-            Column("likelyUnnecessarySkipDecisionCount") { run ->
-                run.admissionAuditRows.count { row ->
-                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
+            Column("coldStartMedianAbsPredictionErrorMs") { run ->
+                percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
+            },
+            Column("steadyStateMedianAbsPredictionErrorMs") { run ->
+                percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
+            },
+            Column("predictionErrorConvergenceDeltaMs") { run ->
+                val cold = percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
+                val steady = percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
+                if (cold != null && steady != null) {
+                    cold - steady
+                } else {
+                    null
                 }
             },
-            Column("likelyCorrectSkipDecisionCount") { run ->
-                run.admissionAuditRows.count { row ->
-                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_CORRECT_SKIP
-                }
-            },
-            Column("uncertainTransitionSkipDecisionCount") { run ->
-                run.admissionAuditRows.count { row ->
-                    admissionAuditVerdict(row) == AUDIT_VERDICT_UNCERTAIN_TRANSITION
-                }
-            },
-            Column("unidentifiableSkipDecisionCount") { run ->
-                run.admissionAuditRows.count { row ->
-                    admissionAuditVerdict(row) == AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
-                }
-            },
-            // The third decision family. A delay is graded like an admit or a skip - was this one decision right,
-            // given what was observable when it was made - so it belongs beside them rather than with the shutter
-            // time it cost, which RQ2 prices. Excessive fires on structural evidence (a delay with nothing queued
-            // and nothing in flight); insufficient on a gated capture at risk whose queue or draft estimate was
-            // under-priced. Everything else stays unidentifiable on purpose: optimality needs a replay.
+        )
+
+        private fun buildPacingDiagnosticColumns(): List<Column<EvaluationRun>> = listOf(
+            // These are structural diagnostics, not per-decision causal or minimum-delay verdicts.
             Column("likelyExcessivePacingDecisionCount") { run ->
                 run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
@@ -1734,23 +2283,9 @@ class CaptureMetricsExcelExporter(
             Column("p95QueuePricingErrorMs") { run ->
                 percentile(queuePricingErrorsMs(run), 0.95)
             },
-            // Cold-start convergence: the model learns online with no persisted priors, so absolute prediction error
-            // over the first few captures vs the last few shows it settling. A positive convergence delta means the
-            // later captures predict more accurately than the opening ones.
-            Column("coldStartMedianAbsPredictionErrorMs") { run ->
-                percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
-            },
-            Column("steadyStateMedianAbsPredictionErrorMs") { run ->
-                percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
-            },
-            Column("predictionErrorConvergenceDeltaMs") { run ->
-                val cold = percentile(absPredictionErrors(run.captures.take(COLD_START_CAPTURE_COUNT)), 0.50)
-                val steady = percentile(absPredictionErrors(run.captures.takeLast(COLD_START_CAPTURE_COUNT)), 0.50)
-                if (cold != null && steady != null) cold - steady else null
-            },
         )
 
-        private fun buildRq3TimelineColumns(): List<Column<EvaluationTimelineRow>> = listOf(
+        private fun buildSessionTimelineColumns(): List<Column<EvaluationTimelineRow>> = listOf(
             Column("trialCaptureNumber") { it.trialCaptureNumber },
             Column("captureIndex") { it.capture.row.captureIndex },
             Column("ppSequenceId") { it.capture.row.metrics.ppSequenceId },
@@ -1758,6 +2293,10 @@ class CaptureMetricsExcelExporter(
             Column("resultImageWidth") { it.capture.row.metrics.resultImageSize.width },
             Column("resultImageHeight") { it.capture.row.metrics.resultImageSize.height },
             Column("shotToShotTimeMs") { it.capture.row.metrics.shotToShotTimeMs },
+            Column("acceptedUptimeMs") { it.capture.row.acceptedUptimeMs },
+            Column("draftStartUptimeMs") { it.capture.row.draftStartUptimeMs },
+            Column("draftEndUptimeMs") { it.capture.row.draftEndUptimeMs },
+            Column("completionLatencyMs") { it.capture.row.completionLatencyMs },
             Column("overheatLevel") {
                 it.capture.row.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
             },
@@ -1785,6 +2324,10 @@ class CaptureMetricsExcelExporter(
             Column("timeoutMarginMs") { it.capture.row.timeoutMarginMs },
             Column("draftWallMs") { it.capture.row.draftWallMs },
             Column("policyOutcome") { it.capture.row.policyOutcome().label },
+            Column("optionalWorkOutcome") { optionalWorkOutcome(it.capture.row) },
+            Column("controllerRequirementDiagnostic") {
+                controllerRequirementDiagnostic(it.capture.row)
+            },
             Column("mBokehAdmitted") { it.capture.row.bokehDecisionRow?.wasAdmitted },
             Column("mBokehCompleted") { it.capture.row.bokehDecisionRow?.wasCompleted },
             Column("mBokehPredictedDurationMs") {
@@ -1797,10 +2340,21 @@ class CaptureMetricsExcelExporter(
                 it.capture.row.bokehDecisionRow?.sequenceActualDurationMs
             },
             Column("mBokehUpperBoundSlackMs") {
-                it.capture.row.bokehDecisionRow?.sequenceUpperBoundSlackMs()
+                admissionSheetRow(it.capture.row, it.capture.row.bokehDecisionRow)
+                    ?.fullyObservedSequenceUpperBoundSlackMs()
             },
             Column("mBokehUpperBoundMiss") { row ->
                 admissionSheetRow(row.capture.row, row.capture.row.bokehDecisionRow)?.sequenceUpperBoundMiss()
+            },
+            Column("mBokehObservedRemainingWallMs") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.bokehDecisionRow)?.observedRemainingWallMs()
+            },
+            Column("mBokehObservedFeasible") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.bokehDecisionRow)?.observedActualFeasible()
+            },
+            Column("mBokehGroundTruthSource") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.bokehDecisionRow)
+                    ?.admissionGroundTruthSource()
             },
             Column("sFilterAdmitted") { it.capture.row.filterDecisionRow?.wasAdmitted },
             Column("sFilterCompleted") { it.capture.row.filterDecisionRow?.wasCompleted },
@@ -1814,10 +2368,21 @@ class CaptureMetricsExcelExporter(
                 it.capture.row.filterDecisionRow?.sequenceActualDurationMs
             },
             Column("sFilterUpperBoundSlackMs") {
-                it.capture.row.filterDecisionRow?.sequenceUpperBoundSlackMs()
+                admissionSheetRow(it.capture.row, it.capture.row.filterDecisionRow)
+                    ?.fullyObservedSequenceUpperBoundSlackMs()
             },
             Column("sFilterUpperBoundMiss") { row ->
                 admissionSheetRow(row.capture.row, row.capture.row.filterDecisionRow)?.sequenceUpperBoundMiss()
+            },
+            Column("sFilterObservedRemainingWallMs") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.filterDecisionRow)?.observedRemainingWallMs()
+            },
+            Column("sFilterObservedFeasible") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.filterDecisionRow)?.observedActualFeasible()
+            },
+            Column("sFilterGroundTruthSource") { row ->
+                admissionSheetRow(row.capture.row, row.capture.row.filterDecisionRow)
+                    ?.admissionGroundTruthSource()
             },
             Column("pacingDecisionAvailable") { it.capture.row.pacingReplay != null },
             Column("appliedPacingDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
@@ -1857,9 +2422,7 @@ class CaptureMetricsExcelExporter(
             Column("deviceModel") { Build.MODEL },
             Column("sizeBucketInferred") { sizeBucketInferred(it.run) },
             Column("targetConfigInferred") { targetConfigInferred(it.run) },
-            Column("armSignatureInferred") { armSignatureInferred(it.run) },
-            Column("armLabel") { "" },
-            Column("conditionLabel") { "" },
+            Column("observedActivitySignature") { observedActivitySignature(it.run) },
             Column("trialCaptureNumber") { it.trialCaptureNumber },
             Column("captureIndex") { it.sheetRow.capture.captureIndex },
             Column("ppSequenceId") { it.sheetRow.capture.metrics.ppSequenceId },
@@ -1868,9 +2431,13 @@ class CaptureMetricsExcelExporter(
             Column("resultImageHeight") { it.sheetRow.capture.metrics.resultImageSize.height },
             Column("nodeOrder") { it.sheetRow.nodeOrder },
             Column("admissionStage") { it.sheetRow.admissionStage() },
+            Column("controllableOptionalDecision") {
+                it.sheetRow.nodeRow.isControllableOptionalDecision
+            },
             Column("workloadKey") { it.sheetRow.nodeRow.node.workloadKey },
             Column("workloadSequenceKey") { it.sheetRow.nodeRow.prediction?.workloadSequenceKey },
             Column("budgetMs") { it.sheetRow.nodeRow.node.preExecutionMetrics.budgetMs },
+            Column("decisionUptimeMs") { it.sheetRow.decisionUptimeMs() },
             Column("sequencePredictedDurationMs") {
                 it.sheetRow.nodeRow.prediction?.sequencePredictedDurationMs
             },
@@ -1891,11 +2458,28 @@ class CaptureMetricsExcelExporter(
             },
             Column("captureTimedOut") { it.sheetRow.capture.hasTimeoutFailure },
             Column("captureWatchdogFailed") { it.sheetRow.capture.hasWatchdogFailure },
+            Column("admittedNodeWatchdogTimedOut") {
+                it.sheetRow.nodeRow.wasAdmitted == true &&
+                    it.sheetRow.nodeRow.node.watchdogTimedOut == true
+            },
+            Column("admittedSuffixWatchdogTimedOut") {
+                it.sheetRow.admittedSuffixWatchdogTimedOut()
+            },
             Column("timeoutMarginMs") { it.sheetRow.capture.timeoutMarginMs },
             Column("nodeActualDurationMs") { it.sheetRow.nodeRow.nodeActualDurationMs },
             Column("sequenceActualDurationMs") { it.sheetRow.nodeRow.sequenceActualDurationMs },
             Column("suffixFullyObserved") { it.sheetRow.isFullyObservedSuffix() },
-            Column("observedActualFeasible") { it.sheetRow.observedActualFeasible() },
+            Column("plannedSuffixKeyMatch") { it.sheetRow.plannedSuffixKeyMatch() },
+            Column("plannedSuffixFullyExecuted") { it.sheetRow.plannedSuffixFullyExecuted() },
+            Column("sequenceUpperBoundSlackMs") {
+                it.sheetRow.fullyObservedSequenceUpperBoundSlackMs()
+            },
+            Column("sequenceUpperBoundMiss") { it.sheetRow.sequenceUpperBoundMiss() },
+            Column("observedRemainingWallMs") { it.sheetRow.observedRemainingWallMs() },
+            Column("exactWallUpperBoundSlackMs") { it.sheetRow.exactWallUpperBoundSlackMs() },
+            Column("exactWallUpperBoundMiss") { it.sheetRow.exactWallUpperBoundMiss() },
+            Column("admissionGroundTruthSource") { it.sheetRow.admissionGroundTruthSource() },
+            Column("captureDeadlineFeasibleShared") { it.sheetRow.observedActualFeasible() },
             Column("recordedDecisionOutcome") { it.sheetRow.decisionOutcomeLabel() },
             Column("runQueueWaitMs") {
                 it.sheetRow.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs
@@ -2175,9 +2759,7 @@ class CaptureMetricsExcelExporter(
             Column("deviceModel") { Build.MODEL },
             Column("sizeBucketInferred") { sizeBucketInferred(it.run) },
             Column("targetConfigInferred") { targetConfigInferred(it.run) },
-            Column("armSignatureInferred") { armSignatureInferred(it.run) },
-            Column("armLabel") { "" },
-            Column("conditionLabel") { "" },
+            Column("observedActivitySignature") { observedActivitySignature(it.run) },
             Column("trialCaptureNumber") { it.trialCaptureNumber },
             Column("captureIndex") { it.capture.row.captureIndex },
             Column("ppSequenceId") { it.capture.row.metrics.ppSequenceId },
@@ -2269,13 +2851,17 @@ class CaptureMetricsExcelExporter(
         )
 
         /** Prefix windows plus the whole burst, deduplicated and clipped to what was actually captured. */
-        private fun prefixWindowRows(captures: List<EnrichedCaptureRow>): List<PrefixWindowRow> =
+        private fun prefixWindowRows(
+            captures: List<EnrichedCaptureRow>,
+        ): List<PrefixWindowRow> =
             (PREFIX_CAPTURE_COUNTS + captures.size).distinct().sorted()
                 .filter { count -> count in 1..captures.size }
                 .map { count -> PrefixWindowRow(count, EvaluationRun(captures.take(count))) }
 
         private fun buildBurstPrefixColumns(): List<Column<PrefixWindowRow>> = listOf(
             Column("prefixCaptureCount") { it.prefixCaptureCount },
+            Column("wholeBurstSessionEvaluated") { it.run.isWholeBurstSession },
+            Column("confirmatoryPrefixEligible") { it.run.isWholeBurstSession },
             Column("startingOverheatLevel") { overheatLevels(it.run).firstOrNull() },
             Column("endingOverheatLevel") { overheatLevels(it.run).lastOrNull() },
             Column("maximumOverheatLevel") { overheatLevels(it.run).maxOrNull() },
@@ -2322,23 +2908,27 @@ class CaptureMetricsExcelExporter(
                 row.run.pacingRows.maxOfOrNull { pacing -> pacing.before.appliedDelayMs }
             },
             Column("meanShotToShotTimeMs") { row ->
-                mean(row.run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+                mean(inSessionShotToShotTimesMs(row.run).map { intervalMs -> intervalMs.toDouble() })
             },
             Column("p95ShotToShotTimeMs") { row ->
                 percentile(
-                    row.run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    inSessionShotToShotTimesMs(row.run).map { intervalMs -> intervalMs.toDouble() },
                     0.95,
                 )
             },
         )
 
         /**
-         * One self-describing row per workbook. Lets several exported workbooks be aggregated into the baseline and
-         * ablation comparison tables without parsing file names: every config axis of the Section 2.4 study (device,
-         * resolution, size bucket, starting/observed overheat, memory, M vs M+S) plus the inferred controller arm.
+         * One observed-context row per workbook. Controlled policy and condition labels come from the filename/test
+         * log; this sheet records what can be inferred from the capture itself.
          */
         private fun buildRunContextColumns(): List<Column<EvaluationRun>> = listOf(
+            Column("evaluationSchemaVersion") { EVALUATION_SCHEMA_VERSION },
+            Column("deviceManufacturer") { Build.MANUFACTURER },
             Column("deviceModel") { Build.MODEL },
+            Column("deviceProduct") { Build.PRODUCT },
+            Column("softwareBuildId") { Build.ID },
+            Column("softwareBuildFingerprint") { Build.FINGERPRINT },
             Column("androidSdkInt") { Build.VERSION.SDK_INT },
             Column("androidRelease") { Build.VERSION.RELEASE },
             Column("captureCount") { it.captureRows.size },
@@ -2367,37 +2957,73 @@ class CaptureMetricsExcelExporter(
             Column("minRamAvailablePercent") { run ->
                 firstNodePreExecutionMetrics(run).minOfOrNull { metrics -> metrics.memorySnapshot.ramAvailablePercent }
             },
-            Column("admissionActiveObserved") { run -> run.admissionRows.any { row -> row.nodeRow.wasSkipped } },
-            Column("pacingDecisionsPresent") { it.pacingRows.isNotEmpty() },
-            Column("pacingActiveObserved") { run -> run.pacingRows.any { pacing -> pacing.before.appliedDelayMs > 0L } },
-            Column("armSignatureInferred") { armSignatureInferred(it) },
+            Column("admissionDecisionCount") { it.admissionRows.size },
+            Column("admissionSkipCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.wasSkipped }
+            },
+            Column("controllableOptionalDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == true }
+            },
+            Column("controllabilityUnknownDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == null }
+            },
+            Column("controllableOptionalAdmitCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                }
+            },
+            Column("controllableOptionalSkipCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasSkipped
+                }
+            },
+            Column("pacingDecisionCount") { it.pacingRows.size },
+            Column("nonzeroPacingDelayCount") { run ->
+                run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }
+            },
+            Column("observedActivitySignature") { observedActivitySignature(it) },
             Column("captureTimeoutMs") { MakerFeature.CAPTURE_TIMEOUT_MS },
             Column("staticGuardOverheatLevel") { STATIC_GUARD_OVERHEAT_LEVEL },
             Column("nearMissMarginMs") { NEAR_MISS_MARGIN_MS },
-            // Blank cells for the operator to annotate the authoritative arm/condition after pulling the workbook.
-            Column("armLabel") { "" },
-            Column("conditionLabel") { "" },
-            Column("trialId") { "" },
-            Column("notes") { "" },
         )
 
         /**
-         * One headline row per workbook: the same config keys as RunContext plus the safety, feature, cost, and
-         * correctness KPIs. Stack these rows across arm/condition runs to assemble the baseline vs proposed and the
-         * admission-only / pacing-only / full ablation comparison tables directly.
+         * One headline row per workbook. Join it with the supplied filename/test log when comparing policy arms.
          */
         private fun buildRunScorecardColumns(): List<Column<EvaluationRun>> = listOf(
+            Column("evaluationSchemaVersion") { EVALUATION_SCHEMA_VERSION },
+            Column("deviceManufacturer") { Build.MANUFACTURER },
             Column("deviceModel") { Build.MODEL },
+            Column("deviceProduct") { Build.PRODUCT },
+            Column("softwareBuildId") { Build.ID },
             Column("sizeBucketInferred") { sizeBucketInferred(it) },
             Column("targetConfigInferred") { targetConfigInferred(it) },
             Column("anyLowMemoryObserved") { run ->
                 firstNodePreExecutionMetrics(run).any { metrics -> metrics.memorySnapshot.isLowMemory }
             },
             Column("startingOverheatLevel") { overheatLevels(it).firstOrNull() },
-            Column("armSignatureInferred") { armSignatureInferred(it) },
-            Column("armLabel") { "" },
-            Column("conditionLabel") { "" },
+            Column("observedActivitySignature") { observedActivitySignature(it) },
             Column("captureCount") { it.captureRows.size },
+            Column("admissionDecisionCount") { it.admissionRows.size },
+            Column("admissionSkipCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.wasSkipped }
+            },
+            Column("controllableOptionalDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == true }
+            },
+            Column("controllabilityUnknownDecisionCount") { run ->
+                run.admissionRows.count { row -> row.nodeRow.isControllableOptionalDecision == null }
+            },
+            Column("controllableOptionalAdmitCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasAdmitted == true
+                }
+            },
+            Column("controllableOptionalSkipCount") { run ->
+                run.admissionRows.count { row ->
+                    row.nodeRow.isControllableOptionalDecision == true && row.nodeRow.wasSkipped
+                }
+            },
             // Safety.
             Column("timeoutCount") { run -> run.captureRows.count { capture -> capture.hasTimeoutFailure } },
             Column("timeoutRate") { run ->
@@ -2407,6 +3033,8 @@ class CaptureMetricsExcelExporter(
                 oneBasedFirstIndex(run.captureRows) { capture -> capture.hasTimeoutFailure }
             },
             Column("timeoutRightCensored") { run -> run.captureRows.none { capture -> capture.hasTimeoutFailure } },
+            Column("timeoutFreeAt30Captures") { timeoutFreeAtCaptureCount(it, 30) },
+            Column("failureFreeAt30Captures") { failureFreeAtCaptureCount(it, 30) },
             Column("watchdogFailureCount") { run -> run.captureRows.count { capture -> capture.hasWatchdogFailure } },
             Column("minTimeoutMarginMs") { run ->
                 run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs }.minOrNull()
@@ -2418,25 +3046,59 @@ class CaptureMetricsExcelExporter(
                 percentile(run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.50)
             },
             // Feature availability.
+            Column("featureEligibleCaptureCount") { it.featureEligibleCaptures.size },
+            Column("mBokehDecisionCount") { it.bokehRows.size },
+            Column("mBokehCompletedCount") { run -> run.bokehRows.count { row -> row.wasCompleted } },
             Column("mBokehCompletionRate") { run ->
                 rate(run.bokehRows.count { row -> row.wasCompleted }, run.bokehRows.size)
             },
             Column("mBokehCompletionLevelGE4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = true) },
             Column("mBokehCompletionLevelLT4Rate") { mCompletionRateAtLevel(it, atOrAboveGuard = false) },
+            Column("sFilterDecisionCount") { it.filterRows.size },
+            Column("sFilterCompletedCount") { run -> run.filterRows.count { row -> row.wasCompleted } },
             Column("sFilterCompletionRate") { run ->
                 rate(run.filterRows.count { row -> row.wasCompleted }, run.filterRows.size)
+            },
+            Column("fullFeatureSuccessCount") { run ->
+                run.captureRows.count { capture -> capture.isFullFeatureSuccess }
             },
             Column("fullFeatureSuccessRate") { run ->
                 rate(run.captureRows.count { capture -> capture.isFullFeatureSuccess }, run.featureEligibleCaptures.size)
             },
-            Column("guardFalsePositiveFixCount") { guardFalsePositiveFixCount(it) },
-            Column("guardFalseNegativeExposedCount") { guardFalseNegativeExposedCount(it) },
+            Column("mAndSCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_M_AND_S) },
+            Column("mAndSCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_M_AND_S) },
+            Column("mOnlyCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_M_ONLY) },
+            Column("mOnlyCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_M_ONLY) },
+            Column("sOnlyCompletedCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_S_ONLY) },
+            Column("sOnlyCompletedRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_S_ONLY) },
+            Column("mandatoryOnlyCount") { optionalWorkOutcomeCount(it, OPTIONAL_OUTCOME_MANDATORY_ONLY) },
+            Column("mandatoryOnlyRate") { optionalWorkOutcomeRate(it, OPTIONAL_OUTCOME_MANDATORY_ONLY) },
+            Column("offlineGuardRecoveryCandidateCount") { offlineGuardRecoveryCandidateCount(it) },
+            Column("offlineGuardBlindTimeoutCandidateCount") { offlineGuardBlindTimeoutCandidateCount(it) },
             // Cost.
             Column("meanShotToShotTimeMs") { run ->
-                mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+                mean(inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() })
             },
             Column("p95ShotToShotTimeMs") { run ->
-                percentile(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() }, 0.95)
+                percentile(
+                    inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
+                    0.95,
+                )
+            },
+            Column("p99ShotToShotTimeMs") { run ->
+                percentile(
+                    inSessionShotToShotTimesMs(run).map { intervalMs -> intervalMs.toDouble() },
+                    0.99,
+                )
+            },
+            Column("captureAcceptanceSpanMs") { captureAcceptanceSpanMs(it) },
+            Column("processingMakespanMs") { processingMakespanMs(it) },
+            Column("acceptanceRateWithinObservedSpanPerMinute") {
+                acceptanceRateWithinObservedSpanPerMinute(it)
+            },
+            Column("pacingDecisionCount") { it.pacingRows.size },
+            Column("nonzeroPacingDelayCount") { run ->
+                run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }
             },
             Column("nonzeroPacingDelayRate") { run ->
                 rate(run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }, run.pacingRows.size)
@@ -2447,34 +3109,37 @@ class CaptureMetricsExcelExporter(
             Column("p95AppliedPacingDelayMs") { run ->
                 percentile(run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() }, 0.95)
             },
-            // Correctness.
-            Column("unsafeAdmitCount") { run ->
-                run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT }
+            // RQ2 calibration headline; detailed denominators and sensitivity metrics live in RQ2Admission.
+            Column("exactWallUpperBoundObservationCount") { run ->
+                run.admissionRows.count { row -> row.exactWallUpperBoundSlackMs() != null }
             },
-            Column("observedInfeasibleAdmitDecisionCount") { run ->
-                run.admissionRows.count { row -> row.observedActualFeasible() == false }
+            Column("exactWallUpperBoundMissCount") { run ->
+                run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true }
             },
-            Column("likelyUnnecessarySkipDecisionCount") { run ->
-                run.admissionAuditRows.count { row ->
-                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
-                }
-            },
-            Column("likelyExcessivePacingDecisionCount") { run ->
-                run.pacingAuditRows.count { row ->
-                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
-                }
-            },
-            Column("likelyInsufficientPacingDecisionCount") { run ->
-                run.pacingAuditRows.count { row ->
-                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
-                }
+            Column("observedExactWallUpperBoundMissRate") { run ->
+                rate(
+                    run.admissionRows.count { row -> row.exactWallUpperBoundMiss() == true },
+                    run.admissionRows.count { row -> row.exactWallUpperBoundMiss() != null },
+                )
             },
             Column("sequenceUpperBoundMissCount") { run ->
                 run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
             },
+            Column("sequenceUpperBoundMissRate") { run ->
+                rate(
+                    run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true },
+                    run.admissionRows.count { row -> row.sequenceUpperBoundMiss() != null },
+                )
+            },
             Column("medianAbsolutePredictionErrorMs") { run ->
                 percentile(
-                    run.admissionRows.mapNotNull { row -> row.nodeRow.sequencePredictionResidualMs()?.let(::abs) },
+                    run.admissionRows.mapNotNull { row ->
+                        if (row.fullyObservedSequenceUpperBoundSlackMs() == null) {
+                            null
+                        } else {
+                            row.nodeRow.sequencePredictionResidualMs()?.let(::abs)
+                        }
+                    },
                     0.50,
                 )
             },
@@ -2503,13 +3168,13 @@ class CaptureMetricsExcelExporter(
             Column("isTimeout") { it.capture.row.hasTimeoutFailure },
             Column("timeoutMarginMs") { it.capture.row.timeoutMarginMs },
             Column("guardVsControllerCell") { guardBaselineCell(it.capture.row) },
-            Column("mRecoveredAtSuppressedLevel") { row ->
+            Column("offlineGuardRecoveryCandidate") { row ->
                 val capture = row.capture.row
                 val level = overheatLevelOf(capture)
                 level != null && level >= STATIC_GUARD_OVERHEAT_LEVEL &&
                     capture.bokehDecisionRow?.wasCompleted == true && !capture.hasTimeoutFailure
             },
-            Column("guardBlindTimeout") { row ->
+            Column("offlineGuardBlindTimeoutCandidate") { row ->
                 val capture = row.capture.row
                 val level = overheatLevelOf(capture)
                 level != null && level < STATIC_GUARD_OVERHEAT_LEVEL && capture.hasTimeoutFailure
@@ -2563,16 +3228,16 @@ class CaptureMetricsExcelExporter(
             return rate(eligible.count { it.bokehDecisionRow?.wasCompleted == true }, eligible.size)
         }
 
-        /** Captures where the guard would suppress M (level >= 4) but the controller ran it safely - the benefit. */
-        private fun guardFalsePositiveFixCount(run: EvaluationRun): Int =
+        /** Offline candidates where a level-4 guard suppresses M but the recorded controller ran it safely. */
+        private fun offlineGuardRecoveryCandidateCount(run: EvaluationRun): Int =
             run.captureRows.count { capture ->
                 val level = overheatLevelOf(capture)
                 level != null && level >= STATIC_GUARD_OVERHEAT_LEVEL &&
                     capture.bokehDecisionRow?.wasCompleted == true && !capture.hasTimeoutFailure
             }
 
-        /** Timeouts below level 4, where the static guard permits optional Draft and so would not have prevented them. */
-        private fun guardFalseNegativeExposedCount(run: EvaluationRun): Int =
+        /** Offline candidates where a timeout occurred below level 4, outside a pure level-4 guard's trigger. */
+        private fun offlineGuardBlindTimeoutCandidateCount(run: EvaluationRun): Int =
             run.captureRows.count { capture ->
                 val level = overheatLevelOf(capture)
                 level != null && level < STATIC_GUARD_OVERHEAT_LEVEL && capture.hasTimeoutFailure
@@ -2794,7 +3459,6 @@ class CaptureMetricsExcelExporter(
                     }
                 }
             }
-
             val primarySlackMs = admissionAuditPrimarySlackMs(row)
                 ?: return AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
             if (admissionAuditEvidenceAgreement(row) == false) {
@@ -3049,9 +3713,12 @@ class CaptureMetricsExcelExporter(
                 .sumOf { pacing -> pacing.before.appliedDelayMs }
 
         private fun absPredictionErrors(captures: List<EnrichedCaptureRow>): List<Double> =
-            captures.flatMap { capture -> capture.row.nodeRows }
-                .filter { row -> row.isAdmissionWorkload && row.prediction != null }
-                .mapNotNull { row -> row.sequencePredictionResidualMs()?.let(::abs) }
+            nodeSheetRows(captures)
+                .filter { row ->
+                    row.nodeRow.isAdmissionWorkload &&
+                        row.fullyObservedSequenceUpperBoundSlackMs() != null
+                }
+                .mapNotNull { row -> row.nodeRow.sequencePredictionResidualMs()?.let(::abs) }
 
         private fun dominantResolution(run: EvaluationRun): String? =
             run.captureRows.groupingBy { capture ->
@@ -3084,16 +3751,288 @@ class CaptureMetricsExcelExporter(
             }
         }
 
-        private fun armSignatureInferred(run: EvaluationRun): String {
+        private fun observedActivitySignature(run: EvaluationRun): String {
             val admissionActive = run.admissionRows.any { row -> row.nodeRow.wasSkipped }
             val pacingActive = run.pacingRows.any { pacing -> pacing.before.appliedDelayMs > 0L }
             return when {
-                admissionActive && pacingActive -> ARM_FULL
-                admissionActive -> ARM_ADMISSION_ONLY
-                pacingActive -> ARM_PACING_ONLY
-                else -> ARM_INACTIVE
+                admissionActive && pacingActive -> ACTIVITY_SKIP_AND_DELAY
+                admissionActive -> ACTIVITY_SKIP_ONLY
+                pacingActive -> ACTIVITY_DELAY_ONLY
+                else -> ACTIVITY_NO_TRIGGER
             }
         }
+
+        private fun buildEvaluationReadinessRows(run: EvaluationRun): List<EvaluationReadinessRow> {
+            val captureCount = run.captureRows.size
+            val deadlineSlackObservedCount =
+                run.captureRows.count { capture -> capture.timeoutMarginMs != null }
+            val featureEligibleCount = run.featureEligibleCaptures.size
+            val shotToShotObservedCount = inSessionShotToShotTimesMs(run).size
+            val exactWallEligibleCount = run.admissionRows.count { row ->
+                row.nodeRow.isControllableOptionalDecision == true &&
+                    row.nodeRow.wasAdmitted == true &&
+                    row.capture.metrics.timeoutTimestampMs != null
+            }
+            val exactWallObservedCount =
+                run.admissionRows.count { row -> row.exactWallUpperBoundSlackMs() != null }
+            val fullyObservedSequenceCount =
+                run.admissionRows.count { row -> row.fullyObservedSequenceUpperBoundSlackMs() != null }
+            val pacingCalibrationObservedCount =
+                draftSequencePacingErrorsMs(run).size + queuePricingErrorsMs(run).size
+            return listOf(
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1",
+                    metric = "Capture timeout, survival index, and deadline slack",
+                    status = when {
+                        captureCount == 0 -> "NO_CAPTURE_ROWS"
+                        deadlineSlackObservedCount == captureCount -> "AVAILABLE"
+                        deadlineSlackObservedCount > 0 -> "PARTIALLY_AVAILABLE"
+                        else -> "TIMEOUT_ONLY_NO_DEADLINE_SLACK"
+                    },
+                    evidenceSource = "Persisted shutter deadline and Draft completion " +
+                        "($deadlineSlackObservedCount/$captureCount rows with deadline slack)",
+                    limitation = "One workbook contains one newest burst session; missing deadlines cannot yield slack.",
+                    requiredAction = "Aggregate independent workbook sessions for rates, confidence intervals, and survival.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1",
+                    metric = "M/S utility",
+                    status = if (featureEligibleCount > 0) {
+                        "AVAILABLE_AS_EXECUTION_PROXY"
+                    } else {
+                        "NO_ELIGIBLE_ROWS"
+                    },
+                    evidenceSource = "Bokeh and Filter admit/completion observations " +
+                        "($featureEligibleCount eligible captures)",
+                    limitation = "Execution is not a perceptual image-quality measurement.",
+                    requiredAction = "Add a separate image-quality study if the paper claims visual equivalence.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1/RQ3",
+                    metric = "Shot-to-shot responsiveness and throughput",
+                    status = if (shotToShotObservedCount > 0) {
+                        "AVAILABLE"
+                    } else {
+                        "NO_WITHIN_SESSION_INTERVALS"
+                    },
+                    evidenceSource = "Within-session shot-to-shot intervals; first row excluded " +
+                        "($shotToShotObservedCount observed intervals)",
+                    limitation = "Requested pacing delay is not identical to total UI shutter-blocked time.",
+                    requiredAction = "Use a fixed-duration run and UI instrumentation for blocked-time claims.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1/RQ3",
+                    metric = "Assigned policy arm and one-sided compliance check",
+                    status = "EXTERNAL_MANIFEST_REQUIRED",
+                    evidenceSource = "Filename/manifest assignment plus observedActivitySignature and trigger counts",
+                    limitation = "Observed behavior cannot prove that an enabled mechanism was configured when it never " +
+                        "fired. Legacy Decoding rows without workloadSequenceKey have unknown controllability.",
+                    requiredAction = "Use the manifest as assignment; reject only forbidden positive triggers, never " +
+                        "require exact equality with observedActivitySignature. Exclude unknown-controllability rows " +
+                        "from optional-admit/skip contradiction checks.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1",
+                    metric = "Cross-device and thermal/memory robustness",
+                    status = if (firstNodePreExecutionMetrics(run).isNotEmpty()) {
+                        "AVAILABLE_AT_DRAFT_START"
+                    } else {
+                        "NO_STATE_ROWS"
+                    },
+                    evidenceSource = STATE_SAMPLING_DRAFT_START_SHARED,
+                    limitation = "A workbook is one session and node rows reuse the Draft-start snapshot; sessions that " +
+                        "inherit the same thermal trajectory are not independent.",
+                    requiredAction = "Block by device, resolution, memory protocol, and starting thermal level; preserve " +
+                        "the whole session and counterbalance arm order with cooldown.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ2",
+                    metric = "Exact-wall one-sided upper-bound calibration",
+                    status = when {
+                        exactWallEligibleCount == 0 -> "NO_ELIGIBLE_ADMITTED_ROWS"
+                        exactWallObservedCount == exactWallEligibleCount -> "AVAILABLE"
+                        exactWallObservedCount > 0 -> "PARTIALLY_AVAILABLE"
+                        else -> "NO_COMPLETE_WALL_ROWS"
+                    },
+                    evidenceSource = "Predicted sequence upper bound versus decision-to-Draft-end remaining wall " +
+                        "($exactWallObservedCount/$exactWallEligibleCount eligible controllable admitted decisions observed)",
+                    limitation = "Only a fully executed planned suffix is observed for the primary comparison. Missing " +
+                        "or later-skipped suffixes can be informative and are not missing at random.",
+                    requiredAction = "Report observed-case miss rate with incomplete count and the exported worst-case " +
+                        "sensitivity rate; cluster decisions within capture/session.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ2",
+                    metric = "Fully observed node-suffix predictor calibration",
+                    status = if (fullyObservedSequenceCount > 0) "AVAILABLE_SECONDARY" else "NO_COMPLETE_SUFFIX_ROWS",
+                    evidenceSource = "Predicted upper bound versus summed node durations " +
+                        "($fullyObservedSequenceCount plan-matched, fully observed controllable admits)",
+                    limitation = "Node-duration sums exclude inter-node gaps and scheduling, and skipped decisions are unobserved.",
+                    requiredAction = "Use as predictor calibration only; do not substitute it for exact-wall gate safety.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ2",
+                    metric = "Unnecessary skip ground truth",
+                    status = "UNAVAILABLE_WITHOUT_EXPLICIT_FORCED_FLAG",
+                    evidenceSource = "Exploratory matched-history proxy only",
+                    limitation = "A normal skipped stage has no factual execution cost; filename-level forced labels " +
+                        "cannot identify which decision was actually forced.",
+                    requiredAction = "If a forced audit is later required, persist decisionAdmit, actuallyExecuted, and " +
+                        "a node-level forcedExecution flag. Keep history matching as sensitivity only.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ3",
+                    metric = "Assigned-policy pacing effect",
+                    status = "CROSS_WORKBOOK_CONTRAST_REQUIRED",
+                    evidenceSource = "Session outcomes from Always-on, Admission-only, Pacing-only, and Full files",
+                    limitation = "Full minus Admission-only is the total effect of enabling pacing with admission on; " +
+                        "pacing may change later admission decisions.",
+                    requiredAction = "Randomize arms within condition blocks for ITT. Otherwise label the result a " +
+                        "controlled assigned-policy contrast. Report Full-Admission-only, Pacing-only-Always-on, and " +
+                        "their interaction.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ3",
+                    metric = "Pacing mechanism diagnostics",
+                    status = if (pacingCalibrationObservedCount > 0) {
+                        "AVAILABLE"
+                    } else {
+                        "NO_CALIBRATION_ROWS"
+                    },
+                    evidenceSource = "Recorded delay, backlog, queue wait, Draft wall, and timeout outcome " +
+                        "($pacingCalibrationObservedCount calibration observations)",
+                    limitation = "Excessive/insufficient verdicts are structural diagnostics, not an optimal-delay oracle.",
+                    requiredAction = "Use these diagnostics to debug the controller, not to claim d* optimality.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ3",
+                    metric = "Fixed-duration exposure completion",
+                    status = "EXTERNAL_PROTOCOL_LOG_REQUIRED",
+                    evidenceSource = "No fixed-duration protocol timer in persisted capture metrics",
+                    limitation = "Acceptance span is not the protocol timer and cannot prove the requested exposure ran.",
+                    requiredAction = "Supply the intended/actual test duration with the workbook.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ3",
+                    metric = "Minimum-delay oracle and per-decision under/overpace correctness",
+                    status = "OUT_OF_SCOPE_WITH_CURRENT_DATA",
+                    evidenceSource = PACING_ORACLE_NONE,
+                    limitation = "Changing a delay changes later arrivals, admission, queue, and thermal state.",
+                    requiredAction = "Attribute deadline and throughput differences only through assigned-arm contrasts; " +
+                        "add validated closed-loop replay only if minimum-delay optimality becomes a separate claim.",
+                ),
+                EvaluationReadinessRow(
+                    researchQuestion = "RQ1",
+                    metric = "Controller overhead, preview frames, and UI regression",
+                    status = "UNAVAILABLE",
+                    evidenceSource = "Node CPU/GC metrics do not isolate controller overhead",
+                    limitation = "The current store has no decision latency, controller allocation, or frame timeline.",
+                    requiredAction = "Measure with Perfetto/frame metrics and a controller-off paired run.",
+                ),
+            )
+        }
+
+        private fun buildEvaluationReadinessColumns(): List<Column<EvaluationReadinessRow>> = listOf(
+            Column("researchQuestion") { it.researchQuestion },
+            Column("metric") { it.metric },
+            Column("status") { it.status },
+            Column("evidenceSource") { it.evidenceSource },
+            Column("limitation") { it.limitation },
+            Column("requiredAction") { it.requiredAction },
+        )
+
+        private fun buildMetricDefinitions(): List<ReplayNote> = listOf(
+            ReplayNote(
+                topic = "evaluationSchemaVersion",
+                note = "Schema 2 is the first three-RQ export layout. Do not pool it with older workbooks by column " +
+                    "position; join by explicit column name and keep older schema rows in a separately mapped cohort.",
+            ),
+            ReplayNote(
+                topic = "acceptedUptimeMs",
+                note = "timeoutDeadlineUptimeMs - current captureTimeoutMs. Valid for newly exported runs whose " +
+                    "runtime timeout matches the exporter constant; do not use it to compare historical DB rows " +
+                    "recorded under a different timeout.",
+            ),
+            ReplayNote(
+                topic = "completionLatencyMs",
+                note = "draftEndUptimeMs - acceptedUptimeMs",
+            ),
+            ReplayNote(
+                topic = "timeoutMarginMs",
+                note = "timeoutDeadlineUptimeMs - draftEndUptimeMs; positive means deadline slack.",
+            ),
+            ReplayNote(
+                topic = "admissionDecisionUptimeMs",
+                note = "timeoutDeadlineUptimeMs - decisionBudgetMs; nodeStartUptimeMs is a labelled legacy fallback.",
+            ),
+            ReplayNote(
+                topic = "observedRemainingWallMs",
+                note = "draftEndUptimeMs - admissionDecisionUptimeMs. Includes decision overhead, inter-node gaps, " +
+                    "scheduling, and the mandatory tail. Exported only for recorded admitted decisions.",
+            ),
+            ReplayNote(
+                topic = "plannedSuffixKeyMatch",
+                note = "Exact equality between the decision-time workloadSequenceKey list and the later profiled " +
+                    "workload-key suffix. False exposes a later skip/configuration change; blank means the comparison " +
+                    "cannot be reconstructed. Primary RQ2 coverage additionally requires every matched node to finish.",
+            ),
+            ReplayNote(
+                topic = "exactWallUpperBoundSlackMs",
+                note = "sequencePredictedUpperBoundMs - observedRemainingWallMs, only when the persisted deadline " +
+                    "reconstructs the exact decision instant and every node in the admitted controllable decision's " +
+                    "planned suffix completed. Negative means the one-sided bound under-covered the realized wall cost.",
+            ),
+            ReplayNote(
+                topic = "sequenceUpperBoundSlackMs",
+                note = "sequencePredictedUpperBoundMs - summed recorded suffix node durations. Exported only for a " +
+                    "fully observed controllable admitted suffix; it excludes inter-node gaps and scheduling and is " +
+                    "secondary predictor calibration rather than end-to-end gate safety.",
+            ),
+            ReplayNote(
+                topic = "controllableAdmittedDecisionWithSuffixWatchdogTimeoutCount",
+                note = "Counts controllable admitted decisions whose recorded suffix contains any watchdog timeout. " +
+                    "It is not a distinct watchdog-event count: one downstream timeout can be included in several " +
+                    "earlier admitted decisions.",
+            ),
+            ReplayNote(
+                topic = "captureAcceptanceSpanMs",
+                note = "last capture acceptedUptimeMs - first capture acceptedUptimeMs in session order. Blank when " +
+                    "either endpoint is missing, so an interior subset is never presented as the whole-burst span.",
+            ),
+            ReplayNote(
+                topic = "processingMakespanMs",
+                note = "latest Draft completion - first capture acceptance, but only when every capture in the " +
+                    "session has a completion timestamp. Otherwise blank to avoid understating burst completion time.",
+            ),
+            ReplayNote(
+                topic = "acceptanceRateWithinObservedSpanPerMinute",
+                note = "(captureCount - 1) * 60000 / captureAcceptanceSpanMs only when every capture has an " +
+                    "acceptance timestamp. Blank with incomplete timestamp coverage. This is the observed-span rate, " +
+                    "not a fixed-duration protocol rate.",
+            ),
+            ReplayNote(
+                topic = "optionalWorkOutcome",
+                note = "M+S, M-only, S-only, or mandatory-only from observed Bokeh(M) and Filter(S) completion.",
+            ),
+            ReplayNote(
+                topic = "observedActivitySignature",
+                note = "Behavior-only summary from positive triggers: at least one admission skip and/or nonzero " +
+                    "pacing delay. The filename/manifest remains the assigned arm. A forbidden positive trigger is a " +
+                    "contradiction, but a configured mechanism that never fires is inconclusive.",
+            ),
+            ReplayNote(
+                topic = "controllableOptionalDecision",
+                note = "True for admission-controlled optional work and false for mandatory Frame-Watermark Decoding. " +
+                    "Legacy Decoding rows without workloadSequenceKey are blank/unknown and are excluded from " +
+                    "controllableOptionalAdmitCount and controllableOptionalSkipCount.",
+            ),
+            ReplayNote(
+                topic = "controllerRequirementDiagnostic",
+                note = "Controller-formula diagnostic from recorded budget overruns and pacing backlog deficit. It is " +
+                    "not an oracle classification of which mechanism was truly required and must not be used as " +
+                    "ground truth for admission or pacing correctness.",
+            ),
+        )
 
         private fun buildEvaluationNotes(): List<ReplayNote> = listOf(
             ReplayNote(
@@ -3101,13 +4040,13 @@ class CaptureMetricsExcelExporter(
                 note = "Each export evaluates the newest burst session: captures are split wherever ppSequenceId " +
                     "restarts at 0 or a capture has no shot-to-shot time, and the last group is the evaluated run. " +
                     "wholeBurstSessionEvaluated is false when retention dropped the head of that burst, so its " +
-                    "opening shots are missing. The exporter does not attach manually configured environment " +
-                    "labels; record the test condition in the exported file name after pulling it.",
+                    "opening shots are missing. Controlled policy and condition labels come from the supplied " +
+                    "workbook filename/test log.",
             ),
             ReplayNote(
                 topic = "RQ1 safety outcome",
                 note = "Timeout and watchdog failures are separate outcomes. firstTimeoutCaptureNumber is right " +
-                    "censored at captureCount when timeoutRightCensored is true.",
+                    "censored at captureCount during analysis when timeoutRightCensored is true.",
             ),
             ReplayNote(
                 topic = "RQ1 feature outcome",
@@ -3116,33 +4055,37 @@ class CaptureMetricsExcelExporter(
                     "proxy, not a perceptual image-quality score.",
             ),
             ReplayNote(
-                topic = "RQ2 cost outcome",
-                note = "Shot-to-shot and applied pacing delay distributions quantify user-visible pacing cost. " +
-                    "Skip counts separate admission-related feature loss from pacing-related waiting.",
+                topic = "RQ1 responsiveness outcome",
+                note = "Shot-to-shot distributions exclude the first row because it may contain the gap from the " +
+                    "previous burst. Capture span, processing makespan, throughput, and requested pacing delay must " +
+                    "be read beside safety and M/S retention; requested delay is not a direct UI blocked-time trace.",
             ),
             ReplayNote(
-                topic = "RQ3 prediction outcome",
-                note = "Upper-bound coverage uses only fully observed suffixes. Online skips have no actual workload " +
-                    "duration, so unnecessary-skip claims require shadow execution or a separate offline oracle.",
+                topic = "RQ2 one-sided upper-bound calibration",
+                note = "The primary metric compares sequencePredictedUpperBoundMs with exact decision-to-Draft-end " +
+                    "remaining wall cost for controllable admitted decisions whose persisted deadline reconstructs the " +
+                    "decision instant and whose planned suffix fully executed. This tests the safety bound independently " +
+                    "of whether the later capture deadline was missed. Report observed-case coverage, incomplete " +
+                    "eligible decisions, and the worst-case rate that treats incomplete or changed suffixes as misses. " +
+                    "The sequence-sum metrics use the same fully observed controllable population and are secondary " +
+                    "predictor calibration because they omit gaps and scheduling.",
             ),
             ReplayNote(
-                topic = "RQ3 skip oracle",
+                topic = "RQ2 skip sensitivity proxy",
                 note = "previousSkipCounterfactualSlackMs prices every workload a capture skipped from the most " +
                     "recent earlier capture that actually ran that workload key, then asks whether the capture " +
-                    "would still have met its own deadline: positive slack means the skip bought that capture " +
-                    "nothing. Earlier observations only, so the estimate uses nothing the controller could not have " +
-                    "had. It restores the work into that one capture only, so it cannot see the queue the " +
-                    "restored work would have left for later shots - that cross-shot cost is what pacing absorbs, " +
-                    "so read previousOwnDeadlineUnnecessarySkipRate together with the RQ2 delay columns before " +
-                    "calling a skip wrong. Skips with no earlier observation stay unpriced and are excluded from " +
-                    "the rate. The next-observation columns are sensitivity only and are usually blank: sticky " +
-                    "demotion means a skipped workload does not run again in the same burst.",
+                    "would still have met its own deadline. It can mix earlier thermal/content conditions and cannot " +
+                    "recreate gaps, watchdogs, future queue, or thermal effects. Skips with no earlier observation are " +
+                    "excluded, so always report historyProxyCoverageRate. Treat every historyProxy result as " +
+                    "exploratory sensitivity, never factual unnecessary-skip ground truth.",
             ),
             ReplayNote(
                 topic = "AdmissionDecisionAudit",
-                note = "Admitted rows are scored factually from the fully observed suffix. For skipped rows, the " +
-                    "primary retrospective evidence is the most recent earlier execution of the same workload; an " +
-                    "earlier fully observed row with the exact workloadSequenceKey is preferred because its actual " +
+                note = "Admitted rows expose factual remaining wall and upper-bound coverage. Every skipped row " +
+                    "requires an explicit audit for factual scoring; duration presence is never interpreted as proof " +
+                    "of forced execution. The exploratory retrospective evidence uses the most recent earlier " +
+                    "execution of the same workload; an earlier fully observed row with the exact workloadSequenceKey " +
+                    "is preferred because its actual " +
                     "suffix can be compared directly with the skipped decision's budget. The closest later " +
                     "observation is sensitivity evidence only: disagreement marks a transition as uncertain. The " +
                     "recent-three median exposes one-sample GC/contention sensitivity. Evidence may come from the " +
@@ -3150,7 +4093,8 @@ class CaptureMetricsExcelExporter(
                     "Under sticky demotion a skipped workload never runs again in the burst, so the later-" +
                     "observation columns and the uncertain-transition verdict are usually empty by construction - " +
                     "they fill in only for a skip the controller recovered from. Confidence is therefore graded on " +
-                    "the earlier evidence: exact-sequence and comparable context is High. contextComparable is only " +
+                    "the earlier evidence: exact-sequence and comparable context is High for the local proxy only. " +
+                    "contextComparable is only " +
                     "a coarse screen of thermal and memory state (overheat delta <= 1, thermal-headroom delta <= " +
                     "0.25, same low-memory state, RAM delta <= 10 percentage points); it deliberately ignores queue " +
                     "depth, because the comparison is against the skipped decision's own budget and that budget " +
@@ -3158,17 +4102,15 @@ class CaptureMetricsExcelExporter(
                     "local decision audit, not the closed-loop outcome of changing the burst.",
             ),
             ReplayNote(
-                topic = "RQ2 delay adequacy",
-                note = "RQ2 prices what pacing cost; whether each delay was the right call is graded in RQ3 with " +
-                    "the admit and skip verdicts. No column proves a delay was the right size either way: changing " +
-                    "one delay changes every later arrival, which needs a closed-loop replay. A persisted pacing " +
-                    "decision is consumed by the same capture row's draft start, so the observable factual outcome " +
-                    "is that row's timeout margin. p05PacedCaptureMarginMs in the near-miss band means paced " +
-                    "captures did not get enough headroom; medianPacedCaptureMarginMs far above " +
-                    "medianUnpacedCaptureMarginMs means shutter time bought headroom the deadline did not need - " +
-                    "but the two groups are selected, not assigned, since a delay is charged exactly when the queue " +
-                    "is deep. emptyPipelineDelayCount must stay 0 - a delay with nothing queued and nothing in " +
-                    "flight has no backlog to drain.",
+                topic = "RQ3 assigned-policy effect",
+                note = "The causal unit is the assigned session arm, not whether an individual delay happened. " +
+                    "Full minus Admission-only estimates the total effect of enabling pacing with admission on, " +
+                    "including pacing-mediated changes to later admission. Pacing-only minus Always-on estimates the " +
+                    "effect with admission off; their difference is the admission-by-pacing interaction. Call these " +
+                    "ITT contrasts only when arms were assigned before the session and randomized within condition " +
+                    "blocks. Blocking or counterbalancing without random assignment supports a controlled " +
+                    "assigned-policy contrast, not a causal ITT claim. Within-arm paced-versus-unpaced rows remain " +
+                    "selected diagnostics.",
             ),
             ReplayNote(
                 topic = "PacingDecisionAudit",
@@ -3191,38 +4133,95 @@ class CaptureMetricsExcelExporter(
                     "(firstMBokehSkipCaptureNumber, firstNonzeroPacingDelayCaptureNumber), and everything after " +
                     "them is a different regime. The 5-capture row is the window most users actually reach, so a " +
                     "controller that keeps M and zero delay for five shots at overheat level 5 reads as a success " +
-                    "there even when the 30-capture row shows heavy skipping.",
+                    "there even when the 30-capture row shows heavy skipping. Retention-truncated sessions remain " +
+                    "diagnostic only: confirmatoryPrefixEligible is false, and 30-capture success fields are blank.",
             ),
             ReplayNote(
-                topic = "RQ3 transition outcome",
-                note = "RQ3Timeline aligns thermal, memory, prediction, admission, pacing, and deadline outcomes by " +
-                    "trial capture number to analyze cold start and throttle ramps.",
+                topic = "SessionTimeline robustness support",
+                note = "SessionTimeline aligns thermal, memory, prediction, admission, pacing, and deadline outcomes " +
+                    "by trial capture number. It supports RQ1 cold-start and throttle-ramp analysis; it is not an " +
+                    "independent fourth research question.",
             ),
             ReplayNote(
                 topic = "Cross-session statistics",
                 note = "Aggregate rates, confidence intervals, and time-to-first-timeout survival analysis must use " +
-                    "each exported workbook/session as the independent unit, not individual captures.",
+                    "each exported workbook/session as the independent unit, not individual captures. For zero " +
+                    "timeouts, report exposure and a session-level upper bound (the rough 95% rule-of-three is 3/n). " +
+                    "A pooled bound applies only to the prespecified device/condition mixture; per-device or per-level " +
+                    "claims require stratum-specific exposure.",
+            ),
+            ReplayNote(
+                topic = "Required policy arms",
+                note = "The balanced 2x2 core is Always-on (admission off/pacing off), Admission-only (on/off), " +
+                    "Pacing-only (off/on), and Full (on/on). Run actual Static-L4 as the primary production baseline; " +
+                    "Mandatory-only is a targeted diagnostic rather than a full-factorial arm. GuardBaseline cannot " +
+                    "replace a Static-L4 run because policy changes alter later queue and thermal trajectories.",
+            ),
+            ReplayNote(
+                topic = "Condition matrix",
+                note = "Within each device, cross 12MP/24MP with normal/memory pressure so resolution and memory " +
+                    "effects are not confounded. Treat starting thermal level as a blocked stratum, preserve the full " +
+                    "thermal trajectory in one session, and report per-device results before any pooled model. The " +
+                    "number of independent devices limits generalization across devices.",
+            ),
+            ReplayNote(
+                topic = "Required arrival protocols",
+                note = "Use both fixed-count bursts (for 30-capture success, first-timeout survival, M/S retention, " +
+                    "and completion time) and fixed-duration saturation (for sustained throughput). Keep one " +
+                    "workbook per independent session, randomize policy order within a condition, and do not split a " +
+                    "single burst when its overheat level changes. Supply fixed-duration protocol timing with the file.",
+            ),
+            ReplayNote(
+                topic = "Exposure allocation",
+                note = "Use a balanced or power-based confirmatory core for arm differences, especially Full versus " +
+                    "Static-L4, then add a Full-only reliability extension for an absolute zero-failure bound. A large " +
+                    "Full sample cannot compensate for a tiny comparator sample when estimating superiority. Mark the " +
+                    "extension as a separate analysis cohort; do not automatically pool it into the balanced 2x2 " +
+                    "contrast if it was collected at a different time or condition mix.",
+            ),
+            ReplayNote(
+                topic = "External manifest join contract",
+                note = "Join exactly one manifest row to each workbook by its immutable full filename. Record trialId, " +
+                    "randomizationBlockId, sessionOrder, assignedPolicyArm, assignedAdmission, assignedPacing, " +
+                    "conditionId, targetStartingThermalLevel, memoryProtocol, resolutionTarget, arrivalProtocol, " +
+                    "plannedCaptureCount, plannedDurationMs, actualProtocolDurationMs, analysisCohort, " +
+                    "deviceInstanceId, softwareBuildId, and whether assignment was recorded before the session. " +
+                    "Reject duplicate filenames and assignment/count contradictions before analysis.",
             ),
             ReplayNote(
                 topic = "RunContext and RunScorecard",
-                note = "RunContext self-describes this workbook (device, resolution, size bucket, starting and " +
-                    "observed overheat, memory, inferred target config and controller arm) so several workbooks can " +
-                    "be aggregated without parsing file names. RunScorecard is one headline row per workbook with the " +
-                    "same config keys plus safety, feature, cost, and correctness KPIs; stack RunScorecard rows " +
-                    "across arm and condition runs to build the baseline-vs-proposed and the admission-only / " +
-                    "pacing-only / full ablation tables. armSignatureInferred is derived from behavior only (a skip " +
-                    "implies admission ran, a nonzero delay implies pacing ran) and cannot distinguish an inactive " +
-                    "mechanism from an active one that never triggered, so set armLabel and conditionLabel " +
-                    "explicitly for the authoritative arm.",
+                note = "RunContext records observed device/build, resolution, size bucket, thermal/memory state, " +
+                    "inferred target config, trigger counts, and observed activity. RunScorecard is one headline row " +
+                    "per workbook with safety, feature, cost, and calibration numerators/denominators. Join these rows " +
+                    "with the filename/manifest assignment. observedActivitySignature is behavior-only: forbidden " +
+                    "positive triggers are contradictions, while an enabled mechanism that never triggered is " +
+                    "inconclusive.",
+            ),
+            ReplayNote(
+                topic = "Manifest arm compliance rules",
+                note = "Always-on contradicts any controllable optional skip or nonzero pacing delay; Admission-only " +
+                    "contradicts a nonzero delay; Pacing-only contradicts a controllable optional skip. Full permits " +
+                    "every observed trigger and cannot be verified by absence. Mandatory-only contradicts any " +
+                    "controllable optional admit or nonzero delay. Static-L4 contradicts nonzero adaptive pacing and " +
+                    "must be checked separately against the level-4 rule. Apply optional admit/skip checks only where " +
+                    "controllableOptionalDecision is true; unknown rows are inconclusive. A missing allowed trigger " +
+                    "is always inconclusive, not a mismatch.",
+            ),
+            ReplayNote(
+                topic = "Static-L4 compliance",
+                note = "Check each known-controllable decision against the same draft-start overheat snapshot used by " +
+                    "the runtime baseline. A pure per-decision L4 policy contradicts admit at level >= 4 or skip below " +
+                    "4. If the actual baseline intentionally keeps a sticky demotion after reaching L4, declare that " +
+                    "variant in the manifest and do not treat a later below-4 skip as a contradiction.",
             ),
             ReplayNote(
                 topic = "GuardBaseline (static-guard counterfactual)",
                 note = "Contrasts the production static thermal guard (skip optional Draft at overheat level >= 4, " +
                     "Section 2.4) with the controller's per-capture decision and the deadline outcome. " +
-                    "guardVsControllerCell classifies each capture; mRecoveredAtSuppressedLevel counts the benefit " +
-                    "(M ran safely where the guard forbids it) and guardBlindTimeout counts timeouts below level 4 " +
-                    "that the guard alone would not have prevented. This is an offline counterfactual over the " +
-                    "recorded overheat level, not a separate on-device guard run.",
+                    "guardVsControllerCell classifies each capture; offlineGuardRecoveryCandidate marks where M ran " +
+                    "safely despite the threshold, and offlineGuardBlindTimeoutCandidate marks a timeout below level " +
+                    "4. These are candidates from the recorded trajectory, not outcomes of a separate on-device " +
+                    "Static-L4 run.",
             ),
             ReplayNote(
                 topic = "FailureAttribution (ablation necessity)",
@@ -3230,8 +4229,9 @@ class CaptureMetricsExcelExporter(
                     "primaryCause and mechanismResponsible attribute the binding constraint to Pacing (cross-shot " +
                     "backlog), Admission (single-capture budget overrun), Predictor (upper-bound miss), or " +
                     "Environment (throttle). Admission-only runs should retain residual Pacing failures and " +
-                    "pacing-only runs residual Admission failures; that separation is the evidence that both " +
-                    "mechanisms are necessary. Precedence: backlog, then overrun, then upper-bound miss, then throttle.",
+                    "pacing-only runs residual Admission failures. This sheet is diagnostic attribution, not a " +
+                    "replacement for actual policy-arm runs. Precedence: backlog, then overrun, then upper-bound " +
+                    "miss, then throttle.",
             ),
         )
 
@@ -3375,14 +4375,22 @@ class CaptureMetricsExcelExporter(
             Column("") { "" },
             Column("beforeCaptureTimedOut") { it.capture.hasTimeoutFailure },
             Column("beforeCaptureWatchdogFailed") { it.capture.hasWatchdogFailure },
+            Column("beforeAdmittedSuffixWatchdogTimedOut") { it.admittedSuffixWatchdogTimedOut() },
             Column("beforeNodeDurationMs") { it.nodeRow.nodeActualDurationMs },
             Column("beforeSequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },
             Column("beforeSuffixFullyObserved") { it.isFullyObservedSuffix() },
-            Column("beforeObservedActualFeasible") { it.observedActualFeasible() },
+            Column("beforePlannedSuffixKeyMatch") { it.plannedSuffixKeyMatch() },
+            Column("beforePlannedSuffixFullyExecuted") { it.plannedSuffixFullyExecuted() },
+            Column("beforeDecisionUptimeMs") { it.decisionUptimeMs() },
+            Column("beforeObservedRemainingWallMs") { it.observedRemainingWallMs() },
+            Column("beforeExactWallUpperBoundSlackMs") { it.exactWallUpperBoundSlackMs() },
+            Column("beforeExactWallUpperBoundMiss") { it.exactWallUpperBoundMiss() },
+            Column("beforeAdmissionGroundTruthSource") { it.admissionGroundTruthSource() },
+            Column("beforeCaptureDeadlineFeasibleShared") { it.observedActualFeasible() },
             Column("beforeDecisionOutcome") { it.decisionOutcomeLabel() },
             Column("beforeDecisionObservationStatus") { it.observationStatus() },
             Column("beforeSequencePredictionResidualMs") { it.nodeRow.sequencePredictionResidualMs() },
-            Column("beforeSequenceUpperBoundSlackMs") { it.nodeRow.sequenceUpperBoundSlackMs() },
+            Column("beforeSequenceUpperBoundSlackMs") { it.fullyObservedSequenceUpperBoundSlackMs() },
             Column("beforeSequenceUpperBoundMiss") { it.sequenceUpperBoundMiss() },
             Column("") { "" },
             Column("isLowMemory") { it.nodeRow.node.preExecutionMetrics.memorySnapshot.isLowMemory },
@@ -3427,10 +4435,12 @@ class CaptureMetricsExcelExporter(
             Column("sessionCaptureIndex") { it.sessionSummary.sessionCaptureIndex },
             Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
             Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
+            Column("acceptedUptimeMs") { it.row.acceptedUptimeMs },
             Column("firstNodeStartUptimeMs") { it.row.firstNodeStartUptimeMs },
             Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
             Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
             Column("draftWallMs") { it.row.draftWallMs },
+            Column("completionLatencyMs") { it.row.completionLatencyMs },
             // Deadline minus draft end - the pacing outcome each counterfactual delay is scored against.
             Column("timeoutMarginMs") { it.row.timeoutMarginMs },
             Column("beforeDraftSequenceDurationMs") { it.row.draftSequenceDurationMs },
@@ -3584,6 +4594,7 @@ class CaptureMetricsExcelExporter(
             Column("delayDeltaMs") { it.row.pacingReplay?.delayDeltaMs },
             Column("pacingChanged") { it.row.pacingReplay?.pacingChanged },
             Column("afterOutcomeStatus") { it.row.pacingReplay?.afterOutcomeStatus },
+            Column("controllerRequirementDiagnostic") { controllerRequirementDiagnostic(it.row) },
         )
 
         private fun buildReplayNotes(): List<ReplayNote> = listOf(
@@ -3685,11 +4696,15 @@ class CaptureMetricsExcelExporter(
             Column("") { "" },
             // Capture timeline: replay anchors plus the timeout margin the pacing policy is scored against.
             Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
+            Column("acceptedUptimeMs") { it.row.acceptedUptimeMs },
             Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
             Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
             Column("draftWallMs") { it.row.draftWallMs },
+            Column("completionLatencyMs") { it.row.completionLatencyMs },
             Column("timeoutMarginMs") { it.row.timeoutMarginMs },
             Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
+            Column("optionalWorkOutcome") { optionalWorkOutcome(it.row) },
+            Column("controllerRequirementDiagnostic") { controllerRequirementDiagnostic(it.row) },
             Column("") { "" },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("sessionShotCount") { it.sessionSummary.sessionShotCount },
@@ -3725,6 +4740,7 @@ class CaptureMetricsExcelExporter(
             Column("") { "" },
             Column("budgetMs") { it.nodeRow.node.preExecutionMetrics.budgetMs },
             Column("admit") { it.nodeRow.prediction?.admit },
+            Column("controllableOptionalDecision") { it.nodeRow.isControllableOptionalDecision },
             Column("admissionSkipReason") { it.admissionSkipReason() },
             Column("admissionMarginMs") { sheetRow ->
                 sheetRow.nodeRow.prediction?.let { prediction ->
@@ -3735,17 +4751,26 @@ class CaptureMetricsExcelExporter(
             Column("durationMs") { it.nodeRow.nodeActualDurationMs },
             Column("watchdogTimeoutMs") { it.nodeRow.node.watchdogTimeoutMs },
             Column("watchdogTimedOut") { it.nodeRow.node.watchdogTimedOut },
+            Column("admittedSuffixWatchdogTimedOut") { it.admittedSuffixWatchdogTimedOut() },
             Column("admissionStage") { it.admissionStage() },
             Column("decisionOutcome") { it.decisionOutcomeLabel() },
             Column("decisionObservationStatus") { it.observationStatus() },
-            Column("observedActualFeasible") { it.observedActualFeasible() },
+            Column("decisionUptimeMs") { it.decisionUptimeMs() },
+            Column("observedRemainingWallMs") { it.observedRemainingWallMs() },
+            Column("exactWallUpperBoundSlackMs") { it.exactWallUpperBoundSlackMs() },
+            Column("exactWallUpperBoundMiss") { it.exactWallUpperBoundMiss() },
+            Column("admissionGroundTruthSource") { it.admissionGroundTruthSource() },
+            Column("captureDeadlineFeasibleShared") { it.observedActualFeasible() },
             Column("") { "" },
             Column("workloadSequenceKey") { it.nodeRow.prediction?.workloadSequenceKey },
             Column("sequencePredictedDurationMs") { it.nodeRow.prediction?.sequencePredictedDurationMs },
             Column("sequencePredictedUpperBoundMs") { it.nodeRow.prediction?.sequencePredictedUpperBoundMs },
             Column("sequenceActualDurationMs") { it.nodeRow.sequenceActualDurationMs },
+            Column("suffixFullyObserved") { it.isFullyObservedSuffix() },
+            Column("plannedSuffixKeyMatch") { it.plannedSuffixKeyMatch() },
+            Column("plannedSuffixFullyExecuted") { it.plannedSuffixFullyExecuted() },
             Column("sequencePredictionResidualMs") { it.nodeRow.sequencePredictionResidualMs() },
-            Column("sequenceUpperBoundSlackMs") { it.nodeRow.sequenceUpperBoundSlackMs() },
+            Column("sequenceUpperBoundSlackMs") { it.fullyObservedSequenceUpperBoundSlackMs() },
             Column("sequenceUpperBoundMiss") { it.sequenceUpperBoundMiss() },
         )
 
