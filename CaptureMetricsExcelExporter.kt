@@ -48,6 +48,14 @@ class CaptureMetricsExcelExporter(
         val timelineRows: List<EvaluationTimelineRow> = captures.mapIndexed { index, capture ->
             EvaluationTimelineRow(index + 1, capture, this)
         }
+
+        // Both audits pair every decision with its matching observations, so they are quadratic in decisions and
+        // every aggregate column reads the same rows. Built once per run, and only for the runs that ask: the
+        // BurstPrefix windows are runs too, and they never touch the audits.
+        val admissionAuditRows: List<AdmissionDecisionAuditRow> by lazy {
+            buildAdmissionDecisionAuditRows(this)
+        }
+        val pacingAuditRows: List<PacingDecisionAuditRow> by lazy { buildPacingDecisionAuditRows(this) }
     }
 
     private class EvaluationTimelineRow(
@@ -205,8 +213,8 @@ class CaptureMetricsExcelExporter(
             val failureAttributionRows = evaluationRun.timelineRows
                 .filter { row -> isFailureOrNearMiss(row.capture.row) }
             val prefixWindowRows = prefixWindowRows(replayCaptures)
-            val admissionDecisionAuditRows = buildAdmissionDecisionAuditRows(evaluationRun)
-            val pacingDecisionAuditRows = buildPacingDecisionAuditRows(evaluationRun)
+            val admissionDecisionAuditRows = evaluationRun.admissionAuditRows
+            val pacingDecisionAuditRows = evaluationRun.pacingAuditRows
 
             writeSheet(
                 workbook,
@@ -297,6 +305,8 @@ class CaptureMetricsExcelExporter(
                 "AdmissionDecisionAudit",
                 admissionDecisionAuditRows,
                 buildAdmissionDecisionAuditColumns(),
+                // Read by filtering on a verdict, so every column carries a title and the autofilter survives.
+                optimizeColumnWidths = true,
             )
             writeSheet(
                 workbook,
@@ -304,6 +314,7 @@ class CaptureMetricsExcelExporter(
                 "PacingDecisionAudit",
                 pacingDecisionAuditRows,
                 buildPacingDecisionAuditColumns(),
+                optimizeColumnWidths = true,
             )
             writeSheet(workbook, styles, "ReplayNotes", buildReplayNotes(), buildReplayNoteColumns())
 
@@ -1148,6 +1159,17 @@ class CaptureMetricsExcelExporter(
             }
         }
 
+        /** Decision-time order: earlier capture first, then earlier node inside the same capture. */
+        private fun decisionOrderCompare(
+            left: AdmissionAuditObservation,
+            right: AdmissionAuditObservation,
+        ): Int = compareValuesBy(
+            left,
+            right,
+            { observation -> observation.trialCaptureNumber },
+            { observation -> observation.sheetRow.nodeOrder },
+        )
+
         private fun buildAdmissionDecisionAuditRows(run: EvaluationRun): List<AdmissionDecisionAuditRow> {
             val observations = run.captureRows.flatMapIndexed { captureIndex, capture ->
                 capture.nodeRows.mapIndexed { nodeIndex, nodeRow ->
@@ -1163,16 +1185,19 @@ class CaptureMetricsExcelExporter(
             }.map { current ->
                 val workloadKey = current.sheetRow.nodeRow.node.workloadKey
                 val workloadObservations = observations.filter { candidate ->
-                    candidate.trialCaptureNumber != current.trialCaptureNumber &&
+                    candidate.sheetRow.nodeRow !== current.sheetRow.nodeRow &&
                         candidate.sheetRow.nodeRow.node.workloadKey == workloadKey &&
                         candidate.sheetRow.nodeRow.nodeActualDurationMs != null
                 }
+                // Ordered by capture, then by node order inside it: a workload that runs twice in one sequence
+                // (Decoding) leaves the best-matched evidence there is - same capture, same thermal and memory
+                // state, same queue - and dropping the whole capture would throw it away.
                 val previousWorkloadObservations = workloadObservations
-                    .filter { candidate -> candidate.trialCaptureNumber < current.trialCaptureNumber }
-                    .sortedByDescending { candidate -> candidate.trialCaptureNumber }
+                    .filter { candidate -> decisionOrderCompare(candidate, current) < 0 }
+                    .sortedWith(Comparator { left, right -> decisionOrderCompare(right, left) })
                 val nextWorkloadObservations = workloadObservations
-                    .filter { candidate -> candidate.trialCaptureNumber > current.trialCaptureNumber }
-                    .sortedBy { candidate -> candidate.trialCaptureNumber }
+                    .filter { candidate -> decisionOrderCompare(candidate, current) > 0 }
+                    .sortedWith(Comparator { left, right -> decisionOrderCompare(left, right) })
 
                 val workloadSequenceKey = current.sheetRow.nodeRow.prediction?.workloadSequenceKey
                 val exactSequenceObservations = workloadObservations.filter { candidate ->
@@ -1432,21 +1457,38 @@ class CaptureMetricsExcelExporter(
             // margins in the near-miss band after a paced shot mean the delay was too small, margins far above the
             // unpaced baseline mean shutter time was spent buying headroom the deadline did not need.
             Column("emptyPipelineDelayCount") { emptyPipelineDelayCount(it) },
-            Column("p05MarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.05) },
-            Column("medianMarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.50) },
-            Column("medianMarginAfterNoDelayMs") { run -> percentile(marginsAfterDelayMs(run, false), 0.50) },
+            Column("p05PacedCaptureMarginMs") { run -> percentile(pacedCaptureMarginsMs(run, paced = true), 0.05) },
+            Column("medianPacedCaptureMarginMs") { run -> percentile(pacedCaptureMarginsMs(run, paced = true), 0.50) },
+            Column("medianUnpacedCaptureMarginMs") { run -> percentile(pacedCaptureMarginsMs(run, paced = false), 0.50) },
+            // A delay the queue absorbed cost this capture no margin - only the unabsorbed part can be excessive
+            // for its own deadline. Splitting them keeps a zero excess count from reading as "no evidence looked at".
+            Column("queueAbsorbedDelayCount") { run ->
+                run.captures.count { capture ->
+                    val appliedDelayMs = capture.row.pacingReplay?.before?.appliedDelayMs ?: 0L
+                    appliedDelayMs > 0L && (realQueueWaitMs(capture) ?: 0L) > 0L
+                }
+            },
+            Column("totalDelayOnOwnCriticalPathMs") { run ->
+                run.captures.sumOf { capture -> delayOnOwnCriticalPathMs(capture) ?: 0L }
+            },
+            Column("ownDeadlineExcessDelayCount") { run ->
+                run.captures.count { capture -> (ownDeadlineExcessDelayMs(capture) ?: 0L) > 0L }
+            },
+            Column("totalOwnDeadlineExcessDelayMs") { run ->
+                run.captures.sumOf { capture -> ownDeadlineExcessDelayMs(capture) ?: 0L }
+            },
             Column("likelyExcessivePacingDecisionCount") { run ->
-                buildPacingDecisionAuditRows(run).count { row ->
+                run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
                 }
             },
             Column("likelyInsufficientPacingDecisionCount") { run ->
-                buildPacingDecisionAuditRows(run).count { row ->
+                run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
                 }
             },
             Column("unidentifiablePacingDecisionCount") { run ->
-                buildPacingDecisionAuditRows(run).count { row ->
+                run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_UNIDENTIFIABLE
                 }
             },
@@ -1598,22 +1640,9 @@ class CaptureMetricsExcelExporter(
                 }
             },
             // The skip half of decision quality. unsafeAdmitCount already scores admits against the observed
-            // outcome; these price each skip from sibling captures that ran the same workload, so an over-strict
-            // controller is visible instead of hiding behind "skip requires offline oracle".
-            Column("oraclePricedSkipCaptureCount") { run -> skipCounterfactualSlacksMs(run).size },
-            Column("ownDeadlineUnnecessarySkipCount") { run ->
-                skipCounterfactualSlacksMs(run).count { slackMs -> slackMs >= 0.0 }
-            },
-            Column("ownDeadlineUnnecessarySkipRate") { run ->
-                val slacksMs = skipCounterfactualSlacksMs(run)
-                rate(slacksMs.count { slackMs -> slackMs >= 0.0 }, slacksMs.size)
-            },
-            Column("medianSkipCounterfactualSlackMs") { run ->
-                percentile(skipCounterfactualSlacksMs(run), 0.50)
-            },
-            Column("p05SkipCounterfactualSlackMs") { run ->
-                percentile(skipCounterfactualSlacksMs(run), 0.05)
-            },
+            // outcome; these price each skip from captures that ran the same workload, so an over-strict controller
+            // is visible instead of hiding behind "skip requires offline oracle".
+            //
             // Past-only is the decision-time-faithful primary audit. Future-only never supplies the primary verdict;
             // it only shows whether a nearby later observation would reverse the retrospective conclusion.
             Column("previousPricedSkipCaptureCount") { run ->
@@ -1643,22 +1672,22 @@ class CaptureMetricsExcelExporter(
                 rate(compared.count { agrees -> agrees }, compared.size)
             },
             Column("likelyUnnecessarySkipDecisionCount") { run ->
-                buildAdmissionDecisionAuditRows(run).count { row ->
+                run.admissionAuditRows.count { row ->
                     admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
                 }
             },
             Column("likelyCorrectSkipDecisionCount") { run ->
-                buildAdmissionDecisionAuditRows(run).count { row ->
+                run.admissionAuditRows.count { row ->
                     admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_CORRECT_SKIP
                 }
             },
             Column("uncertainTransitionSkipDecisionCount") { run ->
-                buildAdmissionDecisionAuditRows(run).count { row ->
+                run.admissionAuditRows.count { row ->
                     admissionAuditVerdict(row) == AUDIT_VERDICT_UNCERTAIN_TRANSITION
                 }
             },
             Column("unidentifiableSkipDecisionCount") { run ->
-                buildAdmissionDecisionAuditRows(run).count { row ->
+                run.admissionAuditRows.count { row ->
                     admissionAuditVerdict(row) == AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
                 }
             },
@@ -1799,9 +1828,6 @@ class CaptureMetricsExcelExporter(
             Column("pacingQueuePricingErrorMs") { row ->
                 queuePricingErrorMs(row.capture)
             },
-            Column("skipCounterfactualSlackMs") { row ->
-                skipCounterfactualSlackMs(row.run, row.capture.row)
-            },
             Column("previousSkipCounterfactualSlackMs") { row ->
                 directionalSkipCounterfactualSlackMs(row.run, row.capture.row, previous = true)
             },
@@ -1830,7 +1856,6 @@ class CaptureMetricsExcelExporter(
             Column("admissionStage") { it.sheetRow.admissionStage() },
             Column("workloadKey") { it.sheetRow.nodeRow.node.workloadKey },
             Column("workloadSequenceKey") { it.sheetRow.nodeRow.prediction?.workloadSequenceKey },
-            Column("") { "" },
             Column("budgetMs") { it.sheetRow.nodeRow.node.preExecutionMetrics.budgetMs },
             Column("sequencePredictedDurationMs") {
                 it.sheetRow.nodeRow.prediction?.sequencePredictedDurationMs
@@ -1850,7 +1875,6 @@ class CaptureMetricsExcelExporter(
                 row.sheetRow.inferredBeforeModelAdmit() == true &&
                     row.sheetRow.nodeRow.prediction?.admit == false
             },
-            Column("") { "" },
             Column("captureTimedOut") { it.sheetRow.capture.hasTimeoutFailure },
             Column("captureWatchdogFailed") { it.sheetRow.capture.hasWatchdogFailure },
             Column("timeoutMarginMs") { it.sheetRow.capture.timeoutMarginMs },
@@ -1871,7 +1895,6 @@ class CaptureMetricsExcelExporter(
             Column("blockingGcTimeMs") {
                 it.sheetRow.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcTimeMs
             },
-            Column("") { "" },
             Column("overheatLevel") {
                 it.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.overheatLevel
             },
@@ -1908,7 +1931,6 @@ class CaptureMetricsExcelExporter(
             Column("pacingInFlightDraftCountAtDecision") { row ->
                 admissionAuditEnrichedCapture(row, null)?.wallBase?.inFlightDraftCountAtDecision
             },
-            Column("") { "" },
             Column("previousWorkloadTrialCaptureNumber") {
                 it.previousWorkloadObservation?.trialCaptureNumber
             },
@@ -1990,7 +2012,6 @@ class CaptureMetricsExcelExporter(
                 it.previousWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
                     ?.gcSnapshot?.blockingGcTimeMs
             },
-            Column("") { "" },
             Column("recentPreviousWorkloadObservationCount") {
                 it.recentPreviousWorkloadObservations.size
             },
@@ -2006,7 +2027,6 @@ class CaptureMetricsExcelExporter(
                     marginMs.toDouble() - medianDurationMs
                 }
             },
-            Column("") { "" },
             Column("nextWorkloadTrialCaptureNumber") {
                 it.nextWorkloadObservation?.trialCaptureNumber
             },
@@ -2088,7 +2108,6 @@ class CaptureMetricsExcelExporter(
                 it.nextWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
                     ?.gcSnapshot?.blockingGcTimeMs
             },
-            Column("") { "" },
             Column("previousExactSequenceTrialCaptureNumber") {
                 it.previousSequenceObservation?.trialCaptureNumber
             },
@@ -2123,7 +2142,6 @@ class CaptureMetricsExcelExporter(
             Column("nextExactSequenceContextComparable") { row ->
                 contextComparable(row, row.nextSequenceObservation)
             },
-            Column("") { "" },
             Column("previousAllSkippedWorkloadsOwnDeadlineSlackMs") { row ->
                 directionalSkipCounterfactualSlackMs(row.run, row.sheetRow.capture, previous = true)
             },
@@ -2133,7 +2151,6 @@ class CaptureMetricsExcelExporter(
             Column("previousNextAllSkippedEvidenceAgree") { row ->
                 directionalSkipEvidenceAgreement(row.run, row.sheetRow.capture)
             },
-            Column("") { "" },
             Column("auditEvidenceBasis") { admissionAuditEvidenceBasis(it) },
             Column("previousNextEvidenceAgree") { admissionAuditEvidenceAgreement(it) },
             Column("auditVerdict") { admissionAuditVerdict(it) },
@@ -2162,7 +2179,6 @@ class CaptureMetricsExcelExporter(
                 it.capture.row.nodeRows.firstOrNull()
                     ?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
             },
-            Column("") { "" },
             Column("decisionUptimeMs") { it.capture.row.pacingReplay?.before?.decisionUptimeMs },
             Column("appliedDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
             Column("dominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
@@ -2185,7 +2201,15 @@ class CaptureMetricsExcelExporter(
             Column("draftWallMs") { it.capture.row.draftWallMs },
             Column("ceilingErrorMs") { row -> pacingCeilingErrorMs(row.capture) },
             Column("emptyPipelineDelay") { row -> isEmptyPipelineDelay(row.capture) },
-            Column("") { "" },
+            // Where the delay landed. Absorbed delay never touched this capture's own deadline, so a paced capture
+            // finishing thin is not evidence the delay hurt it - and excess can only be claimed on the unabsorbed part.
+            Column("delayAbsorbedByQueue") { row ->
+                val appliedDelayMs = row.capture.row.pacingReplay?.before?.appliedDelayMs
+                val queueWaitMs = realQueueWaitMs(row.capture)
+                if (appliedDelayMs == null || queueWaitMs == null) null else appliedDelayMs > 0L && queueWaitMs > 0L
+            },
+            Column("delayOnOwnCriticalPathMs") { row -> delayOnOwnCriticalPathMs(row.capture) },
+            Column("ownDeadlineExcessDelayMs") { row -> ownDeadlineExcessDelayMs(row.capture) },
             // The queued decision is consumed by this draft start, so this row - not the following one - is the
             // factual outcome of the delay. The next capture remains transition sensitivity evidence only.
             Column("captureShotToShotTimeMs") { it.capture.row.metrics.shotToShotTimeMs },
@@ -2193,22 +2217,21 @@ class CaptureMetricsExcelExporter(
             Column("captureWatchdogFailed") { it.capture.row.hasWatchdogFailure },
             Column("captureTimeoutMarginMs") { it.capture.row.timeoutMarginMs },
             Column("captureNearMiss") { row -> isNearMiss(row.capture.row) },
-            Column("medianTimeoutMarginWithDelayMs") { row ->
-                percentile(marginsAfterDelayMs(row.run, true), 0.50)
+            Column("medianPacedCaptureMarginMs") { row ->
+                percentile(pacedCaptureMarginsMs(row.run, paced = true), 0.50)
             },
-            Column("medianTimeoutMarginWithoutDelayMs") { row ->
-                percentile(marginsAfterDelayMs(row.run, false), 0.50)
+            Column("medianUnpacedCaptureMarginMs") { row ->
+                percentile(pacedCaptureMarginsMs(row.run, paced = false), 0.50)
             },
-            Column("timeoutMarginVsNoDelayMedianMs") { row ->
+            Column("marginVsUnpacedMedianMs") { row ->
                 val timeoutMarginMs = row.capture.row.timeoutMarginMs
-                val noDelayMedianMs = percentile(marginsAfterDelayMs(row.run, false), 0.50)
+                val noDelayMedianMs = percentile(pacedCaptureMarginsMs(row.run, paced = false), 0.50)
                 if (timeoutMarginMs == null || noDelayMedianMs == null) {
                     null
                 } else {
                     timeoutMarginMs.toDouble() - noDelayMedianMs
                 }
             },
-            Column("") { "" },
             Column("nextCaptureIndex") { it.nextCapture?.row?.captureIndex },
             Column("nextCaptureShotToShotTimeMs") { it.nextCapture?.row?.metrics?.shotToShotTimeMs },
             Column("nextCaptureTimedOut") { it.nextCapture?.row?.hasTimeoutFailure },
@@ -2224,7 +2247,6 @@ class CaptureMetricsExcelExporter(
                 it.nextCapture?.row?.nodeRows?.firstOrNull()
                     ?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
             },
-            Column("") { "" },
             Column("auditEvidenceBasis") { pacingAuditEvidenceBasis(it) },
             Column("auditVerdict") { pacingAuditVerdict(it) },
             Column("auditConfidence") { pacingAuditConfidence(it) },
@@ -2417,17 +2439,17 @@ class CaptureMetricsExcelExporter(
                 run.admissionRows.count { row -> row.observedActualFeasible() == false }
             },
             Column("likelyUnnecessarySkipDecisionCount") { run ->
-                buildAdmissionDecisionAuditRows(run).count { row ->
+                run.admissionAuditRows.count { row ->
                     admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
                 }
             },
             Column("likelyExcessivePacingDecisionCount") { run ->
-                buildPacingDecisionAuditRows(run).count { row ->
+                run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
                 }
             },
             Column("likelyInsufficientPacingDecisionCount") { run ->
-                buildPacingDecisionAuditRows(run).count { row ->
+                run.pacingAuditRows.count { row ->
                     pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
                 }
             },
@@ -2797,12 +2819,15 @@ class CaptureMetricsExcelExporter(
             val previousComparable = contextComparable(row, previousObservation) == true
             val nextComparable = contextComparable(row, nextObservation) == true
             val evidenceAgrees = admissionAuditEvidenceAgreement(row)
+            // Grading is on the past evidence alone. Sticky demotion means a workload that gets skipped never runs
+            // again in the same burst, so a later observation is structurally absent for exactly the decisions this
+            // audit exists to score - requiring one would pin every skip verdict at Medium. A later observation that
+            // does exist (an upper-bound skip the controller recovered from) still contributes: agreement lifts the
+            // grade, and disagreement is already routed to the uncertain verdict before this point.
             return when {
-                exactSequenceEvidence && previousComparable && nextComparable && evidenceAgrees == true ->
-                    AUDIT_CONFIDENCE_HIGH
-                exactSequenceEvidence && previousComparable -> AUDIT_CONFIDENCE_MEDIUM
-                !exactSequenceEvidence && previousComparable && nextComparable && evidenceAgrees == true ->
-                    AUDIT_CONFIDENCE_MEDIUM
+                exactSequenceEvidence && previousComparable -> AUDIT_CONFIDENCE_HIGH
+                exactSequenceEvidence -> AUDIT_CONFIDENCE_MEDIUM
+                previousComparable && (nextComparable || evidenceAgrees == true) -> AUDIT_CONFIDENCE_MEDIUM
                 else -> AUDIT_CONFIDENCE_LOW
             }
         }
@@ -2948,45 +2973,6 @@ class CaptureMetricsExcelExporter(
             return (previousSlackMs >= 0L) == (nextSlackMs >= 0L)
         }
 
-        /**
-         * What a workload this capture skipped would have cost, priced from the capture nearest to it in the same
-         * session that actually ran the same workload key. Observed durations only: scoring a skip against the
-         * model's own prediction would just replay the model's opinion of itself.
-         */
-        private fun nearestObservedDurationMs(run: EvaluationRun, capture: CaptureRow, workloadKey: String): Long? =
-            run.captureRows.mapNotNull { other ->
-                val observedMs = other.nodeRows.firstOrNull { row ->
-                    row.node.workloadKey == workloadKey && row.nodeActualDurationMs != null
-                }?.nodeActualDurationMs
-                if (observedMs == null) null else abs(other.captureIndex - capture.captureIndex) to observedMs
-            }.minByOrNull { (distance, _) -> distance }?.second
-
-        /**
-         * Deadline slack this capture would still have had if every workload it skipped had run: positive means the
-         * skip bought nothing for this capture's own deadline. Null when nothing was skipped, when the deadline was
-         * not observed, or when no sibling capture ever ran a skipped workload to price it with.
-         *
-         * Scope, deliberately: it restores the skipped work into THIS capture only. The queue that work would have
-         * left for later captures is what pacing exists to absorb, so a positive slack is evidence about one
-         * capture's deadline, not a verdict that the skip was wrong - read it against the RQ2 delay cost.
-         */
-        private fun skipCounterfactualSlackMs(run: EvaluationRun, capture: CaptureRow): Long? {
-            val marginMs = capture.timeoutMarginMs ?: return null
-            val skippedRows = capture.nodeRows.filter { row -> row.isAdmissionWorkload && row.wasSkipped }
-            if (skippedRows.isEmpty()) {
-                return null
-            }
-            var restoredMs = 0L
-            for (row in skippedRows) {
-                val workloadKey = row.node.workloadKey ?: return null
-                restoredMs += nearestObservedDurationMs(run, capture, workloadKey) ?: return null
-            }
-            return marginMs - restoredMs
-        }
-
-        private fun skipCounterfactualSlacksMs(run: EvaluationRun): List<Double> =
-            run.captureRows.mapNotNull { capture -> skipCounterfactualSlackMs(run, capture)?.toDouble() }
-
         private fun directionalSkipCounterfactualSlacksMs(
             run: EvaluationRun,
             previous: Boolean,
@@ -2995,20 +2981,45 @@ class CaptureMetricsExcelExporter(
         }
 
         /**
-         * Deadline margin realized by a capture whose own start consumed a pacing decision with ([afterDelay]) or
-         * without delay. The decision was queued at captureAvailable and persisted when this draft start consumed
-         * it, so the outcome is on the same row. Neither group is a causal verdict - changing a delay changes every
-         * later arrival, which needs a replay.
+         * Deadline margin realized by captures whose own draft start consumed a pacing decision that did ([paced])
+         * or did not carry delay. The decision was queued at captureAvailable and persisted when this draft start
+         * consumed it, so the outcome is on the same row - but the two groups are selected, not assigned: a delay
+         * is charged exactly when the queue is deep, which is also when margin is thin. Read the split as a
+         * description of the two populations, never as the delay's effect; that needs a replay.
          */
-        private fun marginsAfterDelayMs(run: EvaluationRun, afterDelay: Boolean): List<Double> =
+        private fun pacedCaptureMarginsMs(run: EvaluationRun, paced: Boolean): List<Double> =
             run.captureRows.mapNotNull { capture ->
                 val delayMs = capture.pacingReplay?.before?.appliedDelayMs
-                if (delayMs == null || (delayMs > 0L) != afterDelay) {
+                if (delayMs == null || (delayMs > 0L) != paced) {
                     null
                 } else {
                     capture.timeoutMarginMs?.toDouble()
                 }
             }
+
+        /**
+         * How much of the applied delay actually pushed this capture's own draft start later. A delay is absorbed
+         * whenever the pipeline was still busy at release ([realQueueWaitMs] > 0): the draft would have queued
+         * anyway, so the delay cost this capture no deadline margin and its whole effect was throttling the next
+         * shutter. Only the unabsorbed part sits on this capture's critical path.
+         */
+        private fun delayOnOwnCriticalPathMs(capture: EnrichedCaptureRow): Long? {
+            val appliedDelayMs = capture.row.pacingReplay?.before?.appliedDelayMs ?: return null
+            val queueWaitMs = realQueueWaitMs(capture) ?: return null
+            return (appliedDelayMs - queueWaitMs).coerceAtLeast(0L)
+        }
+
+        /**
+         * Delay that could have been dropped without putting this capture past its own deadline - the pacing
+         * counterpart of the skip oracle's own-deadline slack, and threshold-free. Zero has two very different
+         * causes that the neighbouring columns separate: the delay never reached this capture's critical path
+         * (absorbed by the queue), or it did and the capture needed every millisecond of the margin it kept.
+         */
+        private fun ownDeadlineExcessDelayMs(capture: EnrichedCaptureRow): Long? {
+            val criticalPathDelayMs = delayOnOwnCriticalPathMs(capture) ?: return null
+            val marginMs = capture.row.timeoutMarginMs ?: return null
+            return minOf(criticalPathDelayMs, marginMs.coerceAtLeast(0L))
+        }
 
         /** Delay charged with nothing queued and nothing in flight - no backlog to drain, so it was pure shutter lag. */
         private fun emptyPipelineDelayCount(run: EvaluationRun): Int =
@@ -3097,13 +3108,16 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "RQ3 skip oracle",
-                note = "skipCounterfactualSlackMs prices every workload a capture skipped from the nearest sibling " +
-                    "capture in the same session that actually ran that workload key, then asks whether the capture " +
+                note = "previousSkipCounterfactualSlackMs prices every workload a capture skipped from the most " +
+                    "recent earlier capture that actually ran that workload key, then asks whether the capture " +
                     "would still have met its own deadline: positive slack means the skip bought that capture " +
-                    "nothing. It restores the work into that one capture only, so it cannot see the queue the " +
+                    "nothing. Earlier observations only, so the estimate uses nothing the controller could not have " +
+                    "had. It restores the work into that one capture only, so it cannot see the queue the " +
                     "restored work would have left for later shots - that cross-shot cost is what pacing absorbs, " +
-                    "so read ownDeadlineUnnecessarySkipRate together with the RQ2 delay columns before calling a " +
-                    "skip wrong. Skips with no sibling observation stay unpriced and are excluded from the rate.",
+                    "so read previousOwnDeadlineUnnecessarySkipRate together with the RQ2 delay columns before " +
+                    "calling a skip wrong. Skips with no earlier observation stay unpriced and are excluded from " +
+                    "the rate. The next-observation columns are sensitivity only and are usually blank: sticky " +
+                    "demotion means a skipped workload does not run again in the same burst.",
             ),
             ReplayNote(
                 topic = "AdmissionDecisionAudit",
@@ -3112,9 +3126,16 @@ class CaptureMetricsExcelExporter(
                     "earlier fully observed row with the exact workloadSequenceKey is preferred because its actual " +
                     "suffix can be compared directly with the skipped decision's budget. The closest later " +
                     "observation is sensitivity evidence only: disagreement marks a transition as uncertain. The " +
-                    "recent-three median exposes one-sample GC/contention sensitivity. contextComparable is only a " +
-                    "coarse screen (overheat delta <= 1, thermal-headroom delta <= 0.25, same low-memory state, RAM " +
-                    "delta <= 10 percentage points); the raw deltas remain authoritative. A likely verdict is a " +
+                    "recent-three median exposes one-sample GC/contention sensitivity. Evidence may come from the " +
+                    "same capture when a workload runs twice in one sequence; that is the closest match available. " +
+                    "Under sticky demotion a skipped workload never runs again in the burst, so the later-" +
+                    "observation columns and the uncertain-transition verdict are usually empty by construction - " +
+                    "they fill in only for a skip the controller recovered from. Confidence is therefore graded on " +
+                    "the earlier evidence: exact-sequence and comparable context is High. contextComparable is only " +
+                    "a coarse screen of thermal and memory state (overheat delta <= 1, thermal-headroom delta <= " +
+                    "0.25, same low-memory state, RAM delta <= 10 percentage points); it deliberately ignores queue " +
+                    "depth, because the comparison is against the skipped decision's own budget and that budget " +
+                    "already shrinks with the queue. The raw deltas remain authoritative. A likely verdict is a " +
                     "local decision audit, not the closed-loop outcome of changing the burst.",
             ),
             ReplayNote(
@@ -3122,15 +3143,19 @@ class CaptureMetricsExcelExporter(
                 note = "No column proves a delay was the right size: changing one delay changes every later " +
                     "arrival, which needs a closed-loop replay. A persisted pacing decision is consumed by the same " +
                     "capture row's draft start, so the observable factual outcome is that row's timeout margin. " +
-                    "p05MarginAfterDelayMs in the near-miss band means paced captures did not get enough " +
-                    "headroom; medianMarginAfterDelayMs far above medianMarginAfterNoDelayMs means shutter time " +
+                    "p05PacedCaptureMarginMs in the near-miss band means paced captures did not get enough " +
+                    "headroom; medianPacedCaptureMarginMs far above medianUnpacedCaptureMarginMs means shutter time " +
                     "bought headroom the deadline did not need. emptyPipelineDelayCount must stay 0 - a delay with " +
                     "nothing queued and nothing in flight has no backlog to drain.",
             ),
             ReplayNote(
                 topic = "PacingDecisionAudit",
-                note = "A nonzero delay with no queued or in-flight draft is strong evidence of excess. A gated " +
-                    "capture's " +
+                note = "A nonzero delay with no queued or in-flight draft is strong evidence of excess. " +
+                    "delayAbsorbedByQueue separates the far more common case: the pipeline was still busy at " +
+                    "release, so the delay never reached this capture's own critical path and cost it no margin - " +
+                    "its whole effect was throttling the next shutter. Only delayOnOwnCriticalPathMs can be " +
+                    "excessive for this capture, and ownDeadlineExcessDelayMs is how much of it could have been " +
+                    "dropped without missing the deadline. A gated capture's " +
                     "near miss/failure together with queue under-pricing or ceiling undershoot is evidence that the " +
                     "delay was likely insufficient. A safe gated capture supports the observed outcome but never " +
                     "proves the delay was optimal, so those rows stay low-confidence. The following capture is " +
