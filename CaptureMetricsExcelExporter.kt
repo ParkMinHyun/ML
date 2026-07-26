@@ -31,6 +31,12 @@ class CaptureMetricsExcelExporter(
         val captures: List<EnrichedCaptureRow>,
     ) {
         val captureRows: List<CaptureRow> = captures.map { enriched -> enriched.row }
+
+        /**
+         * False when the stored captures start mid-burst - the retention limit dropped the head of this session, so
+         * its opening shots (the coldest predictions and the emptiest backlog) are missing from every RQ statistic.
+         */
+        val isWholeBurstSession: Boolean = captureRows.firstOrNull()?.isBurstSessionStart == true
         val admissionRows: List<NodeSheetRow> = nodeSheetRows(captures)
             .filter { sheetRow -> sheetRow.nodeRow.isAdmissionWorkload && sheetRow.nodeRow.prediction != null }
         val pacingRows: List<PacingReplay> = captureRows.mapNotNull { capture -> capture.pacingReplay }
@@ -40,13 +46,26 @@ class CaptureMetricsExcelExporter(
             capture.bokehDecisionRow != null || capture.filterDecisionRow != null
         }
         val timelineRows: List<EvaluationTimelineRow> = captures.mapIndexed { index, capture ->
-            EvaluationTimelineRow(index + 1, capture)
+            EvaluationTimelineRow(index + 1, capture, this)
         }
     }
 
     private class EvaluationTimelineRow(
         val trialCaptureNumber: Int,
         val capture: EnrichedCaptureRow,
+        /** The session this capture sits in - skip counterfactuals price a skip from its siblings' observations. */
+        val run: EvaluationRun,
+    )
+
+    /**
+     * The same run scored over only its first [prefixCaptureCount] captures. A burst degrades as it goes - the
+     * first skip and the first delay land somewhere in the middle - so a whole-session average hides what the user
+     * actually experiences in a short burst. Five shots is the usability-representative window; ten and the full
+     * session show where the controller starts trading features and shutter time away.
+     */
+    private class PrefixWindowRow(
+        val prefixCaptureCount: Int,
+        val run: EvaluationRun,
     )
 
     /**
@@ -145,7 +164,9 @@ class CaptureMetricsExcelExporter(
                     nodeRows = nodeRows,
                 )
             }
-            val rawCaptures = allRawCaptures.takeLast(EVALUATION_SESSION_CAPTURE_COUNT)
+            // The evaluation unit is the newest burst session, not a fixed capture count: bursts run around 30
+            // shots but vary, so a fixed window straddles boundaries and mixes two thermal states into one row.
+            val rawCaptures = groupCaptures(allRawCaptures).lastOrNull().orEmpty()
 
             val enrichedNormalCaptures = processCaptures(rawCaptures)
             val replayCaptures = enrichedNormalCaptures.sortedBy { enriched -> enriched.row.captureIndex }
@@ -154,6 +175,7 @@ class CaptureMetricsExcelExporter(
                 .filter { row -> row.nodeRow.isAdmissionWorkload && row.nodeRow.prediction != null }
             val failureAttributionRows = evaluationRun.timelineRows
                 .filter { row -> isFailureOrNearMiss(row.capture.row) }
+            val prefixWindowRows = prefixWindowRows(replayCaptures)
 
             writeSheet(
                 workbook,
@@ -206,6 +228,14 @@ class CaptureMetricsExcelExporter(
             writeSheet(
                 workbook,
                 styles,
+                "BurstPrefix",
+                prefixWindowRows,
+                buildBurstPrefixColumns(),
+                optimizeColumnWidths = true,
+            )
+            writeSheet(
+                workbook,
+                styles,
                 "GuardBaseline",
                 evaluationRun.timelineRows,
                 buildGuardBaselineColumns(),
@@ -245,14 +275,7 @@ class CaptureMetricsExcelExporter(
     }
 
     private fun processCaptures(captures: List<CaptureRow>): List<EnrichedCaptureRow> {
-        val usesPacerSessionBoundary = captures.isNotEmpty() &&
-            captures.all { it.metrics.draftSequenceMetrics?.pacerSessionId != null }
-        val sessionBoundarySource = if (usesPacerSessionBoundary) {
-            SESSION_BOUNDARY_PACER
-        } else {
-            SESSION_BOUNDARY_TIMEOUT_PROXY
-        }
-        val groups = groupCaptures(captures, usesPacerSessionBoundary)
+        val groups = groupCaptures(captures)
         groups.forEach(::simulateAdmissionAfter)
 
         val enriched = mutableListOf<EnrichedCaptureRow>()
@@ -275,7 +298,6 @@ class CaptureMetricsExcelExporter(
 
                 val sessionSummary = SessionSummary(
                     sessionId = sessionId,
-                    sessionBoundarySource = sessionBoundarySource,
                     sessionShotCount = group.size,
                     sessionCaptureIndex = indexInSession + 1,
                     sessionTimeoutShotCount = sessionTimeoutShotCount,
@@ -327,42 +349,20 @@ class CaptureMetricsExcelExporter(
     }
 
     /**
-     * Groups captures into burst sessions. Prefers the recorded runtime pacer session id (increments each time the
-     * drained pipeline clears the pacer); rows persisted before that field existed fall back to the legacy
-     * timeout-delimited grouping.
+     * Groups captures into burst sessions, split at every [CaptureRow.isBurstSessionStart]. The runtime pacer
+     * session id is deliberately not the boundary: it only increments when the draft pipeline drains, which
+     * back-to-back bursts never do, so it groups a whole test run into one session.
      */
-    private fun groupCaptures(captures: List<CaptureRow>, usesPacerSessionBoundary: Boolean): List<List<CaptureRow>> {
+    private fun groupCaptures(captures: List<CaptureRow>): List<List<CaptureRow>> {
         val groups = mutableListOf<List<CaptureRow>>()
         var currentGroup = mutableListOf<CaptureRow>()
 
-        if (usesPacerSessionBoundary) {
-            for (capture in captures) {
-                val previousSessionId = currentGroup.lastOrNull()?.metrics?.draftSequenceMetrics?.pacerSessionId
-                val sessionId = capture.metrics.draftSequenceMetrics?.pacerSessionId
-                if (currentGroup.isNotEmpty() && previousSessionId != sessionId) {
-                    groups.add(currentGroup)
-                    currentGroup = mutableListOf()
-                }
-                currentGroup.add(capture)
-            }
-            if (currentGroup.isNotEmpty()) {
-                groups.add(currentGroup)
-            }
-            return groups
-        }
-
         for (capture in captures) {
-            val isTimeout = capture.metrics.draftSequenceMetrics?.isTimeout == true
-            if (currentGroup.isEmpty() && isTimeout) {
-                continue
-            }
-
-            currentGroup.add(capture)
-
-            if (isTimeout) {
+            if (capture.isBurstSessionStart && currentGroup.isNotEmpty()) {
                 groups.add(currentGroup)
                 currentGroup = mutableListOf()
             }
+            currentGroup.add(capture)
         }
         if (currentGroup.isNotEmpty()) {
             groups.add(currentGroup)
@@ -471,6 +471,13 @@ class CaptureMetricsExcelExporter(
         val nodeRows: List<NodeRow>,
     ) {
         val pacingReplay: PacingReplay? = metrics.draftSequenceMetrics?.captureAvailablePacing?.let(::PacingReplay)
+
+        /**
+         * First shot of a burst: the capture pipeline restarts ppSequenceId at 0, and the first shot of a burst has
+         * no preceding shot to measure shot-to-shot time from, so either mark opens a new session.
+         */
+        val isBurstSessionStart: Boolean
+            get() = metrics.ppSequenceId == 0 || metrics.shotToShotTimeMs == null
 
         val firstNodeStartUptimeMs: Long?
             get() = nodeRows.firstOrNull()?.node?.startUptimeMs
@@ -609,7 +616,6 @@ class CaptureMetricsExcelExporter(
 
     private class SessionSummary(
         val sessionId: Int,
-        val sessionBoundarySource: String,
         val sessionShotCount: Int,
         val sessionCaptureIndex: Int,
         val sessionTimeoutShotCount: Int?,
@@ -955,7 +961,6 @@ class CaptureMetricsExcelExporter(
     private companion object {
         private const val DIR_NAME = "metrics"
         private val FILE_NAME = "${Build.MODEL}_metrics.xlsx"
-        private const val EVALUATION_SESSION_CAPTURE_COUNT = 30
         private const val MAX_SHEET_NAME_LENGTH = 31
         private const val MAX_EVALUATION_COLUMN_WIDTH = 48 * 256
         private const val ADMIT_BOKEH_PREFIX = "BOKEH("
@@ -975,8 +980,6 @@ class CaptureMetricsExcelExporter(
         private const val AFTER_SKIP_EVALUATED_FROM_RECORDED_ADMIT = "After Skip Evaluated from Recorded Admit"
         private const val AFTER_UNNECESSARY_SKIP = "Unnecessary Skip"
         private const val AFTER_CORRECT_SKIP = "Correct Skip"
-        private const val SESSION_BOUNDARY_PACER = "runtime pacer session id"
-        private const val SESSION_BOUNDARY_TIMEOUT_PROXY = "timeout-delimited proxy"
         private const val PACING_LATENCY_RECORDED = "Recorded runtime input"
         private const val PACING_LATENCY_EXACT = "Exact from positive backlog deficit"
         private const val PACING_LATENCY_BOUNDED = "Bounded because backlog deficit was zero"
@@ -1002,6 +1005,10 @@ class CaptureMetricsExcelExporter(
 
         // Cold-start window: prediction error over the first vs last few captures shows the online model converging.
         private const val COLD_START_CAPTURE_COUNT = 5
+
+        // Burst prefixes scored separately in BurstPrefix. Five shots is the usability-representative window most
+        // users ever reach; ten and thirty show how far into a burst the controller holds before it trades away.
+        private val PREFIX_CAPTURE_COUNTS = listOf(5, 10, 30)
 
         // PowerManager thermal headroom is normalized so >= 1.0 means at or past the throttling threshold.
         private const val THERMAL_HEADROOM_THROTTLING = 1.0f
@@ -1071,10 +1078,7 @@ class CaptureMetricsExcelExporter(
         private fun buildRq1Columns(): List<Column<EvaluationRun>> = listOf(
             Column("deviceModel") { Build.MODEL },
             Column("captureCount") { it.captureRows.size },
-            Column("expectedCaptureCount") { EVALUATION_SESSION_CAPTURE_COUNT },
-            Column("sessionComplete") { run ->
-                run.captureRows.size == EVALUATION_SESSION_CAPTURE_COUNT
-            },
+            Column("wholeBurstSessionEvaluated") { it.isWholeBurstSession },
             Column("timeoutCount") { run -> run.captureRows.count { capture -> capture.hasTimeoutFailure } },
             Column("timeoutRate") { run ->
                 rate(run.captureRows.count { capture -> capture.hasTimeoutFailure }, run.captureRows.size)
@@ -1099,6 +1103,17 @@ class CaptureMetricsExcelExporter(
             },
             Column("firstFailureCaptureNumber") { run ->
                 oneBasedFirstIndex(run.captureRows) { capture -> capture.hasTimeoutOrWatchdogFailure }
+            },
+            Column("firstWatchdogFailureCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.hasWatchdogFailure }
+            },
+            // Where the run changes regime: every average after the first skip describes a degraded controller, so
+            // a whole-session rate is only readable next to the capture number the degradation started at.
+            Column("firstMBokehSkipCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.bokehDecisionRow?.wasSkipped == true }
+            },
+            Column("firstSFilterSkipCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture -> capture.filterDecisionRow?.wasSkipped == true }
             },
             Column("timeoutRightCensored") { run ->
                 run.captureRows.none { capture -> capture.hasTimeoutFailure }
@@ -1198,6 +1213,11 @@ class CaptureMetricsExcelExporter(
                 run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs }.maxOrNull()
             },
             Column("pacingDecisionCount") { it.pacingRows.size },
+            Column("firstNonzeroPacingDelayCaptureNumber") { run ->
+                oneBasedFirstIndex(run.captureRows) { capture ->
+                    (capture.pacingReplay?.before?.appliedDelayMs ?: 0L) > 0L
+                }
+            },
             Column("nonzeroPacingDelayCount") { run ->
                 run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L }
             },
@@ -1256,6 +1276,13 @@ class CaptureMetricsExcelExporter(
                 val meanMs = mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
                 if (meanMs != null && meanMs > 0.0) 1000.0 / meanMs else null
             },
+            // Was the delay the right size? Offline this can only be read from what the next capture realized:
+            // margins in the near-miss band after a paced shot mean the delay was too small, margins far above the
+            // unpaced baseline mean shutter time was spent buying headroom the deadline did not need.
+            Column("emptyPipelineDelayCount") { emptyPipelineDelayCount(it) },
+            Column("p05MarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.05) },
+            Column("medianMarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.50) },
+            Column("medianMarginAfterNoDelayMs") { run -> percentile(marginsAfterDelayMs(run, false), 0.50) },
         )
 
         private fun buildRq3Columns(): List<Column<EvaluationRun>> = listOf(
@@ -1390,6 +1417,23 @@ class CaptureMetricsExcelExporter(
                 run.admissionRows.count {
                     row -> row.decisionOutcome() == DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
                 }
+            },
+            // The skip half of decision quality. unsafeAdmitCount already scores admits against the observed
+            // outcome; these price each skip from sibling captures that ran the same workload, so an over-strict
+            // controller is visible instead of hiding behind "skip requires offline oracle".
+            Column("oraclePricedSkipCaptureCount") { run -> skipCounterfactualSlacksMs(run).size },
+            Column("ownDeadlineUnnecessarySkipCount") { run ->
+                skipCounterfactualSlacksMs(run).count { slackMs -> slackMs >= 0.0 }
+            },
+            Column("ownDeadlineUnnecessarySkipRate") { run ->
+                val slacksMs = skipCounterfactualSlacksMs(run)
+                rate(slacksMs.count { slackMs -> slackMs >= 0.0 }, slacksMs.size)
+            },
+            Column("medianSkipCounterfactualSlackMs") { run ->
+                percentile(skipCounterfactualSlacksMs(run), 0.50)
+            },
+            Column("p05SkipCounterfactualSlackMs") { run ->
+                percentile(skipCounterfactualSlacksMs(run), 0.05)
             },
             Column("pacingCeilingObservedCount") { run -> ceilingErrorsMs(run).size },
             Column("ceilingUndershootCount") { run ->
@@ -1528,6 +1572,73 @@ class CaptureMetricsExcelExporter(
             Column("pacingQueuePricingErrorMs") { row ->
                 queuePricingErrorMs(row.capture)
             },
+            Column("skipCounterfactualSlackMs") { row ->
+                skipCounterfactualSlackMs(row.run, row.capture.row)
+            },
+        )
+
+        /** Prefix windows plus the whole burst, deduplicated and clipped to what was actually captured. */
+        private fun prefixWindowRows(captures: List<EnrichedCaptureRow>): List<PrefixWindowRow> =
+            (PREFIX_CAPTURE_COUNTS + captures.size).distinct().sorted()
+                .filter { count -> count in 1..captures.size }
+                .map { count -> PrefixWindowRow(count, EvaluationRun(captures.take(count))) }
+
+        private fun buildBurstPrefixColumns(): List<Column<PrefixWindowRow>> = listOf(
+            Column("prefixCaptureCount") { it.prefixCaptureCount },
+            Column("startingOverheatLevel") { overheatLevels(it.run).firstOrNull() },
+            Column("endingOverheatLevel") { overheatLevels(it.run).lastOrNull() },
+            Column("maximumOverheatLevel") { overheatLevels(it.run).maxOrNull() },
+            Column("timeoutCount") { row -> row.run.captureRows.count { capture -> capture.hasTimeoutFailure } },
+            Column("watchdogFailureCount") { row ->
+                row.run.captureRows.count { capture -> capture.hasWatchdogFailure }
+            },
+            Column("minimumTimeoutMarginMs") { row ->
+                row.run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs }.minOrNull()
+            },
+            Column("medianTimeoutMarginMs") { row ->
+                percentile(row.run.captureRows.mapNotNull { capture -> capture.timeoutMarginMs?.toDouble() }, 0.50)
+            },
+            Column("mBokehAdmitRate") { row ->
+                rate(row.run.bokehRows.count { node -> node.wasAdmitted == true }, row.run.bokehRows.size)
+            },
+            Column("mBokehCompletionRate") { row ->
+                rate(row.run.bokehRows.count { node -> node.wasCompleted }, row.run.bokehRows.size)
+            },
+            Column("mBokehSkipCount") { row -> row.run.bokehRows.count { node -> node.wasSkipped } },
+            Column("sFilterCompletionRate") { row ->
+                rate(row.run.filterRows.count { node -> node.wasCompleted }, row.run.filterRows.size)
+            },
+            Column("sFilterSkipCount") { row -> row.run.filterRows.count { node -> node.wasSkipped } },
+            Column("fullFeatureSuccessRate") { row ->
+                rate(
+                    row.run.captureRows.count { capture -> capture.isFullFeatureSuccess },
+                    row.run.featureEligibleCaptures.size,
+                )
+            },
+            Column("nonzeroPacingDelayRate") { row ->
+                rate(
+                    row.run.pacingRows.count { pacing -> pacing.before.appliedDelayMs > 0L },
+                    row.run.pacingRows.size,
+                )
+            },
+            Column("totalAppliedPacingDelayMs") { row ->
+                row.run.pacingRows.sumOf { pacing -> pacing.before.appliedDelayMs }
+            },
+            Column("meanAppliedPacingDelayMs") { row ->
+                mean(row.run.pacingRows.map { pacing -> pacing.before.appliedDelayMs.toDouble() })
+            },
+            Column("maximumAppliedPacingDelayMs") { row ->
+                row.run.pacingRows.maxOfOrNull { pacing -> pacing.before.appliedDelayMs }
+            },
+            Column("meanShotToShotTimeMs") { row ->
+                mean(row.run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
+            },
+            Column("p95ShotToShotTimeMs") { row ->
+                percentile(
+                    row.run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() },
+                    0.95,
+                )
+            },
         )
 
         /**
@@ -1540,8 +1651,7 @@ class CaptureMetricsExcelExporter(
             Column("androidSdkInt") { Build.VERSION.SDK_INT },
             Column("androidRelease") { Build.VERSION.RELEASE },
             Column("captureCount") { it.captureRows.size },
-            Column("expectedCaptureCount") { EVALUATION_SESSION_CAPTURE_COUNT },
-            Column("sessionComplete") { it.captureRows.size == EVALUATION_SESSION_CAPTURE_COUNT },
+            Column("wholeBurstSessionEvaluated") { it.isWholeBurstSession },
             Column("dominantResolution") { dominantResolution(it) },
             Column("observedResolutions") { run ->
                 run.captureRows.map { capture ->
@@ -1829,6 +1939,69 @@ class CaptureMetricsExcelExporter(
             return decisionRows.any { row -> admissionSheetRow(capture, row)?.sequenceUpperBoundMiss() == true }
         }
 
+        /**
+         * What a workload this capture skipped would have cost, priced from the capture nearest to it in the same
+         * session that actually ran the same workload key. Observed durations only: scoring a skip against the
+         * model's own prediction would just replay the model's opinion of itself.
+         */
+        private fun nearestObservedDurationMs(run: EvaluationRun, capture: CaptureRow, workloadKey: String): Long? =
+            run.captureRows.mapNotNull { other ->
+                val observedMs = other.nodeRows.firstOrNull { row ->
+                    row.node.workloadKey == workloadKey && row.nodeActualDurationMs != null
+                }?.nodeActualDurationMs
+                if (observedMs == null) null else abs(other.captureIndex - capture.captureIndex) to observedMs
+            }.minByOrNull { (distance, _) -> distance }?.second
+
+        /**
+         * Deadline slack this capture would still have had if every workload it skipped had run: positive means the
+         * skip bought nothing for this capture's own deadline. Null when nothing was skipped, when the deadline was
+         * not observed, or when no sibling capture ever ran a skipped workload to price it with.
+         *
+         * Scope, deliberately: it restores the skipped work into THIS capture only. The queue that work would have
+         * left for later captures is what pacing exists to absorb, so a positive slack is evidence about one
+         * capture's deadline, not a verdict that the skip was wrong - read it against the RQ2 delay cost.
+         */
+        private fun skipCounterfactualSlackMs(run: EvaluationRun, capture: CaptureRow): Long? {
+            val marginMs = capture.timeoutMarginMs ?: return null
+            val skippedRows = capture.nodeRows.filter { row -> row.isAdmissionWorkload && row.wasSkipped }
+            if (skippedRows.isEmpty()) {
+                return null
+            }
+            var restoredMs = 0L
+            for (row in skippedRows) {
+                val workloadKey = row.node.workloadKey ?: return null
+                restoredMs += nearestObservedDurationMs(run, capture, workloadKey) ?: return null
+            }
+            return marginMs - restoredMs
+        }
+
+        private fun skipCounterfactualSlacksMs(run: EvaluationRun): List<Double> =
+            run.captureRows.mapNotNull { capture -> skipCounterfactualSlackMs(run, capture)?.toDouble() }
+
+        /**
+         * Deadline margin realized by the capture that followed a paced shot ([afterDelay]) or an unpaced one. The
+         * pair is the only delay-adequacy read available offline: a delay that was too small leaves its successor
+         * in the near-miss band, one that was too large leaves it with margin to spare that shutter time paid for.
+         * Neither is a verdict on its own - flipping a delay changes every later arrival, which needs a replay.
+         */
+        private fun marginsAfterDelayMs(run: EvaluationRun, afterDelay: Boolean): List<Double> =
+            run.captureRows.mapIndexedNotNull { index, capture ->
+                val delayMs = capture.pacingReplay?.before?.appliedDelayMs
+                if (delayMs == null || (delayMs > 0L) != afterDelay) {
+                    null
+                } else {
+                    run.captureRows.getOrNull(index + 1)?.timeoutMarginMs?.toDouble()
+                }
+            }
+
+        /** Delay charged with nothing queued and nothing in flight - no backlog to drain, so it was pure shutter lag. */
+        private fun emptyPipelineDelayCount(run: EvaluationRun): Int =
+            run.captures.count { enriched ->
+                val pacing = enriched.row.pacingReplay?.before
+                pacing != null && pacing.appliedDelayMs > 0L && pacing.queuedDraftCount == 0 &&
+                    enriched.wallBase.inFlightDraftCountAtDecision == 0
+            }
+
         private fun appliedDelaySumByDominant(run: EvaluationRun, dominantDeficit: String): Long =
             run.pacingRows.filter { pacing -> pacing.beforeDominantDeficit == dominantDeficit }
                 .sumOf { pacing -> pacing.before.appliedDelayMs }
@@ -1883,9 +2056,11 @@ class CaptureMetricsExcelExporter(
         private fun buildEvaluationNotes(): List<ReplayNote> = listOf(
             ReplayNote(
                 topic = "Evaluation session",
-                note = "Each export evaluates the newest 30 stored captures as one session. sessionComplete is false " +
-                    "when fewer than 30 captures are available. The exporter does not attach manually configured " +
-                    "environment labels; record the test condition in the exported file name after pulling it.",
+                note = "Each export evaluates the newest burst session: captures are split wherever ppSequenceId " +
+                    "restarts at 0 or a capture has no shot-to-shot time, and the last group is the evaluated run. " +
+                    "wholeBurstSessionEvaluated is false when retention dropped the head of that burst, so its " +
+                    "opening shots are missing. The exporter does not attach manually configured environment " +
+                    "labels; record the test condition in the exported file name after pulling it.",
             ),
             ReplayNote(
                 topic = "RQ1 safety outcome",
@@ -1907,6 +2082,34 @@ class CaptureMetricsExcelExporter(
                 topic = "RQ3 prediction outcome",
                 note = "Upper-bound coverage uses only fully observed suffixes. Online skips have no actual workload " +
                     "duration, so unnecessary-skip claims require shadow execution or a separate offline oracle.",
+            ),
+            ReplayNote(
+                topic = "RQ3 skip oracle",
+                note = "skipCounterfactualSlackMs prices every workload a capture skipped from the nearest sibling " +
+                    "capture in the same session that actually ran that workload key, then asks whether the capture " +
+                    "would still have met its own deadline: positive slack means the skip bought that capture " +
+                    "nothing. It restores the work into that one capture only, so it cannot see the queue the " +
+                    "restored work would have left for later shots - that cross-shot cost is what pacing absorbs, " +
+                    "so read ownDeadlineUnnecessarySkipRate together with the RQ2 delay columns before calling a " +
+                    "skip wrong. Skips with no sibling observation stay unpriced and are excluded from the rate.",
+            ),
+            ReplayNote(
+                topic = "RQ2 delay adequacy",
+                note = "No column proves a delay was the right size: changing one delay changes every later " +
+                    "arrival, which needs a closed-loop replay. What is observable is the margin its successor " +
+                    "realized. p05MarginAfterDelayMs in the near-miss band means paced shots did not buy enough " +
+                    "headroom; medianMarginAfterDelayMs far above medianMarginAfterNoDelayMs means shutter time " +
+                    "bought headroom the deadline did not need. emptyPipelineDelayCount must stay 0 - a delay with " +
+                    "nothing queued and nothing in flight has no backlog to drain.",
+            ),
+            ReplayNote(
+                topic = "Burst prefix windows",
+                note = "BurstPrefix scores the same session over its first 5, 10, and 30 captures and then the whole " +
+                    "burst. A session average is a mixture: the first skip and the first delay land mid-burst " +
+                    "(firstMBokehSkipCaptureNumber, firstNonzeroPacingDelayCaptureNumber), and everything after " +
+                    "them is a different regime. The 5-capture row is the window most users actually reach, so a " +
+                    "controller that keeps M and zero delay for five shots at overheat level 5 reads as a success " +
+                    "there even when the 30-capture row shows heavy skipping.",
             ),
             ReplayNote(
                 topic = "RQ3 transition outcome",
@@ -2045,7 +2248,6 @@ class CaptureMetricsExcelExporter(
             Column("resultImageHeight") { it.capture.metrics.resultImageSize.height },
             Column("sessionId") { it.sessionSummary?.sessionId },
             Column("sessionCaptureIndex") { it.sessionSummary?.sessionCaptureIndex },
-            Column("afterSessionBoundarySource") { it.sessionSummary?.sessionBoundarySource },
             Column("nodeOrder") { it.nodeOrder },
             Column("nodeStartUptimeMs") { it.nodeRow.node.startUptimeMs },
             Column("timeoutDeadlineUptimeMs") { it.capture.metrics.timeoutTimestampMs },
@@ -2145,7 +2347,6 @@ class CaptureMetricsExcelExporter(
             Column("resultImageHeight") { it.row.metrics.resultImageSize.height },
             Column("sessionId") { it.sessionSummary.sessionId },
             Column("sessionCaptureIndex") { it.sessionSummary.sessionCaptureIndex },
-            Column("sessionBoundarySource") { it.sessionSummary.sessionBoundarySource },
             Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
             Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
             Column("firstNodeStartUptimeMs") { it.row.firstNodeStartUptimeMs },
@@ -2321,9 +2522,9 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Admission session boundary",
-                note = "sticky demotion is replayed over recorded runtime pacer session ids when every row has one; " +
-                    "rows persisted before that field fall back to timeout-delimited proxy sessions. " +
-                    "sessionBoundarySource says which grouping was used.",
+                note = "sticky demotion is replayed over burst sessions, split where ppSequenceId restarts at 0 or a " +
+                    "capture has no shot-to-shot time. pacerSessionId is reported per capture but is not the " +
+                    "boundary: it only increments when the draft pipeline drains.",
             ),
             ReplayNote(
                 topic = "Pacing draft-start latency",
