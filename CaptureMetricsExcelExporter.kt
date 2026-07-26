@@ -58,6 +58,35 @@ class CaptureMetricsExcelExporter(
     )
 
     /**
+     * One observed execution of the same workload as an admission decision. Previous observations are the primary
+     * evidence because they were available before the decision; next observations are sensitivity evidence only.
+     */
+    private class AdmissionAuditObservation(
+        val trialCaptureNumber: Int,
+        val sheetRow: NodeSheetRow,
+    )
+
+    /** Per-admission-decision factual outcome plus previous/next matched observations for retrospective auditing. */
+    private class AdmissionDecisionAuditRow(
+        val trialCaptureNumber: Int,
+        val run: EvaluationRun,
+        val sheetRow: NodeSheetRow,
+        val previousWorkloadObservation: AdmissionAuditObservation?,
+        val nextWorkloadObservation: AdmissionAuditObservation?,
+        val recentPreviousWorkloadObservations: List<AdmissionAuditObservation>,
+        val previousSequenceObservation: AdmissionAuditObservation?,
+        val nextSequenceObservation: AdmissionAuditObservation?,
+    )
+
+    /** Per-pacing-decision calibration, its gated capture outcome, and the following capture as sensitivity data. */
+    private class PacingDecisionAuditRow(
+        val trialCaptureNumber: Int,
+        val capture: EnrichedCaptureRow,
+        val nextCapture: EnrichedCaptureRow?,
+        val run: EvaluationRun,
+    )
+
+    /**
      * The same run scored over only its first [prefixCaptureCount] captures. A burst degrades as it goes - the
      * first skip and the first delay land somewhere in the middle - so a whole-session average hides what the user
      * actually experiences in a short burst. Five shots is the usability-representative window; ten and the full
@@ -176,6 +205,8 @@ class CaptureMetricsExcelExporter(
             val failureAttributionRows = evaluationRun.timelineRows
                 .filter { row -> isFailureOrNearMiss(row.capture.row) }
             val prefixWindowRows = prefixWindowRows(replayCaptures)
+            val admissionDecisionAuditRows = buildAdmissionDecisionAuditRows(evaluationRun)
+            val pacingDecisionAuditRows = buildPacingDecisionAuditRows(evaluationRun)
 
             writeSheet(
                 workbook,
@@ -260,6 +291,20 @@ class CaptureMetricsExcelExporter(
 
             writeSheet(workbook, styles, "AdmissionReplay", admissionReplayRows, buildAdmissionReplayColumns())
             writeSheet(workbook, styles, "PacingReplay", replayCaptures, buildPacingReplayColumns())
+            writeSheet(
+                workbook,
+                styles,
+                "AdmissionDecisionAudit",
+                admissionDecisionAuditRows,
+                buildAdmissionDecisionAuditColumns(),
+            )
+            writeSheet(
+                workbook,
+                styles,
+                "PacingDecisionAudit",
+                pacingDecisionAuditRows,
+                buildPacingDecisionAuditColumns(),
+            )
             writeSheet(workbook, styles, "ReplayNotes", buildReplayNotes(), buildReplayNoteColumns())
 
             // Write main sheet
@@ -1006,6 +1051,49 @@ class CaptureMetricsExcelExporter(
         // Cold-start window: prediction error over the first vs last few captures shows the online model converging.
         private const val COLD_START_CAPTURE_COUNT = 5
 
+        // Retrospective admission audit: the immediate previous same-workload observation is primary. Two more
+        // previous observations expose its sensitivity to a single GC/contention outlier without replacing it.
+        private const val RECENT_WORKLOAD_OBSERVATION_COUNT = 3
+        private const val AUDIT_MAX_OVERHEAT_LEVEL_DELTA = 1
+        private const val AUDIT_MAX_THERMAL_HEADROOM_DELTA = 0.25f
+        private const val AUDIT_MAX_RAM_AVAILABLE_PERCENT_DELTA = 10
+
+        private const val AUDIT_BASIS_FACTUAL_ADMIT = "Factual admitted suffix"
+        private const val AUDIT_BASIS_PREVIOUS_EXACT_SEQUENCE = "Previous exact-sequence observed suffix"
+        private const val AUDIT_BASIS_PREVIOUS_WORKLOAD = "Previous same-workload own-deadline proxy"
+        private const val AUDIT_BASIS_FUTURE_EXACT_SEQUENCE_ONLY = "Future exact-sequence sensitivity only"
+        private const val AUDIT_BASIS_FUTURE_WORKLOAD_ONLY = "Future same-workload sensitivity only"
+        private const val AUDIT_BASIS_NO_COMPARABLE_OBSERVATION = "No comparable observation"
+
+        private const val AUDIT_VERDICT_OBSERVED_FEASIBLE_ADMIT = "Observed Feasible Admit"
+        private const val AUDIT_VERDICT_OBSERVED_INFEASIBLE_ADMIT = "Observed Infeasible Admit"
+        private const val AUDIT_VERDICT_OBSERVED_UNSAFE_ADMIT_FEASIBILITY_UNKNOWN =
+            "Observed Unsafe Admit, Feasibility Unknown"
+        private const val AUDIT_VERDICT_OBSERVED_ADMIT_INCOMPLETE = "Observed Admit, Incomplete Suffix"
+        private const val AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP = "Likely Unnecessary Skip"
+        private const val AUDIT_VERDICT_LIKELY_CORRECT_SKIP = "Likely Correct Skip"
+        private const val AUDIT_VERDICT_UNCERTAIN_TRANSITION = "Uncertain: Previous/Next Disagree"
+        private const val AUDIT_VERDICT_UNIDENTIFIABLE_SKIP = "Unidentifiable Skip"
+
+        private const val AUDIT_CONFIDENCE_HIGH = "High"
+        private const val AUDIT_CONFIDENCE_MEDIUM = "Medium"
+        private const val AUDIT_CONFIDENCE_LOW = "Low"
+        private const val AUDIT_CONFIDENCE_NONE = "None"
+
+        private const val PACING_AUDIT_BASIS_EMPTY_PIPELINE = "Observed delay with empty pipeline"
+        private const val PACING_AUDIT_BASIS_NO_CAPTURE_OUTCOME = "No gated-capture outcome"
+        private const val PACING_AUDIT_BASIS_CALIBRATION_AND_CAPTURE_OUTCOME =
+            "Queue/ceiling calibration plus gated-capture outcome"
+        private const val PACING_AUDIT_BASIS_CAPTURE_OUTCOME_ONLY = "Gated-capture outcome only"
+        private const val PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE = "Likely Excessive Delay"
+        private const val PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT = "Likely Insufficient Delay"
+        private const val PACING_AUDIT_VERDICT_UNCERTAIN_CAPTURE_AT_RISK =
+            "Uncertain: Gated Capture At Risk"
+        private const val PACING_AUDIT_VERDICT_OUTCOME_SUPPORTED_OPTIMALITY_UNKNOWN =
+            "Outcome Supported, Delay Optimality Unknown"
+        private const val PACING_AUDIT_VERDICT_NO_DELAY_OUTCOME_SUPPORTED = "No-delay Outcome Supported"
+        private const val PACING_AUDIT_VERDICT_UNIDENTIFIABLE = "Unidentifiable Pacing Decision"
+
         // Burst prefixes scored separately in BurstPrefix. Five shots is the usability-representative window most
         // users ever reach; ten and thirty show how far into a burst the controller holds before it trades away.
         private val PREFIX_CAPTURE_COUNTS = listOf(5, 10, 30)
@@ -1059,6 +1147,70 @@ class CaptureMetricsExcelExporter(
                 }
             }
         }
+
+        private fun buildAdmissionDecisionAuditRows(run: EvaluationRun): List<AdmissionDecisionAuditRow> {
+            val observations = run.captureRows.flatMapIndexed { captureIndex, capture ->
+                capture.nodeRows.mapIndexed { nodeIndex, nodeRow ->
+                    AdmissionAuditObservation(
+                        trialCaptureNumber = captureIndex + 1,
+                        sheetRow = NodeSheetRow(capture, nodeIndex + 1, nodeRow),
+                    )
+                }
+            }
+            return observations.filter { observation ->
+                observation.sheetRow.nodeRow.isAdmissionWorkload &&
+                    observation.sheetRow.nodeRow.prediction != null
+            }.map { current ->
+                val workloadKey = current.sheetRow.nodeRow.node.workloadKey
+                val workloadObservations = observations.filter { candidate ->
+                    candidate.trialCaptureNumber != current.trialCaptureNumber &&
+                        candidate.sheetRow.nodeRow.node.workloadKey == workloadKey &&
+                        candidate.sheetRow.nodeRow.nodeActualDurationMs != null
+                }
+                val previousWorkloadObservations = workloadObservations
+                    .filter { candidate -> candidate.trialCaptureNumber < current.trialCaptureNumber }
+                    .sortedByDescending { candidate -> candidate.trialCaptureNumber }
+                val nextWorkloadObservations = workloadObservations
+                    .filter { candidate -> candidate.trialCaptureNumber > current.trialCaptureNumber }
+                    .sortedBy { candidate -> candidate.trialCaptureNumber }
+
+                val workloadSequenceKey = current.sheetRow.nodeRow.prediction?.workloadSequenceKey
+                val exactSequenceObservations = workloadObservations.filter { candidate ->
+                    workloadSequenceKey != null &&
+                        candidate.sheetRow.nodeRow.prediction?.workloadSequenceKey == workloadSequenceKey &&
+                        candidate.sheetRow.isFullyObservedSuffix()
+                }
+                AdmissionDecisionAuditRow(
+                    trialCaptureNumber = current.trialCaptureNumber,
+                    run = run,
+                    sheetRow = current.sheetRow,
+                    previousWorkloadObservation = previousWorkloadObservations.firstOrNull(),
+                    nextWorkloadObservation = nextWorkloadObservations.firstOrNull(),
+                    recentPreviousWorkloadObservations =
+                        previousWorkloadObservations.take(RECENT_WORKLOAD_OBSERVATION_COUNT),
+                    previousSequenceObservation = exactSequenceObservations
+                        .filter { candidate -> candidate.trialCaptureNumber < current.trialCaptureNumber }
+                        .maxByOrNull { candidate -> candidate.trialCaptureNumber },
+                    nextSequenceObservation = exactSequenceObservations
+                        .filter { candidate -> candidate.trialCaptureNumber > current.trialCaptureNumber }
+                        .minByOrNull { candidate -> candidate.trialCaptureNumber },
+                )
+            }
+        }
+
+        private fun buildPacingDecisionAuditRows(run: EvaluationRun): List<PacingDecisionAuditRow> =
+            run.captures.mapIndexedNotNull { index, capture ->
+                if (capture.row.pacingReplay == null) {
+                    null
+                } else {
+                    PacingDecisionAuditRow(
+                        trialCaptureNumber = index + 1,
+                        capture = capture,
+                        nextCapture = run.captures.getOrNull(index + 1),
+                        run = run,
+                    )
+                }
+            }
 
         private fun NodeRow.replayWorkloadKey(): WorkloadKey? {
             val workloadKey = node.workloadKey ?: return null
@@ -1283,6 +1435,21 @@ class CaptureMetricsExcelExporter(
             Column("p05MarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.05) },
             Column("medianMarginAfterDelayMs") { run -> percentile(marginsAfterDelayMs(run, true), 0.50) },
             Column("medianMarginAfterNoDelayMs") { run -> percentile(marginsAfterDelayMs(run, false), 0.50) },
+            Column("likelyExcessivePacingDecisionCount") { run ->
+                buildPacingDecisionAuditRows(run).count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
+                }
+            },
+            Column("likelyInsufficientPacingDecisionCount") { run ->
+                buildPacingDecisionAuditRows(run).count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
+                }
+            },
+            Column("unidentifiablePacingDecisionCount") { run ->
+                buildPacingDecisionAuditRows(run).count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_UNIDENTIFIABLE
+                }
+            },
         )
 
         private fun buildRq3Columns(): List<Column<EvaluationRun>> = listOf(
@@ -1413,6 +1580,18 @@ class CaptureMetricsExcelExporter(
                 }
                 rate(unsafe, correct + unsafe)
             },
+            // Feasibility is kept separate from capture safety: a timeout caused by inherited backlog must not by
+            // itself turn a budget-feasible admission into evidence that the admission gate was wrong.
+            Column("observedFeasibleAdmitDecisionCount") { run ->
+                run.admissionRows.count { row -> row.observedActualFeasible() == true }
+            },
+            Column("observedInfeasibleAdmitDecisionCount") { run ->
+                run.admissionRows.count { row -> row.observedActualFeasible() == false }
+            },
+            Column("observedAdmitFeasibilityRate") { run ->
+                val observed = run.admissionRows.mapNotNull { row -> row.observedActualFeasible() }
+                rate(observed.count { feasible -> feasible }, observed.size)
+            },
             Column("skipRequiresOfflineOracleCount") { run ->
                 run.admissionRows.count {
                     row -> row.decisionOutcome() == DecisionOutcome.SKIP_REQUIRES_OFFLINE_ORACLE
@@ -1434,6 +1613,54 @@ class CaptureMetricsExcelExporter(
             },
             Column("p05SkipCounterfactualSlackMs") { run ->
                 percentile(skipCounterfactualSlacksMs(run), 0.05)
+            },
+            // Past-only is the decision-time-faithful primary audit. Future-only never supplies the primary verdict;
+            // it only shows whether a nearby later observation would reverse the retrospective conclusion.
+            Column("previousPricedSkipCaptureCount") { run ->
+                directionalSkipCounterfactualSlacksMs(run, previous = true).size
+            },
+            Column("previousOwnDeadlineUnnecessarySkipCount") { run ->
+                directionalSkipCounterfactualSlacksMs(run, previous = true)
+                    .count { slackMs -> slackMs >= 0.0 }
+            },
+            Column("previousOwnDeadlineUnnecessarySkipRate") { run ->
+                val slacksMs = directionalSkipCounterfactualSlacksMs(run, previous = true)
+                rate(slacksMs.count { slackMs -> slackMs >= 0.0 }, slacksMs.size)
+            },
+            Column("medianPreviousSkipCounterfactualSlackMs") { run ->
+                percentile(directionalSkipCounterfactualSlacksMs(run, previous = true), 0.50)
+            },
+            Column("nextSensitivityPricedSkipCaptureCount") { run ->
+                directionalSkipCounterfactualSlacksMs(run, previous = false).size
+            },
+            Column("previousNextSkipEvidenceComparedCount") { run ->
+                run.captureRows.count { capture -> directionalSkipEvidenceAgreement(run, capture) != null }
+            },
+            Column("previousNextSkipEvidenceAgreementRate") { run ->
+                val compared = run.captureRows.mapNotNull { capture ->
+                    directionalSkipEvidenceAgreement(run, capture)
+                }
+                rate(compared.count { agrees -> agrees }, compared.size)
+            },
+            Column("likelyUnnecessarySkipDecisionCount") { run ->
+                buildAdmissionDecisionAuditRows(run).count { row ->
+                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
+                }
+            },
+            Column("likelyCorrectSkipDecisionCount") { run ->
+                buildAdmissionDecisionAuditRows(run).count { row ->
+                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_CORRECT_SKIP
+                }
+            },
+            Column("uncertainTransitionSkipDecisionCount") { run ->
+                buildAdmissionDecisionAuditRows(run).count { row ->
+                    admissionAuditVerdict(row) == AUDIT_VERDICT_UNCERTAIN_TRANSITION
+                }
+            },
+            Column("unidentifiableSkipDecisionCount") { run ->
+                buildAdmissionDecisionAuditRows(run).count { row ->
+                    admissionAuditVerdict(row) == AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
+                }
             },
             Column("pacingCeilingObservedCount") { run -> ceilingErrorsMs(run).size },
             Column("ceilingUndershootCount") { run ->
@@ -1575,6 +1802,432 @@ class CaptureMetricsExcelExporter(
             Column("skipCounterfactualSlackMs") { row ->
                 skipCounterfactualSlackMs(row.run, row.capture.row)
             },
+            Column("previousSkipCounterfactualSlackMs") { row ->
+                directionalSkipCounterfactualSlackMs(row.run, row.capture.row, previous = true)
+            },
+            Column("nextSensitivitySkipCounterfactualSlackMs") { row ->
+                directionalSkipCounterfactualSlackMs(row.run, row.capture.row, previous = false)
+            },
+            Column("previousNextSkipEvidenceAgree") { row ->
+                directionalSkipEvidenceAgreement(row.run, row.capture.row)
+            },
+        )
+
+        private fun buildAdmissionDecisionAuditColumns(): List<Column<AdmissionDecisionAuditRow>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("sizeBucketInferred") { sizeBucketInferred(it.run) },
+            Column("targetConfigInferred") { targetConfigInferred(it.run) },
+            Column("armSignatureInferred") { armSignatureInferred(it.run) },
+            Column("armLabel") { "" },
+            Column("conditionLabel") { "" },
+            Column("trialCaptureNumber") { it.trialCaptureNumber },
+            Column("captureIndex") { it.sheetRow.capture.captureIndex },
+            Column("ppSequenceId") { it.sheetRow.capture.metrics.ppSequenceId },
+            Column("dsMode") { DynamicShotMode.getDsModeName(it.sheetRow.capture.metrics.dsMode) },
+            Column("resultImageWidth") { it.sheetRow.capture.metrics.resultImageSize.width },
+            Column("resultImageHeight") { it.sheetRow.capture.metrics.resultImageSize.height },
+            Column("nodeOrder") { it.sheetRow.nodeOrder },
+            Column("admissionStage") { it.sheetRow.admissionStage() },
+            Column("workloadKey") { it.sheetRow.nodeRow.node.workloadKey },
+            Column("workloadSequenceKey") { it.sheetRow.nodeRow.prediction?.workloadSequenceKey },
+            Column("") { "" },
+            Column("budgetMs") { it.sheetRow.nodeRow.node.preExecutionMetrics.budgetMs },
+            Column("sequencePredictedDurationMs") {
+                it.sheetRow.nodeRow.prediction?.sequencePredictedDurationMs
+            },
+            Column("sequencePredictedUpperBoundMs") {
+                it.sheetRow.nodeRow.prediction?.sequencePredictedUpperBoundMs
+            },
+            Column("admissionMarginMs") { row ->
+                row.sheetRow.nodeRow.prediction?.let { prediction ->
+                    row.sheetRow.nodeRow.node.preExecutionMetrics.budgetMs -
+                        prediction.sequencePredictedUpperBoundMs
+                }
+            },
+            Column("effectiveAdmit") { it.sheetRow.nodeRow.prediction?.admit },
+            Column("skipReason") { it.sheetRow.admissionSkipReason() },
+            Column("sessionDemotionApplied") { row ->
+                row.sheetRow.inferredBeforeModelAdmit() == true &&
+                    row.sheetRow.nodeRow.prediction?.admit == false
+            },
+            Column("") { "" },
+            Column("captureTimedOut") { it.sheetRow.capture.hasTimeoutFailure },
+            Column("captureWatchdogFailed") { it.sheetRow.capture.hasWatchdogFailure },
+            Column("timeoutMarginMs") { it.sheetRow.capture.timeoutMarginMs },
+            Column("nodeActualDurationMs") { it.sheetRow.nodeRow.nodeActualDurationMs },
+            Column("sequenceActualDurationMs") { it.sheetRow.nodeRow.sequenceActualDurationMs },
+            Column("suffixFullyObserved") { it.sheetRow.isFullyObservedSuffix() },
+            Column("observedActualFeasible") { it.sheetRow.observedActualFeasible() },
+            Column("recordedDecisionOutcome") { it.sheetRow.decisionOutcomeLabel() },
+            Column("runQueueWaitMs") {
+                it.sheetRow.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.runqueueWaitMs
+            },
+            Column("cpuUtilizationRatio") {
+                it.sheetRow.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.cpuUtilizationRatio
+            },
+            Column("blockingGcCount") {
+                it.sheetRow.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcCount
+            },
+            Column("blockingGcTimeMs") {
+                it.sheetRow.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcTimeMs
+            },
+            Column("") { "" },
+            Column("overheatLevel") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.overheatLevel
+            },
+            Column("thermalStatus") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.thermalStatus
+            },
+            Column("thermalHeadroom") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom
+            },
+            Column("isLowMemory") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.memorySnapshot.isLowMemory
+            },
+            Column("ramAvailablePercent") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent
+            },
+            Column("javaHeapUsedPercent") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.memorySnapshot.javaHeapUsedPercent
+            },
+            Column("nativeHeapAllocatedPercent") {
+                it.sheetRow.nodeRow.node.preExecutionMetrics.memorySnapshot.nativeHeapAllocatedPercent
+            },
+            Column("appliedPacingDelayMs") { row ->
+                admissionAuditEnrichedCapture(row, null)?.row?.pacingReplay?.before?.appliedDelayMs
+            },
+            Column("pacingDominantDeficit") { row ->
+                admissionAuditEnrichedCapture(row, null)?.row?.pacingReplay?.beforeDominantDeficit
+            },
+            Column("pacingBacklogMs") { row ->
+                admissionAuditEnrichedCapture(row, null)?.row?.pacingReplay?.before?.backlogMs
+            },
+            Column("pacingQueuedDraftCount") { row ->
+                admissionAuditEnrichedCapture(row, null)?.row?.pacingReplay?.before?.queuedDraftCount
+            },
+            Column("pacingInFlightDraftCountAtDecision") { row ->
+                admissionAuditEnrichedCapture(row, null)?.wallBase?.inFlightDraftCountAtDecision
+            },
+            Column("") { "" },
+            Column("previousWorkloadTrialCaptureNumber") {
+                it.previousWorkloadObservation?.trialCaptureNumber
+            },
+            Column("previousWorkloadCaptureIndex") {
+                it.previousWorkloadObservation?.sheetRow?.capture?.captureIndex
+            },
+            Column("previousWorkloadDistanceCaptures") { row ->
+                row.previousWorkloadObservation?.let { observation ->
+                    row.trialCaptureNumber - observation.trialCaptureNumber
+                }
+            },
+            Column("previousWorkloadNodeDurationMs") {
+                it.previousWorkloadObservation?.sheetRow?.nodeRow?.nodeActualDurationMs
+            },
+            Column("previousWorkloadSequenceKey") {
+                it.previousWorkloadObservation?.sheetRow?.nodeRow?.prediction?.workloadSequenceKey
+            },
+            Column("previousWorkloadExactSequenceMatch") { row ->
+                val currentKey = row.sheetRow.nodeRow.prediction?.workloadSequenceKey
+                val observedKey =
+                    row.previousWorkloadObservation?.sheetRow?.nodeRow?.prediction?.workloadSequenceKey
+                if (currentKey == null || observedKey == null) {
+                    null
+                } else {
+                    currentKey == observedKey
+                }
+            },
+            Column("previousWorkloadOwnDeadlineSlackMs") { row ->
+                ownDeadlineSlackMs(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadOverheatLevel") { row ->
+                observationPreExecutionMetrics(row.previousWorkloadObservation)
+                    ?.thermalSnapshot?.overheatLevel
+            },
+            Column("previousWorkloadOverheatLevelDelta") { row ->
+                overheatLevelDelta(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadThermalHeadroom") { row ->
+                observationPreExecutionMetrics(row.previousWorkloadObservation)
+                    ?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("previousWorkloadThermalHeadroomDelta") { row ->
+                thermalHeadroomDelta(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadIsLowMemory") { row ->
+                observationPreExecutionMetrics(row.previousWorkloadObservation)
+                    ?.memorySnapshot?.isLowMemory
+            },
+            Column("previousWorkloadRamAvailablePercent") { row ->
+                observationPreExecutionMetrics(row.previousWorkloadObservation)
+                    ?.memorySnapshot?.ramAvailablePercent
+            },
+            Column("previousWorkloadRamAvailablePercentDelta") { row ->
+                ramAvailablePercentDelta(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadPacingBacklogMs") { row ->
+                admissionAuditEnrichedCapture(row, row.previousWorkloadObservation)
+                    ?.row?.pacingReplay?.before?.backlogMs
+            },
+            Column("previousWorkloadPacingBacklogDeltaMs") { row ->
+                pacingBacklogDeltaMs(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadQueuedDraftCount") { row ->
+                admissionAuditEnrichedCapture(row, row.previousWorkloadObservation)
+                    ?.row?.pacingReplay?.before?.queuedDraftCount
+            },
+            Column("previousWorkloadContextComparable") { row ->
+                contextComparable(row, row.previousWorkloadObservation)
+            },
+            Column("previousWorkloadRunQueueWaitMs") {
+                it.previousWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.cpuProcessingSnapshot?.runqueueWaitMs
+            },
+            Column("previousWorkloadBlockingGcCount") {
+                it.previousWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.gcSnapshot?.blockingGcCount
+            },
+            Column("previousWorkloadBlockingGcTimeMs") {
+                it.previousWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.gcSnapshot?.blockingGcTimeMs
+            },
+            Column("") { "" },
+            Column("recentPreviousWorkloadObservationCount") {
+                it.recentPreviousWorkloadObservations.size
+            },
+            Column("recentPreviousWorkloadMedianDurationMs") {
+                recentPreviousWorkloadMedianDurationMs(it)
+            },
+            Column("recentPreviousWorkloadMedianOwnDeadlineSlackMs") { row ->
+                val marginMs = row.sheetRow.capture.timeoutMarginMs
+                val medianDurationMs = recentPreviousWorkloadMedianDurationMs(row)
+                if (marginMs == null || medianDurationMs == null) {
+                    null
+                } else {
+                    marginMs.toDouble() - medianDurationMs
+                }
+            },
+            Column("") { "" },
+            Column("nextWorkloadTrialCaptureNumber") {
+                it.nextWorkloadObservation?.trialCaptureNumber
+            },
+            Column("nextWorkloadCaptureIndex") {
+                it.nextWorkloadObservation?.sheetRow?.capture?.captureIndex
+            },
+            Column("nextWorkloadDistanceCaptures") { row ->
+                row.nextWorkloadObservation?.let { observation ->
+                    observation.trialCaptureNumber - row.trialCaptureNumber
+                }
+            },
+            Column("nextWorkloadNodeDurationMs") {
+                it.nextWorkloadObservation?.sheetRow?.nodeRow?.nodeActualDurationMs
+            },
+            Column("nextWorkloadSequenceKey") {
+                it.nextWorkloadObservation?.sheetRow?.nodeRow?.prediction?.workloadSequenceKey
+            },
+            Column("nextWorkloadExactSequenceMatch") { row ->
+                val currentKey = row.sheetRow.nodeRow.prediction?.workloadSequenceKey
+                val observedKey =
+                    row.nextWorkloadObservation?.sheetRow?.nodeRow?.prediction?.workloadSequenceKey
+                if (currentKey == null || observedKey == null) {
+                    null
+                } else {
+                    currentKey == observedKey
+                }
+            },
+            Column("nextWorkloadOwnDeadlineSlackMs") { row ->
+                ownDeadlineSlackMs(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadOverheatLevel") { row ->
+                observationPreExecutionMetrics(row.nextWorkloadObservation)
+                    ?.thermalSnapshot?.overheatLevel
+            },
+            Column("nextWorkloadOverheatLevelDelta") { row ->
+                overheatLevelDelta(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadThermalHeadroom") { row ->
+                observationPreExecutionMetrics(row.nextWorkloadObservation)
+                    ?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("nextWorkloadThermalHeadroomDelta") { row ->
+                thermalHeadroomDelta(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadIsLowMemory") { row ->
+                observationPreExecutionMetrics(row.nextWorkloadObservation)
+                    ?.memorySnapshot?.isLowMemory
+            },
+            Column("nextWorkloadRamAvailablePercent") { row ->
+                observationPreExecutionMetrics(row.nextWorkloadObservation)
+                    ?.memorySnapshot?.ramAvailablePercent
+            },
+            Column("nextWorkloadRamAvailablePercentDelta") { row ->
+                ramAvailablePercentDelta(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadPacingBacklogMs") { row ->
+                admissionAuditEnrichedCapture(row, row.nextWorkloadObservation)
+                    ?.row?.pacingReplay?.before?.backlogMs
+            },
+            Column("nextWorkloadPacingBacklogDeltaMs") { row ->
+                pacingBacklogDeltaMs(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadQueuedDraftCount") { row ->
+                admissionAuditEnrichedCapture(row, row.nextWorkloadObservation)
+                    ?.row?.pacingReplay?.before?.queuedDraftCount
+            },
+            Column("nextWorkloadContextComparable") { row ->
+                contextComparable(row, row.nextWorkloadObservation)
+            },
+            Column("nextWorkloadRunQueueWaitMs") {
+                it.nextWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.cpuProcessingSnapshot?.runqueueWaitMs
+            },
+            Column("nextWorkloadBlockingGcCount") {
+                it.nextWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.gcSnapshot?.blockingGcCount
+            },
+            Column("nextWorkloadBlockingGcTimeMs") {
+                it.nextWorkloadObservation?.sheetRow?.nodeRow?.node?.postExecutionMetrics
+                    ?.gcSnapshot?.blockingGcTimeMs
+            },
+            Column("") { "" },
+            Column("previousExactSequenceTrialCaptureNumber") {
+                it.previousSequenceObservation?.trialCaptureNumber
+            },
+            Column("previousExactSequenceDistanceCaptures") { row ->
+                row.previousSequenceObservation?.let { observation ->
+                    row.trialCaptureNumber - observation.trialCaptureNumber
+                }
+            },
+            Column("previousExactSequenceActualDurationMs") {
+                it.previousSequenceObservation?.sheetRow?.nodeRow?.sequenceActualDurationMs
+            },
+            Column("previousExactSequenceBudgetSlackMs") { row ->
+                sequenceBudgetSlackMs(row, row.previousSequenceObservation)
+            },
+            Column("previousExactSequenceContextComparable") { row ->
+                contextComparable(row, row.previousSequenceObservation)
+            },
+            Column("nextExactSequenceTrialCaptureNumber") {
+                it.nextSequenceObservation?.trialCaptureNumber
+            },
+            Column("nextExactSequenceDistanceCaptures") { row ->
+                row.nextSequenceObservation?.let { observation ->
+                    observation.trialCaptureNumber - row.trialCaptureNumber
+                }
+            },
+            Column("nextExactSequenceActualDurationMs") {
+                it.nextSequenceObservation?.sheetRow?.nodeRow?.sequenceActualDurationMs
+            },
+            Column("nextExactSequenceBudgetSlackMs") { row ->
+                sequenceBudgetSlackMs(row, row.nextSequenceObservation)
+            },
+            Column("nextExactSequenceContextComparable") { row ->
+                contextComparable(row, row.nextSequenceObservation)
+            },
+            Column("") { "" },
+            Column("previousAllSkippedWorkloadsOwnDeadlineSlackMs") { row ->
+                directionalSkipCounterfactualSlackMs(row.run, row.sheetRow.capture, previous = true)
+            },
+            Column("nextAllSkippedWorkloadsOwnDeadlineSlackMs") { row ->
+                directionalSkipCounterfactualSlackMs(row.run, row.sheetRow.capture, previous = false)
+            },
+            Column("previousNextAllSkippedEvidenceAgree") { row ->
+                directionalSkipEvidenceAgreement(row.run, row.sheetRow.capture)
+            },
+            Column("") { "" },
+            Column("auditEvidenceBasis") { admissionAuditEvidenceBasis(it) },
+            Column("previousNextEvidenceAgree") { admissionAuditEvidenceAgreement(it) },
+            Column("auditVerdict") { admissionAuditVerdict(it) },
+            Column("auditConfidence") { admissionAuditConfidence(it) },
+        )
+
+        private fun buildPacingDecisionAuditColumns(): List<Column<PacingDecisionAuditRow>> = listOf(
+            Column("deviceModel") { Build.MODEL },
+            Column("sizeBucketInferred") { sizeBucketInferred(it.run) },
+            Column("targetConfigInferred") { targetConfigInferred(it.run) },
+            Column("armSignatureInferred") { armSignatureInferred(it.run) },
+            Column("armLabel") { "" },
+            Column("conditionLabel") { "" },
+            Column("trialCaptureNumber") { it.trialCaptureNumber },
+            Column("captureIndex") { it.capture.row.captureIndex },
+            Column("ppSequenceId") { it.capture.row.metrics.ppSequenceId },
+            Column("dsMode") { DynamicShotMode.getDsModeName(it.capture.row.metrics.dsMode) },
+            Column("resultImageWidth") { it.capture.row.metrics.resultImageSize.width },
+            Column("resultImageHeight") { it.capture.row.metrics.resultImageSize.height },
+            Column("overheatLevel") { overheatLevelOf(it.capture.row) },
+            Column("thermalHeadroom") {
+                it.capture.row.nodeRows.firstOrNull()
+                    ?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("isLowMemory") {
+                it.capture.row.nodeRows.firstOrNull()
+                    ?.node?.preExecutionMetrics?.memorySnapshot?.isLowMemory
+            },
+            Column("") { "" },
+            Column("decisionUptimeMs") { it.capture.row.pacingReplay?.before?.decisionUptimeMs },
+            Column("appliedDelayMs") { it.capture.row.pacingReplay?.before?.appliedDelayMs },
+            Column("dominantDeficit") { it.capture.row.pacingReplay?.beforeDominantDeficit },
+            Column("levelDeficitMs") { it.capture.row.pacingReplay?.before?.levelDeficitMs },
+            Column("backlogDeficitMs") { it.capture.row.pacingReplay?.before?.backlogDeficitMs },
+            Column("backlogMs") { it.capture.row.pacingReplay?.before?.backlogMs },
+            Column("queuedDraftCount") { it.capture.row.pacingReplay?.before?.queuedDraftCount },
+            Column("inFlightDraftCountAtDecision") {
+                it.capture.wallBase.inFlightDraftCountAtDecision
+            },
+            Column("maxDraftStartLatencyMs") {
+                it.capture.row.pacingReplay?.before?.maxDraftStartLatencyMs
+            },
+            Column("pricedQueueWaitMs") { row -> pricedQueueWaitMs(row.capture) },
+            Column("realQueueWaitMs") { row -> realQueueWaitMs(row.capture) },
+            Column("queuePricingErrorMs") { row -> queuePricingErrorMs(row.capture) },
+            Column("sessionPlannedCeilingMs") {
+                it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            },
+            Column("draftWallMs") { it.capture.row.draftWallMs },
+            Column("ceilingErrorMs") { row -> pacingCeilingErrorMs(row.capture) },
+            Column("emptyPipelineDelay") { row -> isEmptyPipelineDelay(row.capture) },
+            Column("") { "" },
+            // The queued decision is consumed by this draft start, so this row - not the following one - is the
+            // factual outcome of the delay. The next capture remains transition sensitivity evidence only.
+            Column("captureShotToShotTimeMs") { it.capture.row.metrics.shotToShotTimeMs },
+            Column("captureTimedOut") { it.capture.row.hasTimeoutFailure },
+            Column("captureWatchdogFailed") { it.capture.row.hasWatchdogFailure },
+            Column("captureTimeoutMarginMs") { it.capture.row.timeoutMarginMs },
+            Column("captureNearMiss") { row -> isNearMiss(row.capture.row) },
+            Column("medianTimeoutMarginWithDelayMs") { row ->
+                percentile(marginsAfterDelayMs(row.run, true), 0.50)
+            },
+            Column("medianTimeoutMarginWithoutDelayMs") { row ->
+                percentile(marginsAfterDelayMs(row.run, false), 0.50)
+            },
+            Column("timeoutMarginVsNoDelayMedianMs") { row ->
+                val timeoutMarginMs = row.capture.row.timeoutMarginMs
+                val noDelayMedianMs = percentile(marginsAfterDelayMs(row.run, false), 0.50)
+                if (timeoutMarginMs == null || noDelayMedianMs == null) {
+                    null
+                } else {
+                    timeoutMarginMs.toDouble() - noDelayMedianMs
+                }
+            },
+            Column("") { "" },
+            Column("nextCaptureIndex") { it.nextCapture?.row?.captureIndex },
+            Column("nextCaptureShotToShotTimeMs") { it.nextCapture?.row?.metrics?.shotToShotTimeMs },
+            Column("nextCaptureTimedOut") { it.nextCapture?.row?.hasTimeoutFailure },
+            Column("nextCaptureWatchdogFailed") { it.nextCapture?.row?.hasWatchdogFailure },
+            Column("nextCaptureTimeoutMarginMs") { it.nextCapture?.row?.timeoutMarginMs },
+            Column("nextCaptureNearMiss") { row ->
+                row.nextCapture?.row?.let(::isNearMiss)
+            },
+            Column("nextCaptureOverheatLevel") { row ->
+                row.nextCapture?.row?.let(::overheatLevelOf)
+            },
+            Column("nextCaptureThermalHeadroom") {
+                it.nextCapture?.row?.nodeRows?.firstOrNull()
+                    ?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+            Column("") { "" },
+            Column("auditEvidenceBasis") { pacingAuditEvidenceBasis(it) },
+            Column("auditVerdict") { pacingAuditVerdict(it) },
+            Column("auditConfidence") { pacingAuditConfidence(it) },
         )
 
         /** Prefix windows plus the whole burst, deduplicated and clipped to what was actually captured. */
@@ -1760,6 +2413,24 @@ class CaptureMetricsExcelExporter(
             Column("unsafeAdmitCount") { run ->
                 run.admissionRows.count { row -> row.decisionOutcome() == DecisionOutcome.UNSAFE_ADMIT }
             },
+            Column("observedInfeasibleAdmitDecisionCount") { run ->
+                run.admissionRows.count { row -> row.observedActualFeasible() == false }
+            },
+            Column("likelyUnnecessarySkipDecisionCount") { run ->
+                buildAdmissionDecisionAuditRows(run).count { row ->
+                    admissionAuditVerdict(row) == AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
+                }
+            },
+            Column("likelyExcessivePacingDecisionCount") { run ->
+                buildPacingDecisionAuditRows(run).count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
+                }
+            },
+            Column("likelyInsufficientPacingDecisionCount") { run ->
+                buildPacingDecisionAuditRows(run).count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
+                }
+            },
             Column("sequenceUpperBoundMissCount") { run ->
                 run.admissionRows.count { row -> row.sequenceUpperBoundMiss() == true }
             },
@@ -1939,6 +2610,344 @@ class CaptureMetricsExcelExporter(
             return decisionRows.any { row -> admissionSheetRow(capture, row)?.sequenceUpperBoundMiss() == true }
         }
 
+        private fun observationPreExecutionMetrics(
+            observation: AdmissionAuditObservation?,
+        ): PreExecutionMetrics? = observation?.sheetRow?.nodeRow?.node?.preExecutionMetrics
+
+        private fun admissionAuditEnrichedCapture(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): EnrichedCaptureRow? {
+            val trialCaptureNumber = observation?.trialCaptureNumber ?: row.trialCaptureNumber
+            return row.run.captures.getOrNull(trialCaptureNumber - 1)
+        }
+
+        private fun ownDeadlineSlackMs(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Long? {
+            val timeoutMarginMs = row.sheetRow.capture.timeoutMarginMs ?: return null
+            val observedDurationMs = observation?.sheetRow?.nodeRow?.nodeActualDurationMs ?: return null
+            return timeoutMarginMs - observedDurationMs
+        }
+
+        private fun sequenceBudgetSlackMs(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Long? {
+            val sequenceActualDurationMs =
+                observation?.sheetRow?.nodeRow?.sequenceActualDurationMs ?: return null
+            return row.sheetRow.nodeRow.node.preExecutionMetrics.budgetMs - sequenceActualDurationMs
+        }
+
+        private fun recentPreviousWorkloadMedianDurationMs(row: AdmissionDecisionAuditRow): Double? =
+            percentile(
+                row.recentPreviousWorkloadObservations.mapNotNull { observation ->
+                    observation.sheetRow.nodeRow.nodeActualDurationMs?.toDouble()
+                },
+                0.50,
+            )
+
+        private fun overheatLevelDelta(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Int? {
+            val observedLevel =
+                observationPreExecutionMetrics(observation)?.thermalSnapshot?.overheatLevel ?: return null
+            val currentLevel = row.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.overheatLevel
+            return currentLevel - observedLevel
+        }
+
+        private fun thermalHeadroomDelta(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Float? {
+            val observedHeadroom =
+                observationPreExecutionMetrics(observation)?.thermalSnapshot?.thermalHeadroom ?: return null
+            val currentHeadroom =
+                row.sheetRow.nodeRow.node.preExecutionMetrics.thermalSnapshot.thermalHeadroom
+            return currentHeadroom - observedHeadroom
+        }
+
+        private fun ramAvailablePercentDelta(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Int? {
+            val observedRam =
+                observationPreExecutionMetrics(observation)?.memorySnapshot?.ramAvailablePercent ?: return null
+            val currentRam = row.sheetRow.nodeRow.node.preExecutionMetrics.memorySnapshot.ramAvailablePercent
+            return currentRam - observedRam
+        }
+
+        private fun pacingBacklogDeltaMs(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Long? {
+            observation ?: return null
+            val currentBacklogMs =
+                admissionAuditEnrichedCapture(row, null)?.row?.pacingReplay?.before?.backlogMs ?: return null
+            val observedBacklogMs =
+                admissionAuditEnrichedCapture(row, observation)?.row?.pacingReplay?.before?.backlogMs ?: return null
+            return currentBacklogMs - observedBacklogMs
+        }
+
+        /**
+         * Deliberately coarse context screen, not a causal match score. Raw deltas are exported beside it so an
+         * external multi-session analysis can apply condition-specific matching rather than trusting this flag.
+         */
+        private fun contextComparable(
+            row: AdmissionDecisionAuditRow,
+            observation: AdmissionAuditObservation?,
+        ): Boolean? {
+            val observed = observationPreExecutionMetrics(observation) ?: return null
+            val current = row.sheetRow.nodeRow.node.preExecutionMetrics
+            return abs(current.thermalSnapshot.overheatLevel - observed.thermalSnapshot.overheatLevel) <=
+                AUDIT_MAX_OVERHEAT_LEVEL_DELTA &&
+                abs(current.thermalSnapshot.thermalHeadroom - observed.thermalSnapshot.thermalHeadroom) <=
+                AUDIT_MAX_THERMAL_HEADROOM_DELTA &&
+                current.memorySnapshot.isLowMemory == observed.memorySnapshot.isLowMemory &&
+                abs(current.memorySnapshot.ramAvailablePercent - observed.memorySnapshot.ramAvailablePercent) <=
+                AUDIT_MAX_RAM_AVAILABLE_PERCENT_DELTA
+        }
+
+        private fun admissionAuditEvidenceBasis(row: AdmissionDecisionAuditRow): String {
+            if (row.sheetRow.nodeRow.wasAdmitted == true) {
+                return AUDIT_BASIS_FACTUAL_ADMIT
+            }
+            return when {
+                row.previousSequenceObservation != null -> AUDIT_BASIS_PREVIOUS_EXACT_SEQUENCE
+                row.previousWorkloadObservation != null -> AUDIT_BASIS_PREVIOUS_WORKLOAD
+                row.nextSequenceObservation != null -> AUDIT_BASIS_FUTURE_EXACT_SEQUENCE_ONLY
+                row.nextWorkloadObservation != null -> AUDIT_BASIS_FUTURE_WORKLOAD_ONLY
+                else -> AUDIT_BASIS_NO_COMPARABLE_OBSERVATION
+            }
+        }
+
+        private fun admissionAuditPrimarySlackMs(row: AdmissionDecisionAuditRow): Double? {
+            sequenceBudgetSlackMs(row, row.previousSequenceObservation)?.let { return it.toDouble() }
+            return ownDeadlineSlackMs(row, row.previousWorkloadObservation)?.toDouble()
+        }
+
+        private fun admissionAuditSensitivitySlackMs(row: AdmissionDecisionAuditRow): Double? {
+            if (row.previousSequenceObservation != null) {
+                return sequenceBudgetSlackMs(row, row.nextSequenceObservation)?.toDouble()
+            }
+            return ownDeadlineSlackMs(row, row.nextWorkloadObservation)?.toDouble()
+        }
+
+        private fun admissionAuditEvidenceAgreement(row: AdmissionDecisionAuditRow): Boolean? {
+            if (row.sheetRow.nodeRow.wasSkipped.not()) {
+                return null
+            }
+            val primarySlackMs = admissionAuditPrimarySlackMs(row) ?: return null
+            val sensitivitySlackMs = admissionAuditSensitivitySlackMs(row) ?: return null
+            return (primarySlackMs >= 0.0) == (sensitivitySlackMs >= 0.0)
+        }
+
+        private fun admissionAuditVerdict(row: AdmissionDecisionAuditRow): String {
+            if (row.sheetRow.nodeRow.wasAdmitted == true) {
+                return when (row.sheetRow.observedActualFeasible()) {
+                    true -> AUDIT_VERDICT_OBSERVED_FEASIBLE_ADMIT
+                    false -> AUDIT_VERDICT_OBSERVED_INFEASIBLE_ADMIT
+                    null -> if (row.sheetRow.capture.hasTimeoutOrWatchdogFailure) {
+                        AUDIT_VERDICT_OBSERVED_UNSAFE_ADMIT_FEASIBILITY_UNKNOWN
+                    } else {
+                        AUDIT_VERDICT_OBSERVED_ADMIT_INCOMPLETE
+                    }
+                }
+            }
+
+            val primarySlackMs = admissionAuditPrimarySlackMs(row)
+                ?: return AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
+            if (admissionAuditEvidenceAgreement(row) == false) {
+                return AUDIT_VERDICT_UNCERTAIN_TRANSITION
+            }
+            return if (primarySlackMs >= 0.0) {
+                AUDIT_VERDICT_LIKELY_UNNECESSARY_SKIP
+            } else {
+                AUDIT_VERDICT_LIKELY_CORRECT_SKIP
+            }
+        }
+
+        private fun admissionAuditConfidence(row: AdmissionDecisionAuditRow): String {
+            if (row.sheetRow.nodeRow.wasAdmitted == true) {
+                return if (row.sheetRow.observedActualFeasible() != null) {
+                    AUDIT_CONFIDENCE_HIGH
+                } else {
+                    AUDIT_CONFIDENCE_LOW
+                }
+            }
+            if (admissionAuditPrimarySlackMs(row) == null ||
+                admissionAuditEvidenceAgreement(row) == false
+            ) {
+                return AUDIT_CONFIDENCE_NONE
+            }
+
+            val exactSequenceEvidence = row.previousSequenceObservation != null
+            val previousObservation = if (exactSequenceEvidence) {
+                row.previousSequenceObservation
+            } else {
+                row.previousWorkloadObservation
+            }
+            val nextObservation = if (exactSequenceEvidence) {
+                row.nextSequenceObservation
+            } else {
+                row.nextWorkloadObservation
+            }
+            val previousComparable = contextComparable(row, previousObservation) == true
+            val nextComparable = contextComparable(row, nextObservation) == true
+            val evidenceAgrees = admissionAuditEvidenceAgreement(row)
+            return when {
+                exactSequenceEvidence && previousComparable && nextComparable && evidenceAgrees == true ->
+                    AUDIT_CONFIDENCE_HIGH
+                exactSequenceEvidence && previousComparable -> AUDIT_CONFIDENCE_MEDIUM
+                !exactSequenceEvidence && previousComparable && nextComparable && evidenceAgrees == true ->
+                    AUDIT_CONFIDENCE_MEDIUM
+                else -> AUDIT_CONFIDENCE_LOW
+            }
+        }
+
+        private fun pricedQueueWaitMs(capture: EnrichedCaptureRow): Long? {
+            val pacing = capture.row.pacingReplay?.before ?: return null
+            val maxDraftStartLatencyMs = pacing.maxDraftStartLatencyMs ?: return null
+            return pacing.backlogMs + maxDraftStartLatencyMs
+        }
+
+        private fun realQueueWaitMs(capture: EnrichedCaptureRow): Long? {
+            val pacing = capture.row.pacingReplay?.before ?: return null
+            val draftStartMs = capture.row.draftStartUptimeMs ?: return null
+            val releaseMs = pacing.decisionUptimeMs + pacing.appliedDelayMs
+            return (draftStartMs - releaseMs).coerceAtLeast(0L)
+        }
+
+        private fun pacingCeilingErrorMs(capture: EnrichedCaptureRow): Double? {
+            val ceilingMs = capture.row.pacingReplay?.before?.sessionPlannedCeilingMs ?: return null
+            val draftWallMs = capture.row.draftWallMs ?: return null
+            return ceilingMs - draftWallMs
+        }
+
+        private fun isEmptyPipelineDelay(capture: EnrichedCaptureRow): Boolean? {
+            val pacing = capture.row.pacingReplay?.before ?: return null
+            val inFlightCount = capture.wallBase.inFlightDraftCountAtDecision ?: return null
+            return pacing.appliedDelayMs > 0L && pacing.queuedDraftCount == 0 && inFlightCount == 0
+        }
+
+        private fun pacingAuditEvidenceBasis(row: PacingDecisionAuditRow): String {
+            if (isEmptyPipelineDelay(row.capture) == true) {
+                return PACING_AUDIT_BASIS_EMPTY_PIPELINE
+            }
+            val capture = row.capture.row
+            val hasCaptureOutcome =
+                capture.timeoutMarginMs != null || capture.hasTimeoutOrWatchdogFailure
+            if (!hasCaptureOutcome) {
+                return PACING_AUDIT_BASIS_NO_CAPTURE_OUTCOME
+            }
+            val hasCalibrationEvidence =
+                queuePricingErrorMs(row.capture) != null || pacingCeilingErrorMs(row.capture) != null
+            return if (hasCalibrationEvidence) {
+                PACING_AUDIT_BASIS_CALIBRATION_AND_CAPTURE_OUTCOME
+            } else {
+                PACING_AUDIT_BASIS_CAPTURE_OUTCOME_ONLY
+            }
+        }
+
+        private fun pacingAuditVerdict(row: PacingDecisionAuditRow): String {
+            val pacing = row.capture.row.pacingReplay?.before ?: return PACING_AUDIT_VERDICT_UNIDENTIFIABLE
+            if (isEmptyPipelineDelay(row.capture) == true) {
+                return PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
+            }
+            val capture = row.capture.row
+            val hasCaptureOutcome =
+                capture.timeoutMarginMs != null || capture.hasTimeoutOrWatchdogFailure
+            if (!hasCaptureOutcome) {
+                return PACING_AUDIT_VERDICT_UNIDENTIFIABLE
+            }
+            val captureAtRisk = capture.hasTimeoutOrWatchdogFailure || isNearMiss(capture)
+            val queueUnderpriced = queuePricingErrorMs(row.capture)?.let { errorMs -> errorMs > 0.0 } == true
+            val ceilingUndershot = pacingCeilingErrorMs(row.capture)?.let { errorMs -> errorMs < 0.0 } == true
+            if (captureAtRisk && (queueUnderpriced || ceilingUndershot)) {
+                return PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
+            }
+            if (captureAtRisk) {
+                return PACING_AUDIT_VERDICT_UNCERTAIN_CAPTURE_AT_RISK
+            }
+            return if (pacing.appliedDelayMs > 0L) {
+                PACING_AUDIT_VERDICT_OUTCOME_SUPPORTED_OPTIMALITY_UNKNOWN
+            } else {
+                PACING_AUDIT_VERDICT_NO_DELAY_OUTCOME_SUPPORTED
+            }
+        }
+
+        private fun pacingAuditConfidence(row: PacingDecisionAuditRow): String {
+            return when (pacingAuditVerdict(row)) {
+                PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE -> AUDIT_CONFIDENCE_HIGH
+                PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT -> AUDIT_CONFIDENCE_MEDIUM
+                PACING_AUDIT_VERDICT_OUTCOME_SUPPORTED_OPTIMALITY_UNKNOWN,
+                PACING_AUDIT_VERDICT_NO_DELAY_OUTCOME_SUPPORTED,
+                PACING_AUDIT_VERDICT_UNCERTAIN_CAPTURE_AT_RISK -> AUDIT_CONFIDENCE_LOW
+                else -> AUDIT_CONFIDENCE_NONE
+            }
+        }
+
+        private fun directionalObservedDurationMs(
+            run: EvaluationRun,
+            capture: CaptureRow,
+            workloadKey: String,
+            previous: Boolean,
+        ): Long? {
+            val currentIndex = run.captureRows.indexOf(capture)
+            if (currentIndex < 0) {
+                return null
+            }
+            val indices = if (previous) {
+                (currentIndex - 1 downTo 0)
+            } else {
+                (currentIndex + 1 until run.captureRows.size)
+            }
+            for (index in indices) {
+                val observedMs = run.captureRows[index].nodeRows.firstOrNull { row ->
+                    row.node.workloadKey == workloadKey && row.nodeActualDurationMs != null
+                }?.nodeActualDurationMs
+                if (observedMs != null) {
+                    return observedMs
+                }
+            }
+            return null
+        }
+
+        /**
+         * Own-deadline slack after restoring every workload this capture skipped. Previous-only is the primary
+         * retrospective estimate; next-only is sensitivity evidence for thermal/memory transition bias.
+         */
+        private fun directionalSkipCounterfactualSlackMs(
+            run: EvaluationRun,
+            capture: CaptureRow,
+            previous: Boolean,
+        ): Long? {
+            val marginMs = capture.timeoutMarginMs ?: return null
+            val skippedRows = capture.nodeRows.filter { row -> row.isAdmissionWorkload && row.wasSkipped }
+            if (skippedRows.isEmpty()) {
+                return null
+            }
+            var restoredMs = 0L
+            for (row in skippedRows) {
+                val workloadKey = row.node.workloadKey ?: return null
+                restoredMs += directionalObservedDurationMs(run, capture, workloadKey, previous) ?: return null
+            }
+            return marginMs - restoredMs
+        }
+
+        private fun directionalSkipEvidenceAgreement(
+            run: EvaluationRun,
+            capture: CaptureRow,
+        ): Boolean? {
+            val previousSlackMs =
+                directionalSkipCounterfactualSlackMs(run, capture, previous = true) ?: return null
+            val nextSlackMs =
+                directionalSkipCounterfactualSlackMs(run, capture, previous = false) ?: return null
+            return (previousSlackMs >= 0L) == (nextSlackMs >= 0L)
+        }
+
         /**
          * What a workload this capture skipped would have cost, priced from the capture nearest to it in the same
          * session that actually ran the same workload key. Observed durations only: scoring a skip against the
@@ -1978,29 +2987,32 @@ class CaptureMetricsExcelExporter(
         private fun skipCounterfactualSlacksMs(run: EvaluationRun): List<Double> =
             run.captureRows.mapNotNull { capture -> skipCounterfactualSlackMs(run, capture)?.toDouble() }
 
+        private fun directionalSkipCounterfactualSlacksMs(
+            run: EvaluationRun,
+            previous: Boolean,
+        ): List<Double> = run.captureRows.mapNotNull { capture ->
+            directionalSkipCounterfactualSlackMs(run, capture, previous)?.toDouble()
+        }
+
         /**
-         * Deadline margin realized by the capture that followed a paced shot ([afterDelay]) or an unpaced one. The
-         * pair is the only delay-adequacy read available offline: a delay that was too small leaves its successor
-         * in the near-miss band, one that was too large leaves it with margin to spare that shutter time paid for.
-         * Neither is a verdict on its own - flipping a delay changes every later arrival, which needs a replay.
+         * Deadline margin realized by a capture whose own start consumed a pacing decision with ([afterDelay]) or
+         * without delay. The decision was queued at captureAvailable and persisted when this draft start consumed
+         * it, so the outcome is on the same row. Neither group is a causal verdict - changing a delay changes every
+         * later arrival, which needs a replay.
          */
         private fun marginsAfterDelayMs(run: EvaluationRun, afterDelay: Boolean): List<Double> =
-            run.captureRows.mapIndexedNotNull { index, capture ->
+            run.captureRows.mapNotNull { capture ->
                 val delayMs = capture.pacingReplay?.before?.appliedDelayMs
                 if (delayMs == null || (delayMs > 0L) != afterDelay) {
                     null
                 } else {
-                    run.captureRows.getOrNull(index + 1)?.timeoutMarginMs?.toDouble()
+                    capture.timeoutMarginMs?.toDouble()
                 }
             }
 
         /** Delay charged with nothing queued and nothing in flight - no backlog to drain, so it was pure shutter lag. */
         private fun emptyPipelineDelayCount(run: EvaluationRun): Int =
-            run.captures.count { enriched ->
-                val pacing = enriched.row.pacingReplay?.before
-                pacing != null && pacing.appliedDelayMs > 0L && pacing.queuedDraftCount == 0 &&
-                    enriched.wallBase.inFlightDraftCountAtDecision == 0
-            }
+            run.captures.count { enriched -> isEmptyPipelineDelay(enriched) == true }
 
         private fun appliedDelaySumByDominant(run: EvaluationRun, dominantDeficit: String): Long =
             run.pacingRows.filter { pacing -> pacing.beforeDominantDeficit == dominantDeficit }
@@ -2094,13 +3106,36 @@ class CaptureMetricsExcelExporter(
                     "skip wrong. Skips with no sibling observation stay unpriced and are excluded from the rate.",
             ),
             ReplayNote(
+                topic = "AdmissionDecisionAudit",
+                note = "Admitted rows are scored factually from the fully observed suffix. For skipped rows, the " +
+                    "primary retrospective evidence is the most recent earlier execution of the same workload; an " +
+                    "earlier fully observed row with the exact workloadSequenceKey is preferred because its actual " +
+                    "suffix can be compared directly with the skipped decision's budget. The closest later " +
+                    "observation is sensitivity evidence only: disagreement marks a transition as uncertain. The " +
+                    "recent-three median exposes one-sample GC/contention sensitivity. contextComparable is only a " +
+                    "coarse screen (overheat delta <= 1, thermal-headroom delta <= 0.25, same low-memory state, RAM " +
+                    "delta <= 10 percentage points); the raw deltas remain authoritative. A likely verdict is a " +
+                    "local decision audit, not the closed-loop outcome of changing the burst.",
+            ),
+            ReplayNote(
                 topic = "RQ2 delay adequacy",
                 note = "No column proves a delay was the right size: changing one delay changes every later " +
-                    "arrival, which needs a closed-loop replay. What is observable is the margin its successor " +
-                    "realized. p05MarginAfterDelayMs in the near-miss band means paced shots did not buy enough " +
+                    "arrival, which needs a closed-loop replay. A persisted pacing decision is consumed by the same " +
+                    "capture row's draft start, so the observable factual outcome is that row's timeout margin. " +
+                    "p05MarginAfterDelayMs in the near-miss band means paced captures did not get enough " +
                     "headroom; medianMarginAfterDelayMs far above medianMarginAfterNoDelayMs means shutter time " +
                     "bought headroom the deadline did not need. emptyPipelineDelayCount must stay 0 - a delay with " +
                     "nothing queued and nothing in flight has no backlog to drain.",
+            ),
+            ReplayNote(
+                topic = "PacingDecisionAudit",
+                note = "A nonzero delay with no queued or in-flight draft is strong evidence of excess. A gated " +
+                    "capture's " +
+                    "near miss/failure together with queue under-pricing or ceiling undershoot is evidence that the " +
+                    "delay was likely insufficient. A safe gated capture supports the observed outcome but never " +
+                    "proves the delay was optimal, so those rows stay low-confidence. The following capture is " +
+                    "reported only as transition sensitivity; the sheet does not simulate the changed arrival " +
+                    "trajectory.",
             ),
             ReplayNote(
                 topic = "Burst prefix windows",
@@ -2228,13 +3263,9 @@ class CaptureMetricsExcelExporter(
          * New metrics record maxDraftStartLatencyMs directly; legacy rows without it are intentionally excluded.
          */
         private fun queuePricingErrorMs(capture: EnrichedCaptureRow): Double? {
-            val pacing = capture.row.pacingReplay?.before ?: return null
-            val maxDraftStartLatencyMs = pacing.maxDraftStartLatencyMs ?: return null
-            val draftStartMs = capture.row.draftStartUptimeMs ?: return null
-            val releaseMs = pacing.decisionUptimeMs + pacing.appliedDelayMs
-            val realQueueWaitMs = (draftStartMs - releaseMs).coerceAtLeast(0L)
-            val pricedQueueWaitMs = pacing.backlogMs + maxDraftStartLatencyMs
-            return realQueueWaitMs.toDouble() - pricedQueueWaitMs.toDouble()
+            val observedQueueWaitMs = realQueueWaitMs(capture) ?: return null
+            val modeledQueueWaitMs = pricedQueueWaitMs(capture) ?: return null
+            return observedQueueWaitMs.toDouble() - modeledQueueWaitMs.toDouble()
         }
 
         private fun buildAdmissionReplayColumns(): List<Column<NodeSheetRow>> = listOf(
