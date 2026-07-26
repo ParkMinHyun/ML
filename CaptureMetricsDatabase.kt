@@ -12,10 +12,8 @@ import androidx.room.RoomDatabase
         NodeExecutionMetricsEntity::class,
         ExecutionPredictionEntity::class,
     ],
-    // Bumped with the pacing column rename: Room verifies the stored schema hash, so a changed schema on the same
-    // version aborts at open. No migration is written here - fallbackToDestructiveMigration recreates the database,
-    // which is what these throwaway measurement runs want.
-    version = 3,
+    // Do not change version.
+    version = 1,
     exportSchema = true,
 )
 abstract class CaptureMetricsDatabase : RoomDatabase() {
