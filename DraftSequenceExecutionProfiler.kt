@@ -185,7 +185,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             predictor.learnFromCapture(workloadDurations, admissionDecisions)
             workloadDurations.values.sumOf { durationMs -> durationMs.coerceAtLeast(0L) }
         } ?: 0L
-        // Keep the size-scoped ceiling and learned non-node occupancy aligned to this completed draft.
+        // Keep the size-scoped duration estimate and learned non-node occupancy aligned to this completed draft.
         captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs, nodeProcessingMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs

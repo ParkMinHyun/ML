@@ -109,19 +109,20 @@ data class CaptureAvailablePacingMetricsEntity(
     val maxDraftSequenceDurationMs: Long?,
 
     @ColumnInfo(name = "draft_start_budget_ms")
-    val draftStartBudgetMs: Long,
+    val draftSequenceStartBudgetMs: Long,
 
+    // Preserve the existing Room column names so this source-level rename does not change the database schema.
     @ColumnInfo(name = "session_planned_predicted_ms")
-    val sessionPlannedPredictedMs: Double,
+    val draftSequencePredictedDurationMs: Double,
 
     @ColumnInfo(name = "session_planned_draft_overhead_ms")
-    val sessionPlannedDraftOverheadMs: Double,
+    val draftSequenceOverheadDurationMs: Double,
 
     @ColumnInfo(name = "session_planned_ceiling_ms")
-    val sessionPlannedCeilingMs: Double,
+    val draftSequencePacingDurationMs: Double,
 
     @ColumnInfo(name = "session_planned_sequence_key")
-    val sessionPlannedSequenceKey: String,
+    val draftSequenceKey: String,
 )
 
 @Entity(

@@ -69,13 +69,13 @@ data class CaptureAvailablePacingMetrics(
     val maxDraftStartLatencyMs: Long?,
     /** Session max measured draft sequence duration at decision time; null on rows persisted before recording. */
     val maxDraftSequenceDurationMs: Long?,
-    val draftStartBudgetMs: Long,
-    val sessionPlannedPredictedMs: Double,
+    val draftSequenceStartBudgetMs: Long,
+    val draftSequencePredictedDurationMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
-    val sessionPlannedDraftOverheadMs: Double,
-    /** Observed-max draft ceiling both deficits used; [CaptureAvailablePacingPrediction] says why it is not a bound. */
-    val sessionPlannedCeilingMs: Double,
-    val sessionPlannedSequenceKey: String,
+    val draftSequenceOverheadDurationMs: Double,
+    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingPrediction]. */
+    val draftSequencePacingDurationMs: Double,
+    val draftSequenceKey: String,
 )
 
 data class PreExecutionMetrics(

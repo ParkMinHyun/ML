@@ -66,7 +66,7 @@ class DraftSequenceAdmissionPolicy {
 
     /** The sequence key this session actually plans to run: the planned key minus the workloads whose group is demoted. */
     @Synchronized
-    fun resolveSessionPlannedSequenceKey(plannedSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
+    fun resolveDraftSequenceKey(plannedSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
         if (demotedGroups.isEmpty()) {
             return plannedSequenceKey
         }
@@ -74,7 +74,7 @@ class DraftSequenceAdmissionPolicy {
         val portraitDemoted = AdmissionGroup.PORTRAIT in demotedGroups
         val decorationDemoted = AdmissionGroup.DECORATION in demotedGroups
         val hasFrameWatermark = decorationDemoted && plannedSequenceKey.hasFrameWatermark()
-        val sessionPlannedWorkloadKeys = plannedSequenceKey.workloadKeys.filterNot { workloadKey ->
+        val draftWorkloadKeys = plannedSequenceKey.workloadKeys.filterNot { workloadKey ->
             when (workloadKey) {
                 is WorkloadKey.Bokeh -> portraitDemoted
                 is WorkloadKey.Filter -> decorationDemoted
@@ -83,10 +83,10 @@ class DraftSequenceAdmissionPolicy {
                 is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> false
             }
         }
-        return if (sessionPlannedWorkloadKeys.isEmpty()) {
+        return if (draftWorkloadKeys.isEmpty()) {
             plannedSequenceKey
         } else {
-            WorkloadSequenceKey(sessionPlannedWorkloadKeys)
+            WorkloadSequenceKey(draftWorkloadKeys)
         }
     }
 

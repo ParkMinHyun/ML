@@ -17,11 +17,11 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         queuedPredictedWorkMs = queuedPredictedWorkMs,
         maxDraftStartLatencyMs = maxDraftStartLatencyMs,
         maxDraftSequenceDurationMs = maxDraftSequenceDurationMs,
-        draftStartBudgetMs = prediction.draftStartBudgetMs,
-        sessionPlannedPredictedMs = prediction.sessionPlannedPredictedMs,
-        sessionPlannedDraftOverheadMs = prediction.sessionPlannedDraftOverheadMs,
-        sessionPlannedCeilingMs = prediction.sessionPlannedCeilingMs,
-        sessionPlannedSequenceKey = prediction.sessionPlannedSequenceKey,
+        draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
+        draftSequencePredictedDurationMs = prediction.draftSequencePredictedDurationMs,
+        draftSequenceOverheadDurationMs = prediction.draftSequenceOverheadDurationMs,
+        draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs,
+        draftSequenceKey = prediction.draftSequenceKey,
     )
 }
 
@@ -63,11 +63,11 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         queuedPredictedWorkMs = queuedPredictedWorkMs,
         maxDraftStartLatencyMs = maxDraftStartLatencyMs,
         maxDraftSequenceDurationMs = maxDraftSequenceDurationMs,
-        draftStartBudgetMs = draftStartBudgetMs,
-        sessionPlannedPredictedMs = sessionPlannedPredictedMs,
-        sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
-        sessionPlannedCeilingMs = sessionPlannedCeilingMs,
-        sessionPlannedSequenceKey = sessionPlannedSequenceKey,
+        draftSequenceStartBudgetMs = draftSequenceStartBudgetMs,
+        draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
+        draftSequenceOverheadDurationMs = draftSequenceOverheadDurationMs,
+        draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+        draftSequenceKey = draftSequenceKey,
     )
 }
 
@@ -223,11 +223,11 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         queuedPredictedWorkMs = queuedPredictedWorkMs,
         maxDraftStartLatencyMs = maxDraftStartLatencyMs,
         maxDraftSequenceDurationMs = maxDraftSequenceDurationMs,
-        draftStartBudgetMs = draftStartBudgetMs,
-        sessionPlannedPredictedMs = sessionPlannedPredictedMs,
-        sessionPlannedDraftOverheadMs = sessionPlannedDraftOverheadMs,
-        sessionPlannedCeilingMs = sessionPlannedCeilingMs,
-        sessionPlannedSequenceKey = sessionPlannedSequenceKey,
+        draftSequenceStartBudgetMs = draftSequenceStartBudgetMs,
+        draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
+        draftSequenceOverheadDurationMs = draftSequenceOverheadDurationMs,
+        draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+        draftSequenceKey = draftSequenceKey,
     )
 }
 

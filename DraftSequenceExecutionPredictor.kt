@@ -136,7 +136,7 @@ class DraftSequenceExecutionPredictor {
     /**
      * Point estimate for [workloadSequenceKey] - the one input [CaptureAvailablePacer] paces captureAvailable
      * callbacks with. No upper bound is offered: pacing bounds a capture by observed draft wall time, not by this
-     * model, so exposing one only invites re-coupling the two (see the pacer's sessionPlannedCeilingMs).
+     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequencePacingDurationMs).
      */
     @Synchronized
     fun estimateDraftSequenceMs(workloadSequenceKey: WorkloadSequenceKey): Double {
@@ -333,4 +333,3 @@ data class WatchdogTimeoutDecision(
     /** Reservation decision backing [timeoutMs]; null when the sequence had no mandatory tail to reserve. */
     val decision: AdmissionDecision?,
 )
-

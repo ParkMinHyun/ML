@@ -118,8 +118,8 @@ class CaptureMetricsExcelExporter(
         val freshestCompletedDraftWallMs: Long?,
         /**
          * Session max draft wall of the SAME draft size as this capture, observed before its decision. The pacer's
-         * ceiling uses beforeObservedMaxDraftMs (max over all sizes); the gap between the two is the cross-size
-         * contamination a heavy other-size draft (e.g. MP24) adds to this size's (e.g. MP12) reserve.
+         * draft-sequence estimate uses beforeObservedMaxDraftMs (max over all sizes); the gap between the two is the
+         * cross-size contamination a heavy other-size draft (e.g. MP24) adds to this size's (e.g. MP12) estimate.
          */
         val sizeScopedObservedMaxDraftMs: Long?,
     )
@@ -698,7 +698,7 @@ class CaptureMetricsExcelExporter(
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
         private val backlogBaseWithoutLatencyMs =
-            before.backlogMs + before.sessionPlannedCeilingMs - captureTimeoutMs
+            before.backlogMs + before.draftSequencePacingDurationMs - captureTimeoutMs
 
         val inferredDraftStartLatencyMs: Long? = if (before.backlogDeficitMs > 0L) {
             (before.backlogDeficitMs - ceil(backlogBaseWithoutLatencyMs).toLong()).coerceAtLeast(0L)
@@ -711,7 +711,7 @@ class CaptureMetricsExcelExporter(
             before.maxDraftStartLatencyMs ?: inferredDraftStartLatencyMs
         val draftStartLatencyMinMs: Long = knownDraftStartLatencyMs ?: 0L
         val draftStartLatencyMaxMs: Long = knownDraftStartLatencyMs ?: floor(
-            (captureTimeoutMs - before.backlogMs - before.sessionPlannedCeilingMs).coerceAtLeast(0.0),
+            (captureTimeoutMs - before.backlogMs - before.draftSequencePacingDurationMs).coerceAtLeast(0.0),
         ).toLong()
         val draftStartLatencyInference: String = when {
             before.maxDraftStartLatencyMs != null -> PACING_LATENCY_RECORDED
@@ -720,18 +720,18 @@ class CaptureMetricsExcelExporter(
         }
 
         val afterLevelDeficitMs: Long = computeCaptureAvailableLevelDeficitMs(
-            draftStartBudgetMs = before.draftStartBudgetMs,
-            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
+            draftSequenceStartBudgetMs = before.draftSequenceStartBudgetMs,
+            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
         val afterBacklogDeficitMinMs: Long = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             maxDraftStartLatencyMs = draftStartLatencyMinMs,
-            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
+            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
         val afterBacklogDeficitMaxMs: Long = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = before.backlogMs,
             maxDraftStartLatencyMs = draftStartLatencyMaxMs,
-            sessionPlannedCeilingMs = before.sessionPlannedCeilingMs,
+            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
@@ -1094,7 +1094,7 @@ class CaptureMetricsExcelExporter(
         private const val PACING_AUDIT_BASIS_EMPTY_PIPELINE = "Observed delay with empty pipeline"
         private const val PACING_AUDIT_BASIS_NO_CAPTURE_OUTCOME = "No gated-capture outcome"
         private const val PACING_AUDIT_BASIS_CALIBRATION_AND_CAPTURE_OUTCOME =
-            "Queue/ceiling calibration plus gated-capture outcome"
+            "Queue/draft-sequence estimate calibration plus gated-capture outcome"
         private const val PACING_AUDIT_BASIS_CAPTURE_OUTCOME_ONLY = "Gated-capture outcome only"
         private const val PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE = "Likely Excessive Delay"
         private const val PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT = "Likely Insufficient Delay"
@@ -1442,10 +1442,10 @@ class CaptureMetricsExcelExporter(
             },
             Column("mBokehSkipCount") { run -> run.bokehRows.count { row -> row.wasSkipped } },
             Column("sFilterSkipCount") { run -> run.filterRows.count { row -> row.wasSkipped } },
-            // Where the pacing cost went: delay charged because this capture's own ceiling exceeded a throttled
-            // budget (level-dominant, throttle recovery) vs delay charged to drain a queued backlog the current
-            // capture inherited (backlog-dominant, cross-shot recovery). Section 2.4 argues only the latter can
-            // recover budget already lost while waiting for the Draft worker, so separating them is load-bearing.
+            // Where the pacing cost went: delay charged because this capture's own duration estimate exceeded a
+            // throttled budget (level-dominant, throttle recovery) vs delay charged to drain a queued backlog the
+            // current capture inherited (backlog-dominant, cross-shot recovery). Section 2.4 argues only the latter
+            // can recover budget already lost while waiting for the Draft worker, so separating them is load-bearing.
             Column("throttleRecoveryDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_LEVEL) },
             Column("backlogRecoveryDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_BACKLOG) },
             Column("coDominantDelayMs") { appliedDelaySumByDominant(it, PACING_DOMINANT_EQUAL) },
@@ -1453,9 +1453,10 @@ class CaptureMetricsExcelExporter(
                 val meanMs = mean(run.captureRows.mapNotNull { capture -> capture.metrics.shotToShotTimeMs?.toDouble() })
                 if (meanMs != null && meanMs > 0.0) 1000.0 / meanMs else null
             },
-            // Was the delay the right size? Offline this can only be read from what the next capture realized:
-            // margins in the near-miss band after a paced shot mean the delay was too small, margins far above the
-            // unpaced baseline mean shutter time was spent buying headroom the deadline did not need.
+            // What the paced captures realized, as cost context: margins in the near-miss band mean the shutter time
+            // did not buy much headroom, margins far above the unpaced population mean it bought more than the
+            // deadline needed. Whether each individual delay was the right size is scored in RQ3 with the other
+            // decision verdicts; these columns stay here because they price the trade, not the decision.
             Column("emptyPipelineDelayCount") { emptyPipelineDelayCount(it) },
             Column("p05PacedCaptureMarginMs") { run -> percentile(pacedCaptureMarginsMs(run, paced = true), 0.05) },
             Column("medianPacedCaptureMarginMs") { run -> percentile(pacedCaptureMarginsMs(run, paced = true), 0.50) },
@@ -1476,21 +1477,6 @@ class CaptureMetricsExcelExporter(
             },
             Column("totalOwnDeadlineExcessDelayMs") { run ->
                 run.captures.sumOf { capture -> ownDeadlineExcessDelayMs(capture) ?: 0L }
-            },
-            Column("likelyExcessivePacingDecisionCount") { run ->
-                run.pacingAuditRows.count { row ->
-                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
-                }
-            },
-            Column("likelyInsufficientPacingDecisionCount") { run ->
-                run.pacingAuditRows.count { row ->
-                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
-                }
-            },
-            Column("unidentifiablePacingDecisionCount") { run ->
-                run.pacingAuditRows.count { row ->
-                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_UNIDENTIFIABLE
-                }
             },
         )
 
@@ -1691,19 +1677,47 @@ class CaptureMetricsExcelExporter(
                     admissionAuditVerdict(row) == AUDIT_VERDICT_UNIDENTIFIABLE_SKIP
                 }
             },
-            Column("pacingCeilingObservedCount") { run -> ceilingErrorsMs(run).size },
-            Column("ceilingUndershootCount") { run ->
-                ceilingErrorsMs(run).count { errorMs -> errorMs < 0.0 }
+            // The third decision family. A delay is graded like an admit or a skip - was this one decision right,
+            // given what was observable when it was made - so it belongs beside them rather than with the shutter
+            // time it cost, which RQ2 prices. Excessive fires on structural evidence (a delay with nothing queued
+            // and nothing in flight); insufficient on a gated capture at risk whose queue or draft estimate was
+            // under-priced. Everything else stays unidentifiable on purpose: optimality needs a replay.
+            Column("likelyExcessivePacingDecisionCount") { run ->
+                run.pacingAuditRows.count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_EXCESSIVE
+                }
             },
-            Column("ceilingUndershootRate") { run ->
+            Column("likelyInsufficientPacingDecisionCount") { run ->
+                run.pacingAuditRows.count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
+                }
+            },
+            Column("unidentifiablePacingDecisionCount") { run ->
+                run.pacingAuditRows.count { row ->
+                    pacingAuditVerdict(row) == PACING_AUDIT_VERDICT_UNIDENTIFIABLE
+                }
+            },
+            Column("draftSequencePacingDurationObservedCount") { run ->
+                draftSequencePacingErrorsMs(run).size
+            },
+            Column("draftSequencePacingUndershootCount") { run ->
+                draftSequencePacingErrorsMs(run).count { errorMs -> errorMs < 0.0 }
+            },
+            Column("draftSequencePacingUndershootRate") { run ->
                 rate(
-                    ceilingErrorsMs(run).count { errorMs -> errorMs < 0.0 },
-                    ceilingErrorsMs(run).size,
+                    draftSequencePacingErrorsMs(run).count { errorMs -> errorMs < 0.0 },
+                    draftSequencePacingErrorsMs(run).size,
                 )
             },
-            Column("minimumCeilingErrorMs") { run -> ceilingErrorsMs(run).minOrNull() },
-            Column("p05CeilingErrorMs") { run -> percentile(ceilingErrorsMs(run), 0.05) },
-            Column("p95CeilingErrorMs") { run -> percentile(ceilingErrorsMs(run), 0.95) },
+            Column("minimumDraftSequencePacingErrorMs") { run ->
+                draftSequencePacingErrorsMs(run).minOrNull()
+            },
+            Column("p05DraftSequencePacingErrorMs") { run ->
+                percentile(draftSequencePacingErrorsMs(run), 0.05)
+            },
+            Column("p95DraftSequencePacingErrorMs") { run ->
+                percentile(draftSequencePacingErrorsMs(run), 0.95)
+            },
             Column("queuePricingObservedCount") { run -> queuePricingErrorsMs(run).size },
             Column("queueUnderpriceCount") { run ->
                 queuePricingErrorsMs(run).count { errorMs -> errorMs > 0.0 }
@@ -1813,16 +1827,16 @@ class CaptureMetricsExcelExporter(
             Column("pacingMaxDraftStartLatencyMs") {
                 it.capture.row.pacingReplay?.before?.maxDraftStartLatencyMs
             },
-            Column("pacingSessionPlannedCeilingMs") {
-                it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            Column("draftSequencePacingDurationMs") {
+                it.capture.row.pacingReplay?.before?.draftSequencePacingDurationMs
             },
-            Column("pacingCeilingErrorMs") {
-                val ceilingMs = it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            Column("draftSequencePacingErrorMs") {
+                val pacingDurationMs = it.capture.row.pacingReplay?.before?.draftSequencePacingDurationMs
                 val draftWallMs = it.capture.row.draftWallMs
-                if (ceilingMs == null || draftWallMs == null) {
+                if (pacingDurationMs == null || draftWallMs == null) {
                     null
                 } else {
-                    ceilingMs - draftWallMs
+                    pacingDurationMs - draftWallMs
                 }
             },
             Column("pacingQueuePricingErrorMs") { row ->
@@ -2195,11 +2209,13 @@ class CaptureMetricsExcelExporter(
             Column("pricedQueueWaitMs") { row -> pricedQueueWaitMs(row.capture) },
             Column("realQueueWaitMs") { row -> realQueueWaitMs(row.capture) },
             Column("queuePricingErrorMs") { row -> queuePricingErrorMs(row.capture) },
-            Column("sessionPlannedCeilingMs") {
-                it.capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            Column("draftSequencePacingDurationMs") {
+                it.capture.row.pacingReplay?.before?.draftSequencePacingDurationMs
             },
             Column("draftWallMs") { it.capture.row.draftWallMs },
-            Column("ceilingErrorMs") { row -> pacingCeilingErrorMs(row.capture) },
+            Column("draftSequencePacingErrorMs") { row ->
+                draftSequencePacingErrorMs(row.capture)
+            },
             Column("emptyPipelineDelay") { row -> isEmptyPipelineDelay(row.capture) },
             // Where the delay landed. Absorbed delay never touched this capture's own deadline, so a paced capture
             // finishing thin is not evidence the delay hurt it - and excess can only be claimed on the unabsorbed part.
@@ -2845,10 +2861,11 @@ class CaptureMetricsExcelExporter(
             return (draftStartMs - releaseMs).coerceAtLeast(0L)
         }
 
-        private fun pacingCeilingErrorMs(capture: EnrichedCaptureRow): Double? {
-            val ceilingMs = capture.row.pacingReplay?.before?.sessionPlannedCeilingMs ?: return null
+        private fun draftSequencePacingErrorMs(capture: EnrichedCaptureRow): Double? {
+            val pacingDurationMs =
+                capture.row.pacingReplay?.before?.draftSequencePacingDurationMs ?: return null
             val draftWallMs = capture.row.draftWallMs ?: return null
-            return ceilingMs - draftWallMs
+            return pacingDurationMs - draftWallMs
         }
 
         private fun isEmptyPipelineDelay(capture: EnrichedCaptureRow): Boolean? {
@@ -2868,7 +2885,8 @@ class CaptureMetricsExcelExporter(
                 return PACING_AUDIT_BASIS_NO_CAPTURE_OUTCOME
             }
             val hasCalibrationEvidence =
-                queuePricingErrorMs(row.capture) != null || pacingCeilingErrorMs(row.capture) != null
+                queuePricingErrorMs(row.capture) != null ||
+                    draftSequencePacingErrorMs(row.capture) != null
             return if (hasCalibrationEvidence) {
                 PACING_AUDIT_BASIS_CALIBRATION_AND_CAPTURE_OUTCOME
             } else {
@@ -2889,8 +2907,9 @@ class CaptureMetricsExcelExporter(
             }
             val captureAtRisk = capture.hasTimeoutOrWatchdogFailure || isNearMiss(capture)
             val queueUnderpriced = queuePricingErrorMs(row.capture)?.let { errorMs -> errorMs > 0.0 } == true
-            val ceilingUndershot = pacingCeilingErrorMs(row.capture)?.let { errorMs -> errorMs < 0.0 } == true
-            if (captureAtRisk && (queueUnderpriced || ceilingUndershot)) {
+            val draftSequencePacingUndershot =
+                draftSequencePacingErrorMs(row.capture)?.let { errorMs -> errorMs < 0.0 } == true
+            if (captureAtRisk && (queueUnderpriced || draftSequencePacingUndershot)) {
                 return PACING_AUDIT_VERDICT_LIKELY_INSUFFICIENT
             }
             if (captureAtRisk) {
@@ -3140,13 +3159,16 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "RQ2 delay adequacy",
-                note = "No column proves a delay was the right size: changing one delay changes every later " +
-                    "arrival, which needs a closed-loop replay. A persisted pacing decision is consumed by the same " +
-                    "capture row's draft start, so the observable factual outcome is that row's timeout margin. " +
-                    "p05PacedCaptureMarginMs in the near-miss band means paced captures did not get enough " +
-                    "headroom; medianPacedCaptureMarginMs far above medianUnpacedCaptureMarginMs means shutter time " +
-                    "bought headroom the deadline did not need. emptyPipelineDelayCount must stay 0 - a delay with " +
-                    "nothing queued and nothing in flight has no backlog to drain.",
+                note = "RQ2 prices what pacing cost; whether each delay was the right call is graded in RQ3 with " +
+                    "the admit and skip verdicts. No column proves a delay was the right size either way: changing " +
+                    "one delay changes every later arrival, which needs a closed-loop replay. A persisted pacing " +
+                    "decision is consumed by the same capture row's draft start, so the observable factual outcome " +
+                    "is that row's timeout margin. p05PacedCaptureMarginMs in the near-miss band means paced " +
+                    "captures did not get enough headroom; medianPacedCaptureMarginMs far above " +
+                    "medianUnpacedCaptureMarginMs means shutter time bought headroom the deadline did not need - " +
+                    "but the two groups are selected, not assigned, since a delay is charged exactly when the queue " +
+                    "is deep. emptyPipelineDelayCount must stay 0 - a delay with nothing queued and nothing in " +
+                    "flight has no backlog to drain.",
             ),
             ReplayNote(
                 topic = "PacingDecisionAudit",
@@ -3156,9 +3178,9 @@ class CaptureMetricsExcelExporter(
                     "its whole effect was throttling the next shutter. Only delayOnOwnCriticalPathMs can be " +
                     "excessive for this capture, and ownDeadlineExcessDelayMs is how much of it could have been " +
                     "dropped without missing the deadline. A gated capture's " +
-                    "near miss/failure together with queue under-pricing or ceiling undershoot is evidence that the " +
-                    "delay was likely insufficient. A safe gated capture supports the observed outcome but never " +
-                    "proves the delay was optimal, so those rows stay low-confidence. The following capture is " +
+                    "near miss/failure together with queue under-pricing or duration-estimate undershoot is evidence " +
+                    "that the delay was likely insufficient. A safe gated capture supports the observed outcome but " +
+                    "never proves the delay was optimal, so those rows stay low-confidence. The following capture is " +
                     "reported only as transition sensitivity; the sheet does not simulate the changed arrival " +
                     "trajectory.",
             ),
@@ -3267,14 +3289,14 @@ class CaptureMetricsExcelExporter(
             return NodeSheetRow(capture, index + 1, nodeRow)
         }
 
-        private fun ceilingErrorsMs(run: EvaluationRun): List<Double> {
+        private fun draftSequencePacingErrorsMs(run: EvaluationRun): List<Double> {
             return run.captures.mapNotNull { capture ->
-                val ceilingMs = capture.row.pacingReplay?.before?.sessionPlannedCeilingMs
+                val pacingDurationMs = capture.row.pacingReplay?.before?.draftSequencePacingDurationMs
                 val draftWallMs = capture.row.draftWallMs
-                if (ceilingMs == null || draftWallMs == null) {
+                if (pacingDurationMs == null || draftWallMs == null) {
                     null
                 } else {
-                    ceilingMs - draftWallMs
+                    pacingDurationMs - draftWallMs
                 }
             }
         }
@@ -3451,16 +3473,16 @@ class CaptureMetricsExcelExporter(
                     firstNodeStartUptimeMs - decisionUptimeMs
                 }
             },
-            Column("beforeSessionPlannedSequenceKey") { it.row.pacingReplay?.before?.sessionPlannedSequenceKey },
-            Column("beforeDraftStartBudgetMs") { it.row.pacingReplay?.before?.draftStartBudgetMs },
-            Column("beforeSessionPlannedPredictedMs") {
-                it.row.pacingReplay?.before?.sessionPlannedPredictedMs
+            Column("beforeDraftSequenceKey") { it.row.pacingReplay?.before?.draftSequenceKey },
+            Column("beforeDraftSequenceStartBudgetMs") { it.row.pacingReplay?.before?.draftSequenceStartBudgetMs },
+            Column("beforeDraftSequencePredictedDurationMs") {
+                it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
             },
-            Column("beforeSessionPlannedDraftOverheadMs") {
-                it.row.pacingReplay?.before?.sessionPlannedDraftOverheadMs
+            Column("beforeDraftSequenceOverheadDurationMs") {
+                it.row.pacingReplay?.before?.draftSequenceOverheadDurationMs
             },
-            Column("beforeSessionPlannedCeilingMs") {
-                it.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            Column("beforeDraftSequencePacingDurationMs") {
+                it.row.pacingReplay?.before?.draftSequencePacingDurationMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
@@ -3475,15 +3497,15 @@ class CaptureMetricsExcelExporter(
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
             Column("beforeAppliedDelayMs") { it.row.pacingReplay?.before?.appliedDelayMs },
-            // Ceiling calibration: recorded per-capture ceiling minus this draft's wall time
-            // (positive = ceiling too high = over-pacing pressure, negative = ceiling undershot the draft).
-            Column("ceilingErrorMs") {
-                val ceilingMs = it.row.pacingReplay?.before?.sessionPlannedCeilingMs
+            // Estimate calibration: recorded per-capture duration estimate minus this draft's wall time
+            // (positive = estimate too high = over-pacing pressure, negative = estimate undershot the draft).
+            Column("draftSequencePacingErrorMs") {
+                val pacingDurationMs = it.row.pacingReplay?.before?.draftSequencePacingDurationMs
                 val draftWallMs = it.row.draftWallMs
-                if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
+                if (pacingDurationMs != null && draftWallMs != null) pacingDurationMs - draftWallMs else null
             },
             // This draft's real between-node overhead (wall minus node processing) - what the clock's learned
-            // overhead term is calibrated against. Compare to beforeSessionPlannedDraftOverheadMs.
+            // overhead term is calibrated against. Compare to beforeDraftSequenceOverheadDurationMs.
             Column("overheadActualMs") {
                 val draftWallMs = it.row.draftWallMs
                 val nodeMs = it.row.draftSequenceDurationMs
@@ -3491,7 +3513,7 @@ class CaptureMetricsExcelExporter(
             },
             // Learned overhead the clock added minus what this draft actually needed (positive = learned ran high).
             Column("overheadLearnedMinusActualMs") {
-                val learnedMs = it.row.pacingReplay?.before?.sessionPlannedDraftOverheadMs
+                val learnedMs = it.row.pacingReplay?.before?.draftSequenceOverheadDurationMs
                 val draftWallMs = it.row.draftWallMs
                 val nodeMs = it.row.draftSequenceDurationMs
                 if (learnedMs != null && draftWallMs != null && nodeMs != null) {
@@ -3504,7 +3526,7 @@ class CaptureMetricsExcelExporter(
             // sum) - the shortfall the overhead term exists to close. Positive = a point-only clock runs fast here,
             // which is the backlog under-pricing that compounds with queue depth into a timeout.
             Column("draftOccupancyUnderpriceMs") {
-                val predMs = it.row.pacingReplay?.before?.sessionPlannedPredictedMs
+                val predMs = it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
                 val draftWallMs = it.row.draftWallMs
                 if (predMs != null && draftWallMs != null) draftWallMs - predMs else null
             },
@@ -3535,10 +3557,10 @@ class CaptureMetricsExcelExporter(
             },
             // Session max draft wall of THIS capture's own draft size, vs the pacer's size-agnostic observed max.
             Column("sizeScopedObservedMaxDraftMs") { it.wallBase.sizeScopedObservedMaxDraftMs },
-            // How much the size-agnostic observed max inflates this size's ceiling (cross-size contamination): a heavy
+            // How much the size-agnostic observed max inflates this size's estimate (cross-size contamination): a heavy
             // MP24 draft raising an MP12 capture's reserve. Clamped at 0 (when obsMax is below this size's own max, or
-            // freshly reset to 0, the ceiling is not cross-size inflated).
-            Column("ceilingCrossSizeContaminationMs") {
+            // freshly reset to 0, the estimate is not cross-size inflated).
+            Column("draftSequencePacingCrossSizeContaminationMs") {
                 val obsMaxMs = it.row.pacingReplay?.before?.maxDraftSequenceDurationMs
                 val sizeScopedMs = it.wallBase.sizeScopedObservedMaxDraftMs
                 if (obsMaxMs != null && sizeScopedMs != null) (obsMaxMs - sizeScopedMs).coerceAtLeast(0L) else null
@@ -3591,9 +3613,9 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Pacing prediction scope",
-                note = "after pacing reuses the recorded draft-sequence prediction, ceiling, and backlog. Changes to " +
-                    "how the ceiling is derived or to backlog reconstruction require a sequential replay with " +
-                    "additional raw runtime observations.",
+                note = "after pacing reuses the recorded draft-sequence prediction, duration estimate, and backlog. " +
+                    "Changes to how the estimate is derived or to backlog reconstruction require a sequential replay " +
+                    "with additional raw runtime observations.",
             ),
             ReplayNote(
                 topic = "Counterfactual outcomes",
@@ -3604,15 +3626,16 @@ class CaptureMetricsExcelExporter(
                 topic = "Wall-base pacing",
                 note = "columns for judging a future draft-wall-time-based clock. draftOccupancyUnderpriceMs " +
                     "(draftWall - point sum) is how much the current point clock under-prices a draft; " +
-                    "sessionPlannedDraftOverheadMs vs overheadActualMs is the learned overhead's calibration. For a " +
+                    "draftSequenceOverheadDurationMs vs overheadActualMs is the learned overhead's calibration. For a " +
                     "wall-based clock the blockers show up as: inFlightDraftCountAtDecision (drafts whose wall is not " +
                     "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
                     "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
                     "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
-                    "(compare to beforeBacklogMs + beforeMaxDraftStartLatencyMs). ceilingCrossSizeContaminationMs " +
+                    "(compare to beforeBacklogMs + beforeMaxDraftStartLatencyMs). " +
+                    "draftSequencePacingCrossSizeContaminationMs " +
                     "(beforeObservedMaxDraftMs minus sizeScopedObservedMaxDraftMs) is how much a heavier other-size " +
-                    "draft inflates this capture's ceiling - the mixed-size over-pacing channel left after the point " +
-                    "prediction is made size-aware.",
+                    "draft inflates this capture's duration estimate - the mixed-size over-pacing channel left after " +
+                    "the point prediction is made size-aware.",
             ),
         )
 

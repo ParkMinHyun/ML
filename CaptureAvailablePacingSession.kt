@@ -35,12 +35,12 @@ internal class CaptureAvailablePacingSession {
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
      * capture's point prediction plus the learned between-node overhead snapshotted into the pacing prediction,
-     * never by its ceiling. The point sum alone under-prices real pipeline occupancy (it omits the inter-node/deinit
-     * time), and that shortfall compounds with queue depth into a timeout; adding the overhead prices each queued
-     * draft by its real occupancy. The ceiling is still avoided here - summing k ceilings would price a queue at k
-     * times the session worst case, which no observed burst reaches. The timeout margin comes from the ceiling that
-     * [CaptureAvailablePacer.decideDelay] adds for the single capture being paced; underruns here do not accumulate
-     * because every draft start rebases this clock onto the real one.
+     * never by its draft-sequence duration estimate. The point sum alone under-prices real pipeline occupancy (it
+     * omits the inter-node/deinit time), and that shortfall compounds with queue depth into a timeout; adding the
+     * overhead prices each queued draft by its real occupancy. The duration estimate is still avoided here - summing
+     * k conservative estimates would price a queue at k times the session worst case, which no observed burst reaches.
+     * The timeout margin comes from the estimate that [CaptureAvailablePacer.decideDelay] adds for the single capture
+     * being paced; underruns here do not accumulate because every draft start rebases this clock onto the real one.
      *
      * An absolute uptime, unlike the durations around it: [backlogMsAt] is what turns it into "how much is left".
      */
@@ -58,7 +58,7 @@ internal class CaptureAvailablePacingSession {
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
-        get() = pendingDecisions.sumOf { it.prediction.sessionPlannedPredictedMs }
+        get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
 
     /** Raises the session maxima by one capture's observed timings; non-positive values mean no observation. */
     fun observeCaptureTimings(draftSequenceDurationMs: Long, draftStartLatencyMs: Long) {
@@ -99,7 +99,8 @@ internal class CaptureAvailablePacingSession {
     fun admit(decision: CaptureAvailablePacingDecision) {
         pendingDecisions.addLast(decision)
         val prediction = decision.prediction
-        val draftWorkMs = prediction.sessionPlannedPredictedMs + prediction.sessionPlannedDraftOverheadMs
+        val draftWorkMs =
+            prediction.draftSequencePredictedDurationMs + prediction.draftSequenceOverheadDurationMs
         backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) +
             ceil(draftWorkMs).toLong()
     }
@@ -120,8 +121,8 @@ internal class CaptureAvailablePacingSession {
             pacingPrediction = draftStartPrediction
         }
         val gatingDecision = pendingDecisions.removeFirstOrNull()
-        val startingPredictedMs = draftStartPrediction?.sessionPlannedPredictedMs ?: 0.0
-        val draftOverheadMs = pacingPrediction?.sessionPlannedDraftOverheadMs ?: 0.0
+        val startingPredictedMs = draftStartPrediction?.draftSequencePredictedDurationMs ?: 0.0
+        val draftOverheadMs = pacingPrediction?.draftSequenceOverheadDurationMs ?: 0.0
         val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
         backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
         return gatingDecision

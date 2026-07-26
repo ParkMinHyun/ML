@@ -54,8 +54,8 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * Reads the whole draft-task times and capture-available latency the {@link ProcessingResultData} repository
-     * collected. The max draft time (not a mean) feeds the pacer's observed ceiling; a mean would lag a rising
-     * thermal trend and let the queue overrun.
+     * collected. The max draft time (not a mean) feeds the pacer's draft-sequence duration estimate; a mean would
+     * lag a rising thermal trend and let the queue overrun.
      */
     private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
             new CaptureAvailableData(
@@ -144,13 +144,13 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 reason = "budget is enough";
             }
 
-            pacingDetails += ", draftStartBudget=" + pacingPrediction.getDraftStartBudgetMs() + "ms"
-                    + ", sessionPlannedPredicted=" + pacingPrediction.getSessionPlannedPredictedMs() + "ms"
-                    + ", sessionPlannedDraftOverhead=" + pacingPrediction.getSessionPlannedDraftOverheadMs() + "ms"
-                    + ", sessionPlannedCeiling=" + pacingPrediction.getSessionPlannedCeilingMs() + "ms"
+            pacingDetails += ", draftSequenceStartBudget=" + pacingPrediction.getDraftSequenceStartBudgetMs() + "ms"
+                    + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
+                    + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
+                    + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
-                    + ", sessionPlannedSequenceKey=" + pacingPrediction.getSessionPlannedSequenceKey();
+                    + ", draftSequenceKey=" + pacingPrediction.getDraftSequenceKey();
         }
 
         final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, appliedDelayMs);
