@@ -1,0 +1,642 @@
+diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
+index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd76fcfed5 100644
+--- a/CaptureAvailablePacer.kt
++++ b/CaptureAvailablePacer.kt
+@@ -21,9 +21,10 @@ fun interface CaptureAvailablePacingDecider {
+  * Asks the [DraftSequenceAdmissionPolicy] which sequence key a planned one becomes in this session's plan.
+  * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
+  */
+-class CaptureAvailablePacer(
++class CaptureAvailablePacer @JvmOverloads constructor(
+     private val predictor: DraftSequenceExecutionPredictor,
+     private val admissionPolicy: DraftSequenceAdmissionPolicy,
++    private val delayPolicy: CaptureAvailableDelayPolicy = ContextAwareCaptureAvailableDelayPolicy,
+ ) : CaptureAvailablePacingDecider {
+ 
+     /**
+@@ -47,7 +48,10 @@ class CaptureAvailablePacer(
+     fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
+         val session = activeSession()
+         if (plannedSequenceKey == null) {
+-            return session.startDraftSequence(null)
++            val startUptimeMs = SystemClock.uptimeMillis()
++            val gatingDecision = session.startDraftSequence(null, startUptimeMs)
++            delayPolicy.onDraftStarted(null, startUptimeMs)
++            return gatingDecision
+         }
+         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
+         val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
+@@ -63,7 +67,8 @@ class CaptureAvailablePacer(
+             draftSequencePredictedDurationMs,
+         )
+ 
+-        return session.startDraftSequence(
++        val startUptimeMs = SystemClock.uptimeMillis()
++        val gatingDecision = session.startDraftSequence(
+             CaptureAvailablePacingPrediction(
+                 draftSequenceStartBudgetMs = budgetMs,
+                 draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
+@@ -71,13 +76,15 @@ class CaptureAvailablePacer(
+                 draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+                 draftSequenceKey = draftSequenceKey.toReplayString(),
+             ),
++            startUptimeMs,
+         )
++        delayPolicy.onDraftStarted(currentSizeBucket, startUptimeMs)
++        return gatingDecision
+     }
+ 
+     /**
+-     * Records the APM timings observed for this capture (non-positive values mean no observation), then returns the
+-     * larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is
+-     * queued as the admission record consumed by the next draft start.
++     * Records the APM timings observed for this capture (non-positive values mean no observation), delegates delay
++     * arithmetic to the selected policy, and queues the resulting admission record for the next draft start.
+      */
+     @Synchronized
+     override fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision? {
+@@ -86,23 +93,24 @@ class CaptureAvailablePacer(
+ 
+         val prediction = session.pacingPrediction ?: return null
+         val nowUptimeMs = SystemClock.uptimeMillis()
+-        val backlogMs = session.backlogMsAt(nowUptimeMs)
++        val predictedBacklogMs = session.backlogMsAt(nowUptimeMs)
+         val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
+-        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
+-            draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
+-            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+-        )
+-        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
+-            backlogMs = backlogMs,
+-            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+-            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
++        val policyDecision = delayPolicy.decide(
++            CaptureAvailableDelayPolicyInput(
++                decisionUptimeMs = nowUptimeMs,
++                draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
++                draftSequencePacingDurationMs = draftSequencePacingDurationMs,
++                predictedBacklogMs = predictedBacklogMs,
++                queuedDraftCount = session.queuedDraftCount,
++                maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
++            )
+         )
+ 
+         val decision = CaptureAvailablePacingDecision(
+-            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
+-            backlogMs = backlogMs,
+-            levelDeficitMs = levelDeficitMs,
+-            backlogDeficitMs = backlogDeficitMs,
++            delayMs = policyDecision.delayMs,
++            backlogMs = policyDecision.backlogMs,
++            levelDeficitMs = policyDecision.levelDeficitMs,
++            backlogDeficitMs = policyDecision.backlogDeficitMs,
+             queuedDraftCount = session.queuedDraftCount,
+             queuedPredictedWorkMs = session.queuedPredictedWorkMs,
+             maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+@@ -122,6 +130,7 @@ class CaptureAvailablePacer(
+     fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long, nodeProcessingMs: Long) {
+         activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
+         draftDurationOverhead.observe(nodeProcessingMs, draftWallMs)
++        delayPolicy.onDraftMeasured(sizeBucket, draftWallMs)
+     }
+ 
+     /** Burst-session identity for metrics: a new value every time the drained pipeline clears the pacer. */
+@@ -132,6 +141,7 @@ class CaptureAvailablePacer(
+     @Synchronized
+     fun clear() {
+         session = null
++        delayPolicy.clearSession()
+     }
+ 
+     /**
+@@ -165,10 +175,9 @@ class CaptureAvailablePacer(
+ }
+ 
+ /**
+- * The two deficits, stateless so a decision can be re-derived from persisted pacing inputs alone. Offline replay
+- * calls these exact functions to answer "what would today's pacing delay be"; a copy of this arithmetic would let the
+- * two drift and report a pacing change as no change. The delay they feed is their plain max, written out at both call
+- * sites - a wrapper around `maxOf` is not arithmetic that can drift.
++ * Ours' two deficits, stateless so its decision can be re-derived from persisted pacing inputs alone. The default
++ * policy and offline replay call these exact functions; a copy of this arithmetic would let the two drift and report
++ * a pacing change as no change.
+  */
+ internal fun computeCaptureAvailableLevelDeficitMs(
+     draftSequenceStartBudgetMs: Long,
+diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
+index f168fa1eac0965bb72b9e733ee01753a9e91eda5..2c0ff7a7c35013e457da45ebb399db77c9e9f90f 100644
+--- a/CaptureAvailablePacingSession.kt
++++ b/CaptureAvailablePacingSession.kt
+@@ -116,6 +116,7 @@ internal class CaptureAvailablePacingSession {
+      */
+     fun startDraftSequence(
+         draftStartPrediction: CaptureAvailablePacingPrediction?,
++        startUptimeMs: Long,
+     ): CaptureAvailablePacingDecision? {
+         if (draftStartPrediction != null) {
+             pacingPrediction = draftStartPrediction
+@@ -124,7 +125,7 @@ internal class CaptureAvailablePacingSession {
+         val startingPredictedMs = draftStartPrediction?.draftSequencePredictedDurationMs ?: 0.0
+         val draftOverheadMs = pacingPrediction?.draftSequenceOverheadDurationMs ?: 0.0
+         val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
+-        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
++        backlogEndTimeMs = startUptimeMs + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
+         return gatingDecision
+     }
+ }
+diff --git a/CaptureMetrics.kt b/CaptureMetrics.kt
+index 811210842d770173b0a91458646883c0d6688e9c..38ed2e9bd4c6ff028a6ea685965f65757fad4b36 100644
+--- a/CaptureMetrics.kt
++++ b/CaptureMetrics.kt
+@@ -53,9 +53,8 @@ data class NodeExecutionMetrics(
+ )
+ 
+ /**
+- * Runtime captureAvailable pacing decision persisted for offline replay: the applied callback delay plus every
+- * backlog-clock input that produced it, so skip/pacing counterfactuals can re-run the policy on real state
+- * instead of exporter-side proxies.
++ * Runtime captureAvailable pacing decision persisted for offline replay: the applied callback delay, the selected
++ * policy's deficit/backlog projection, and the shared Ours inputs needed for counterfactual replay.
+  */
+ data class CaptureAvailablePacingMetrics(
+     val decisionUptimeMs: Long,
+@@ -73,7 +72,7 @@ data class CaptureAvailablePacingMetrics(
+     val draftSequencePredictedDurationMs: Double,
+     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
+     val draftSequenceOverheadDurationMs: Double,
+-    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingPrediction]. */
++    /** Draft-sequence duration Ours' two pacing deficits use; see [CaptureAvailablePacingPrediction]. */
+     val draftSequencePacingDurationMs: Double,
+     val draftSequenceKey: String,
+ )
+diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
+index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c38838235acfa1dd 100644
+--- a/CaptureMetricsExcelExporter.kt
++++ b/CaptureMetricsExcelExporter.kt
+@@ -59,6 +59,7 @@ class CaptureMetricsExcelExporter(
+     /** Per-shot RQ3 row. The delay recorded on shot i gates the transition to shot i+1. */
+     private class Rq3CaptureRow(
+         val deviceModel: String,
++        val pacingPolicy: String,
+         val capture: CaptureRow,
+         val runId: Int,
+         val runShotIndex: Int,
+@@ -80,6 +81,7 @@ class CaptureMetricsExcelExporter(
+     /** One row per ppSequenceId-reset-delimited experiment run for direct RQ3 table aggregation. */
+     private class Rq3RunSummary(
+         val deviceModel: String,
++        val pacingPolicy: String,
+         val runId: Int,
+         val shotCount: Int,
+         val startingOverheatLevel: Int?,
+@@ -192,6 +194,7 @@ class CaptureMetricsExcelExporter(
+     private fun buildRq3Export(captures: List<CaptureRow>): Rq3Export {
+         val captureRows = mutableListOf<Rq3CaptureRow>()
+         val summaries = mutableListOf<Rq3RunSummary>()
++        val pacingPolicy = CaptureAvailableDelayPolicyFactory.activePolicyName()
+ 
+         groupRq3ExperimentRuns(captures).forEachIndexed { runIndex, run ->
+             val runId = runIndex + 1
+@@ -232,6 +235,7 @@ class CaptureMetricsExcelExporter(
+                 runRows.add(
+                     Rq3CaptureRow(
+                         deviceModel = Build.MODEL,
++                        pacingPolicy = pacingPolicy,
+                         capture = capture,
+                         runId = runId,
+                         runShotIndex = shotIndex,
+@@ -264,6 +268,7 @@ class CaptureMetricsExcelExporter(
+             summaries.add(
+                 Rq3RunSummary(
+                     deviceModel = Build.MODEL,
++                    pacingPolicy = pacingPolicy,
+                     runId = runId,
+                     shotCount = run.size,
+                     startingOverheatLevel = startingOverheatLevel,
+@@ -1265,6 +1270,7 @@ class CaptureMetricsExcelExporter(
+ 
+         private fun buildRq3PacingColumns(): List<Column<Rq3CaptureRow>> = listOf(
+             Column("deviceModel") { it.deviceModel },
++            Column("pacingPolicy") { it.pacingPolicy },
+             Column("runId") { it.runId },
+             Column("runShotIndex") { it.runShotIndex },
+             Column("runShotCount") { it.runShotCount },
+@@ -1333,6 +1339,7 @@ class CaptureMetricsExcelExporter(
+ 
+         private fun buildRq3SummaryColumns(): List<Column<Rq3RunSummary>> = listOf(
+             Column("deviceModel") { it.deviceModel },
++            Column("pacingPolicy") { it.pacingPolicy },
+             Column("runId") { it.runId },
+             Column("shotCount") { it.shotCount },
+             Column("isComplete30ShotRun") { it.shotCount == RQ3_TARGET_SHOT_COUNT },
+@@ -1593,7 +1600,8 @@ class CaptureMetricsExcelExporter(
+             ReplayNote(
+                 topic = "RQ3 summary",
+                 note = "RQ3Summary reports P50 and P95 over positive transition delays using Excel PERCENTILE.INC " +
+-                    "interpolation. deviceModel is the runtime Build.MODEL value.",
++                    "interpolation. deviceModel is the runtime Build.MODEL value. pacingPolicy is the active factory " +
++                    "policy in the exporting build; clear the metrics DB between policy builds.",
+             ),
+             ReplayNote(
+                 topic = "Wall-base pacing",
+diff --git a/DeviceStateReader.kt b/DeviceStateReader.kt
+index a9103bfec2db2ecb8a85be0431e211cb4ccb3513..28a1edd6edc070cc1a779ce6f1a025bb9e60cc71 100644
+--- a/DeviceStateReader.kt
++++ b/DeviceStateReader.kt
+@@ -20,6 +20,12 @@ class DeviceStateReader(
+     private val overheatLevelSupplier: Supplier<Int>,
+ ) {
+ 
++    @Volatile
++    private var latestThermalHeadroom = Float.NaN
++
++    /** Latest profiler snapshot; reading it does not poll PowerManager again from the captureAvailable callback. */
++    fun readLatestThermalHeadroom(): Float = latestThermalHeadroom
++
+     fun read(): DeviceStateSnapshot {
+         return runBlocking(Dispatchers.Default) {
+             readInternal()
+@@ -88,6 +94,7 @@ class DeviceStateReader(
+             .takeIf { !it.isNaN() }
+             ?.let { (round(it * 1000) / 1000f) }
+             ?: -1f
++        latestThermalHeadroom = thermalHeadroom
+ 
+         return ThermalSnapshot(
+             overheatLevel = overheatLevelSupplier.get(),
+diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
+index ac1d6935d527fb1296a76f3fbc324ed70f75b825..6dedfbb2f25947d0d2fe096f4e13cfcfd52b494b 100644
+--- a/external/apm/policy/CaptureAvailableApmPolicy.java
++++ b/external/apm/policy/CaptureAvailableApmPolicy.java
+@@ -141,14 +141,14 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
+             } else if (appliedDelayMs > 0L) {
+                 reason = "pace draft sequence by " + appliedDelayMs + "ms";
+             } else {
+-                reason = "budget is enough";
++                reason = "selected pacing policy requires no delay";
+             }
+ 
+             pacingDetails += ", draftSequenceStartBudget=" + pacingPrediction.getDraftSequenceStartBudgetMs() + "ms"
+                     + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
+                     + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
+                     + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"
+-                    + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
++                    + ", policyBacklog=" + pacingDecision.getBacklogMs() + "ms"
+                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
+                     + ", draftSequenceKey=" + pacingPrediction.getDraftSequenceKey();
+         }
+diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
+index 437e1e034a81c269a63c62f824216b1c3ef52312..75338cdcfb6253c01fbde3d63446a49e42417395 100644
+--- a/external/draftSaving/SavingDraftImageTaskManager.java
++++ b/external/draftSaving/SavingDraftImageTaskManager.java
+@@ -10,6 +10,7 @@ import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
+ import com.samsung.android.camera.core2.container.ExtraBundle;
+ import com.samsung.android.camera.core2.container.SavingInfoContainer;
+ import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
++import com.samsung.android.camera.core2.ml.CaptureAvailableDelayPolicyFactory;
+ import com.samsung.android.camera.core2.ml.CaptureMetrics;
+ import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+ import com.samsung.android.camera.core2.ml.DeviceStateReader;
+@@ -46,8 +47,7 @@ public class SavingDraftImageTaskManager {
+     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
+     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
+     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
+-    private final CaptureAvailablePacer captureAvailablePacer =
+-            new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
++    private final CaptureAvailablePacer captureAvailablePacer;
+     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
+     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
+     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
+@@ -70,6 +70,12 @@ public class SavingDraftImageTaskManager {
+     public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
+         this.context = context;
+         this.deviceStateReader = deviceStateReader;
++        this.captureAvailablePacer = new CaptureAvailablePacer(
++                draftSequenceExecutionPredictor,
++                admissionPolicy,
++                CaptureAvailableDelayPolicyFactory.create(deviceStateReader));
++        PLog.i(TAG, "[mhyun2.park] captureAvailable delay policy: %s",
++                CaptureAvailableDelayPolicyFactory.activePolicyName());
+     }
+ 
+     /**
+@@ -321,4 +327,4 @@ public class SavingDraftImageTaskManager {
+             hasCaptureTimeoutInCurrentSession = false;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c3f9e751c
+--- /dev/null
++++ b/CaptureAvailableDelayPolicy.kt
+@@ -0,0 +1,74 @@
++package com.samsung.android.camera.core2.ml
++
++/**
++ * Delay arithmetic selected by [CaptureAvailablePacer].
++ *
++ * The pacer continues to own admission pairing, workload prediction, session boundaries, and metrics.  A policy sees
++ * one immutable decision snapshot and returns only the delay components it actually used.  This keeps RQ3 policies
++ * interchangeable without giving a baseline a different admission path or a different captureAvailable callback.
++ *
++ * Not synchronized: [CaptureAvailablePacer] invokes every method under its own lock.
++ */
++interface CaptureAvailableDelayPolicy {
++    fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision
++
++    /** A Draft entered the single-worker pipeline. */
++    fun onDraftStarted(sizeBucket: SizeBucket?, startUptimeMs: Long) = Unit
++
++    /** A Draft left the single-worker pipeline with an observable wall time. */
++    fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) = Unit
++
++    /** Clears burst-local state.  Pipeline-lifetime calibration may deliberately remain. */
++    fun clearSession() = Unit
++}
++
++/** Runtime facts available at one captureAvailable decision. */
++data class CaptureAvailableDelayPolicyInput(
++    val decisionUptimeMs: Long,
++    val draftSequenceStartBudgetMs: Long,
++    val draftSequencePacingDurationMs: Double,
++    val predictedBacklogMs: Long,
++    val queuedDraftCount: Int,
++    val maxDraftStartLatencyMs: Long,
++)
++
++/**
++ * Policy result projected into the existing pacing metrics.
++ *
++ * [backlogMs] is the backlog estimate used by this policy.  It is therefore the predicted-work clock for Ours, zero
++ * for Thermal LUT, and the queue/EWMA estimate for Queue-EWMA.
++ */
++data class CaptureAvailableDelayPolicyDecision(
++    val delayMs: Long,
++    val levelDeficitMs: Long,
++    val backlogDeficitMs: Long,
++    val backlogMs: Long,
++) {
++    init {
++        require(delayMs >= 0L)
++        require(levelDeficitMs >= 0L)
++        require(backlogDeficitMs >= 0L)
++        require(backlogMs >= 0L)
++    }
++}
++
++/** Existing context-aware budget/backlog arithmetic, extracted as the default swappable policy. */
++object ContextAwareCaptureAvailableDelayPolicy : CaptureAvailableDelayPolicy {
++    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
++        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
++            draftSequenceStartBudgetMs = input.draftSequenceStartBudgetMs,
++            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++        )
++        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
++            backlogMs = input.predictedBacklogMs,
++            maxDraftStartLatencyMs = input.maxDraftStartLatencyMs,
++            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++        )
++        return CaptureAvailableDelayPolicyDecision(
++            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
++            levelDeficitMs = levelDeficitMs,
++            backlogDeficitMs = backlogDeficitMs,
++            backlogMs = input.predictedBacklogMs,
++        )
++    }
++}
+diff --git a/CaptureAvailableDelayPolicyFactory.kt b/CaptureAvailableDelayPolicyFactory.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..37142753eb041a60c07a8b3de780e73f2888e68e
+--- /dev/null
++++ b/CaptureAvailableDelayPolicyFactory.kt
+@@ -0,0 +1,66 @@
++package com.samsung.android.camera.core2.ml
++
++import android.os.Build
++import java.util.function.DoubleSupplier
++
++/**
++ * One experiment switch for RQ3 pacing-policy runs.
++ *
++ * Keep [activePolicy] at OURS for production-reference builds.  To collect a baseline, add the exact Build.MODEL
++ * configuration to the corresponding map and change only [activePolicy].  A missing device calibration fails at
++ * construction instead of silently running an uncalibrated zero-delay baseline.
++ */
++object CaptureAvailableDelayPolicyFactory {
++    private val activePolicy = PolicyType.OURS
++
++    /*
++     * Populate from calibration sessions only.  Each map key is the exact Build.MODEL string exported as deviceModel.
++     * Do not reuse one device's LUT or EWMA parameters for another device merely to make an evaluation build run.
++     */
++    private val thermalLutConfigByDevice:
++        Map<String, ThermalLutCaptureAvailableDelayPolicy.Config> = emptyMap()
++    private val queueEwmaConfigByDevice:
++        Map<String, QueueEwmaCaptureAvailableDelayPolicy.Config> = emptyMap()
++
++    @JvmStatic
++    fun create(deviceStateReader: DeviceStateReader): CaptureAvailableDelayPolicy {
++        val deviceModel = Build.MODEL
++        return when (activePolicy) {
++            PolicyType.OURS -> ContextAwareCaptureAvailableDelayPolicy
++            PolicyType.THERMAL_LUT -> ThermalLutCaptureAvailableDelayPolicy(
++                config = requireDeviceConfig(
++                    policyName = PolicyType.THERMAL_LUT.name,
++                    deviceModel = deviceModel,
++                    configByDevice = thermalLutConfigByDevice,
++                ),
++                thermalHeadroomSupplier = DoubleSupplier {
++                    deviceStateReader.readLatestThermalHeadroom().toDouble()
++                },
++            )
++            PolicyType.QUEUE_EWMA -> QueueEwmaCaptureAvailableDelayPolicy(
++                config = requireDeviceConfig(
++                    policyName = PolicyType.QUEUE_EWMA.name,
++                    deviceModel = deviceModel,
++                    configByDevice = queueEwmaConfigByDevice,
++                ),
++            )
++        }
++    }
++
++    @JvmStatic
++    fun activePolicyName(): String = activePolicy.name
++
++    private fun <T> requireDeviceConfig(
++        policyName: String,
++        deviceModel: String,
++        configByDevice: Map<String, T>,
++    ): T = requireNotNull(configByDevice[deviceModel]) {
++        "$policyName has no calibrated configuration for Build.MODEL=$deviceModel"
++    }
++
++    enum class PolicyType {
++        OURS,
++        THERMAL_LUT,
++        QUEUE_EWMA,
++    }
++}
+diff --git a/QueueEwmaCaptureAvailableDelayPolicy.kt b/QueueEwmaCaptureAvailableDelayPolicy.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d3d7e67ac752df998049cb937d18ef8fce60c8a
+--- /dev/null
++++ b/QueueEwmaCaptureAvailableDelayPolicy.kt
+@@ -0,0 +1,87 @@
++package com.samsung.android.camera.core2.ml
++
++import kotlin.math.ceil
++
++/**
++ * RQ3 queue-feedback baseline.
++ *
++ * The policy estimates the unfinished single-worker occupancy from only observable queue state and an EWMA of Drafts
++ * that completed before the decision.  It does not read the pacer's per-workload predictions or its predicted backlog
++ * clock.  The active Draft is charged only its estimated remaining wall time; not-yet-started Drafts are each charged
++ * one full EWMA service time.  Its target is fixed for the calibrated configuration, so thermal bucket changes
++ * cannot abruptly alter the feedback response.
++ *
++ * The EWMA is pipeline-lifetime learned state, matching Ours' learned overhead lifetime.  [clearSession] removes only
++ * burst-local occupancy so repeated 30-shot trials can choose explicitly between a new policy instance (cold) and a
++ * retained instance (warm).
++ */
++class QueueEwmaCaptureAvailableDelayPolicy(
++    private val config: Config,
++) : CaptureAvailableDelayPolicy {
++
++    private val serviceTimeMsBySize = config.initialServiceTimeMsBySize.toMutableMap()
++    private var activeDraftStartUptimeMs: Long? = null
++    private var activeSizeBucket: SizeBucket? = null
++
++    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
++        val serviceTimeMs = serviceTimeMs(activeSizeBucket)
++        val activeRemainingMs = activeDraftStartUptimeMs?.let { startUptimeMs ->
++            (serviceTimeMs - (input.decisionUptimeMs - startUptimeMs).coerceAtLeast(0L)).coerceAtLeast(0.0)
++        } ?: 0.0
++        val queuedWorkMs = input.queuedDraftCount.coerceAtLeast(0).toDouble() * serviceTimeMs
++        val estimatedBacklogMs = ceil(activeRemainingMs + queuedWorkMs).toLong()
++        val backlogDeficitMs = (estimatedBacklogMs - config.targetBacklogMs).coerceAtLeast(0L)
++
++        return CaptureAvailableDelayPolicyDecision(
++            delayMs = backlogDeficitMs,
++            levelDeficitMs = 0L,
++            backlogDeficitMs = backlogDeficitMs,
++            backlogMs = estimatedBacklogMs,
++        )
++    }
++
++    override fun onDraftStarted(sizeBucket: SizeBucket?, startUptimeMs: Long) {
++        activeDraftStartUptimeMs = startUptimeMs
++        activeSizeBucket = sizeBucket
++    }
++
++    override fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
++        activeDraftStartUptimeMs = null
++        activeSizeBucket = null
++        if (draftWallMs <= 0L) {
++            return
++        }
++
++        val previousEstimateMs = serviceTimeMs(sizeBucket)
++        serviceTimeMsBySize[sizeBucket] =
++            previousEstimateMs * (1.0 - config.alpha) + draftWallMs.toDouble() * config.alpha
++    }
++
++    override fun clearSession() {
++        activeDraftStartUptimeMs = null
++        activeSizeBucket = null
++    }
++
++    /** Explicit cold reset for a test harness; normal burst drain intentionally keeps learned service times. */
++    fun resetLearnedServiceTimes() {
++        serviceTimeMsBySize.clear()
++        serviceTimeMsBySize.putAll(config.initialServiceTimeMsBySize)
++    }
++
++    private fun serviceTimeMs(sizeBucket: SizeBucket?): Double =
++        sizeBucket?.let { serviceTimeMsBySize[it] } ?: config.fallbackInitialServiceTimeMs
++
++    data class Config(
++        val alpha: Double,
++        val initialServiceTimeMsBySize: Map<SizeBucket, Double>,
++        val fallbackInitialServiceTimeMs: Double,
++        val targetBacklogMs: Long,
++    ) {
++        init {
++            require(alpha > 0.0 && alpha <= 1.0)
++            require(initialServiceTimeMsBySize.values.all { serviceTimeMs -> serviceTimeMs > 0.0 })
++            require(fallbackInitialServiceTimeMs > 0.0)
++            require(targetBacklogMs >= 0L)
++        }
++    }
++}
+diff --git a/ThermalLutCaptureAvailableDelayPolicy.kt b/ThermalLutCaptureAvailableDelayPolicy.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9178a67aa08353efee992b4d777a3ac3f3d3d62
+--- /dev/null
++++ b/ThermalLutCaptureAvailableDelayPolicy.kt
+@@ -0,0 +1,62 @@
++package com.samsung.android.camera.core2.ml
++
++import java.util.function.DoubleSupplier
++import kotlin.math.roundToLong
++
++/**
++ * RQ3 Thermal-LUT baseline.
++ *
++ * The only runtime input is continuous thermal headroom.  Delay is linearly interpolated between calibrated control
++ * points, avoiding a discontinuous jump at a thermal bucket boundary.  This class deliberately has no queue,
++ * workload-prediction, or online-duration input.
++ */
++class ThermalLutCaptureAvailableDelayPolicy(
++    private val config: Config,
++    private val thermalHeadroomSupplier: DoubleSupplier,
++) : CaptureAvailableDelayPolicy {
++
++    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
++        val delayMs = config.delayMs(thermalHeadroomSupplier.getAsDouble())
++        return CaptureAvailableDelayPolicyDecision(
++            delayMs = delayMs,
++            levelDeficitMs = delayMs,
++            backlogDeficitMs = 0L,
++            backlogMs = 0L,
++        )
++    }
++
++    data class Config(
++        val delayMsByThermalHeadroom: Map<Double, Long>,
++        val fallbackDelayMs: Long,
++    ) {
++        private val controlPoints = delayMsByThermalHeadroom.entries.sortedBy { it.key }
++
++        init {
++            require(delayMsByThermalHeadroom.isNotEmpty())
++            require(delayMsByThermalHeadroom.keys.all { headroom -> headroom.isFinite() })
++            require(delayMsByThermalHeadroom.values.all { delayMs -> delayMs >= 0L })
++            require(fallbackDelayMs >= 0L)
++        }
++
++        fun delayMs(thermalHeadroom: Double): Long {
++            if (!thermalHeadroom.isFinite() || thermalHeadroom < 0.0) {
++                return fallbackDelayMs
++            }
++
++            val upperIndex = controlPoints.indexOfFirst { point -> point.key >= thermalHeadroom }
++            if (upperIndex < 0) {
++                return controlPoints.last().value
++            }
++            if (upperIndex == 0) {
++                return controlPoints.first().value
++            }
++
++            val lower = controlPoints[upperIndex - 1]
++            val upper = controlPoints[upperIndex]
++            val ratio = (thermalHeadroom - lower.key) / (upper.key - lower.key)
++            return (lower.value.toDouble() + (upper.value - lower.value).toDouble() * ratio)
++                .roundToLong()
++                .coerceAtLeast(0L)
++        }
++    }
++}
