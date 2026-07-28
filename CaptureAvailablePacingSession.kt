@@ -50,8 +50,11 @@ internal class CaptureAvailablePacingSession {
     var maxDraftSequenceDurationMs = 0L
         private set
 
-    /** Longest shutter-to-draft-start wait observed this session; the part of the queue wait the backlog cannot see. */
-    var maxDraftStartLatencyMs = 0L
+    /**
+     * Longest takePicture-to-captureAvailable elapsed observed this session, as the APM side measures it: the part of
+     * the capture timeout window already spent before a draft can start, which the backlog clock cannot see.
+     */
+    var maxCaptureAvailableLatencyMs = 0L
         private set
 
     val queuedDraftCount: Int get() = pendingDecisions.size
@@ -61,12 +64,12 @@ internal class CaptureAvailablePacingSession {
         get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
 
     /** Raises the session maxima by one capture's observed timings; non-positive values mean no observation. */
-    fun observeCaptureTimings(draftSequenceDurationMs: Long, draftStartLatencyMs: Long) {
+    fun observeCaptureTimings(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long) {
         if (draftSequenceDurationMs > 0L) {
             maxDraftSequenceDurationMs = maxOf(maxDraftSequenceDurationMs, draftSequenceDurationMs)
         }
-        if (draftStartLatencyMs > 0L) {
-            maxDraftStartLatencyMs = maxOf(maxDraftStartLatencyMs, draftStartLatencyMs)
+        if (captureAvailableLatencyMs > 0L) {
+            maxCaptureAvailableLatencyMs = maxOf(maxCaptureAvailableLatencyMs, captureAvailableLatencyMs)
         }
     }
 
@@ -86,8 +89,8 @@ internal class CaptureAvailablePacingSession {
      * not yet measured this session falls back to the size-agnostic max - conservative for a genuinely cold size,
      * exact once its own size has run.
      */
-    fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket?): Long =
-        sizeBucket?.let { maxDraftSequenceDurationMsBySize[it] } ?: maxDraftSequenceDurationMs
+    fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
+        maxDraftSequenceDurationMsBySize[sizeBucket] ?: maxDraftSequenceDurationMs
 
     /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
     fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)

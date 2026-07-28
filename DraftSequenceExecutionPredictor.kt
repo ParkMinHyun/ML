@@ -24,6 +24,7 @@ class DraftSequenceExecutionPredictor {
 
     private val workloadDurationTrend = WorkloadDurationTrend()
     private val workloadSequenceResidual = WorkloadSequenceResidual()
+    private val draftDurationOverhead = DraftDurationOverhead()
 
     @Synchronized
     fun decideAdmission(
@@ -123,14 +124,21 @@ class DraftSequenceExecutionPredictor {
             .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
     }
 
+    /**
+     * Learns every duration trend this capture can teach: per-workload baselines, the sequence residual margin, and
+     * the whole-draft time outside node processing. [draftWallMs] is the completed draft's real wall; non-positive
+     * means it was not measured and the overhead trend keeps its history.
+     */
     @Synchronized
     fun learnFromCapture(
         workloadDurations: Map<WorkloadKey, Long>,
         admissionDecisions: Collection<AdmissionDecision>,
+        draftWallMs: Long,
     ) {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
         workloadSequenceResidual.observe(validWorkloadDurations, admissionDecisions)
         workloadDurationTrend.observe(validWorkloadDurations)
+        draftDurationOverhead.observe(validWorkloadDurations.values.sum(), draftWallMs)
     }
 
     /**
@@ -142,6 +150,40 @@ class DraftSequenceExecutionPredictor {
     fun estimateDraftSequenceMs(workloadSequenceKey: WorkloadSequenceKey): Double {
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         return sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
+    }
+
+    /** Learned wall time outside node processing, priced once per whole draft. Exposed for pacing metrics. */
+    @Synchronized
+    fun estimateDraftOverheadMs(): Double = draftDurationOverhead.estimateMs()
+
+    /**
+     * Whole-draft occupancy estimate: [estimateDraftSequenceMs] plus [estimateDraftOverheadMs]. Every caller pricing
+     * a real draft wants this one - the node point sum alone omits the pipeline time between nodes, so a caller that
+     * reaches for the point sum and adds the overhead itself is one edit away from forgetting to.
+     */
+    @Synchronized
+    fun estimateDraftSequenceWallMs(workloadSequenceKey: WorkloadSequenceKey): Double =
+        estimateDraftSequenceMs(workloadSequenceKey) + draftDurationOverhead.estimateMs()
+
+    /**
+     * Whole-draft time outside node processing: inter-node gaps, deinit, and scheduling. The recency-weighted mean
+     * prices each queued draft's real pipeline occupancy; a median would under-price its right-skewed distribution.
+     */
+    private class DraftDurationOverhead {
+        private val overheadScores = RecencyWeightedDistribution()
+        private var learnedOverheadMs = 0.0
+
+        fun estimateMs(): Double = learnedOverheadMs
+
+        fun observe(nodeProcessingMs: Long, draftWallMs: Long) {
+            if (draftWallMs <= 0L || nodeProcessingMs <= 0L) {
+                return
+            }
+
+            overheadScores.decay()
+            overheadScores.add((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            learnedOverheadMs = overheadScores.mean()
+        }
     }
 
     /**

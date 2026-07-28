@@ -144,7 +144,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 reason = "budget is enough";
             }
 
-            pacingDetails += ", draftSequenceStartBudget=" + pacingPrediction.getDraftSequenceStartBudgetMs() + "ms"
+            pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
                     + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
                     + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
                     + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"

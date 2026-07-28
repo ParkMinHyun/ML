@@ -27,14 +27,14 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
          val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
 @@ -63,7 +67,8 @@ class CaptureAvailablePacer(
-             draftSequencePredictedDurationMs,
+             predictor.estimateDraftSequenceWallMs(draftSequenceKey),
          )
  
 -        return session.startDraftSequence(
 +        val startUptimeMs = SystemClock.uptimeMillis()
 +        val gatingDecision = session.startDraftSequence(
              CaptureAvailablePacingPrediction(
-                 draftSequenceStartBudgetMs = budgetMs,
+                 draftSequenceBudgetMs = budgetMs,
                  draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
 @@ -71,13 +76,15 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
@@ -54,7 +54,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +     * arithmetic to the selected policy, and queues the resulting admission record for the next draft start.
       */
      @Synchronized
-     override fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision? {
+     override fun decideDelay(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long): CaptureAvailablePacingDecision? {
 @@ -86,23 +93,24 @@ class CaptureAvailablePacer(
  
          val prediction = session.pacingPrediction ?: return null
@@ -63,21 +63,21 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +        val predictedBacklogMs = session.backlogMsAt(nowUptimeMs)
          val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
 -        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
--            draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
+-            draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 -        )
 -        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
 -            backlogMs = backlogMs,
--            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+-            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 +        val policyDecision = delayPolicy.decide(
 +            CaptureAvailableDelayPolicyInput(
 +                decisionUptimeMs = nowUptimeMs,
-+                draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
++                draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
 +                draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 +                predictedBacklogMs = predictedBacklogMs,
 +                queuedDraftCount = session.queuedDraftCount,
-+                maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
++                maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
 +            )
          )
  
@@ -92,11 +92,10 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +            backlogDeficitMs = policyDecision.backlogDeficitMs,
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
-             maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
-@@ -122,6 +130,7 @@ class CaptureAvailablePacer(
-     fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long, nodeProcessingMs: Long) {
+             maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
+@@ -122,5 +130,6 @@ class CaptureAvailablePacer(
+     fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
          activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
-         draftDurationOverhead.observe(nodeProcessingMs, draftWallMs)
 +        delayPolicy.onDraftMeasured(sizeBucket, draftWallMs)
      }
  
@@ -122,7 +121,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 + * a pacing change as no change.
   */
  internal fun computeCaptureAvailableLevelDeficitMs(
-     draftSequenceStartBudgetMs: Long,
+     draftSequenceBudgetMs: Long,
 diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
 index f168fa1eac0965bb72b9e733ee01753a9e91eda5..2c0ff7a7c35013e457da45ebb399db77c9e9f90f 100644
 --- a/CaptureAvailablePacingSession.kt
@@ -276,7 +275,7 @@ index ac1d6935d527fb1296a76f3fbc324ed70f75b825..6dedfbb2f25947d0d2fe096f4e13cfcf
 +                reason = "selected pacing policy requires no delay";
              }
  
-             pacingDetails += ", draftSequenceStartBudget=" + pacingPrediction.getDraftSequenceStartBudgetMs() + "ms"
+             pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
                      + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
                      + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
                      + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"
@@ -360,11 +359,11 @@ index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c
 +/** Runtime facts available at one captureAvailable decision. */
 +data class CaptureAvailableDelayPolicyInput(
 +    val decisionUptimeMs: Long,
-+    val draftSequenceStartBudgetMs: Long,
++    val draftSequenceBudgetMs: Long,
 +    val draftSequencePacingDurationMs: Double,
 +    val predictedBacklogMs: Long,
 +    val queuedDraftCount: Int,
-+    val maxDraftStartLatencyMs: Long,
++    val maxCaptureAvailableLatencyMs: Long,
 +)
 +
 +/**
@@ -391,12 +390,12 @@ index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c
 +object ContextAwareCaptureAvailableDelayPolicy : CaptureAvailableDelayPolicy {
 +    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
 +        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
-+            draftSequenceStartBudgetMs = input.draftSequenceStartBudgetMs,
++            draftSequenceBudgetMs = input.draftSequenceBudgetMs,
 +            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
 +        )
 +        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
 +            backlogMs = input.predictedBacklogMs,
-+            maxDraftStartLatencyMs = input.maxDraftStartLatencyMs,
++            maxCaptureAvailableLatencyMs = input.maxCaptureAvailableLatencyMs,
 +            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
 +        )
 +        return CaptureAvailableDelayPolicyDecision(

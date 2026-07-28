@@ -181,12 +181,11 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         } else {
             0L
         }
-        val nodeProcessingMs = modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
-            predictor.learnFromCapture(workloadDurations, admissionDecisions)
-            workloadDurations.values.sumOf { durationMs -> durationMs.coerceAtLeast(0L) }
-        } ?: 0L
-        // Keep the size-scoped duration estimate and learned non-node occupancy aligned to this completed draft.
-        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs, nodeProcessingMs)
+        modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
+            predictor.learnFromCapture(workloadDurations, admissionDecisions, draftWallMs)
+        }
+        // Keep the session's size-scoped duration estimate aligned to this completed draft.
+        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()

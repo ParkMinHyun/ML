@@ -11,7 +11,7 @@ import kotlin.math.ceil
  * concurrent captureAvailable callbacks would double-admit against a stale backlog.
  */
 fun interface CaptureAvailablePacingDecider {
-    fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision?
+    fun decideDelay(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long): CaptureAvailablePacingDecision?
 }
 
 /**
@@ -29,14 +29,10 @@ class CaptureAvailablePacer(
     /**
      * Everything scoped to the burst session in progress, absent while the pipeline is idle. [clear] drops it whole
      * rather than resetting field by field, so "clear resets the session and nothing else" holds by construction - a
-     * new session field cannot be forgotten there, and the pipeline-lifetime [draftDurationOverhead] beside it
-     * cannot be wiped by accident. The pacer itself outlives every session on purpose: the APM side holds this one
-     * reference, and a pacer between sessions must stay reachable to answer "no delay".
+     * new session field cannot be forgotten there. The pacer itself outlives every session on purpose: the APM side
+     * holds this one reference, and a pacer between sessions must stay reachable to answer "no delay".
      */
     private var session: CaptureAvailablePacingSession? = null
-
-    /** Pipeline-lifetime learned state, deliberately outside [session]: [clear] must never reset this history. */
-    private val draftDurationOverhead = DraftDurationOverhead()
 
     /**
      * Refreshes the pacing prediction and consumes the oldest admitted callback. A null key means a draft with no
@@ -57,17 +53,19 @@ class CaptureAvailablePacer(
             (predictor.estimateDraftSequenceMs(plannedSequenceKey) - draftSequencePredictedDurationMs)
                 .coerceAtLeast(0.0)
         }
-        val currentSizeBucket = plannedSequenceKey.workloadKeys.firstOrNull()?.sizeBucket
+        val currentSizeBucket = plannedSequenceKey.headWorkloadKey.sizeBucket
+        // Floored by the whole-draft estimate, not the node point sum: the reserve prices the same draft occupancy
+        // the backlog clock does, so a session with no observed max yet cannot reserve less than one draft's wall.
         val draftSequencePacingDurationMs = maxOf(
             session.maxDraftSequenceDurationMs(currentSizeBucket).toDouble() - demotedWorkloadMs,
-            draftSequencePredictedDurationMs,
+            predictor.estimateDraftSequenceWallMs(draftSequenceKey),
         )
 
         return session.startDraftSequence(
             CaptureAvailablePacingPrediction(
-                draftSequenceStartBudgetMs = budgetMs,
+                draftSequenceBudgetMs = budgetMs,
                 draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
-                draftSequenceOverheadDurationMs = draftDurationOverhead.estimateMs(),
+                draftSequenceOverheadDurationMs = predictor.estimateDraftOverheadMs(),
                 draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                 draftSequenceKey = draftSequenceKey.toReplayString(),
             ),
@@ -80,21 +78,24 @@ class CaptureAvailablePacer(
      * queued as the admission record consumed by the next draft start.
      */
     @Synchronized
-    override fun decideDelay(draftSequenceDurationMs: Long, draftStartLatencyMs: Long): CaptureAvailablePacingDecision? {
+    override fun decideDelay(
+        draftSequenceDurationMs: Long,
+        captureAvailableLatencyMs: Long,
+    ): CaptureAvailablePacingDecision? {
         val session = activeSession()
-        session.observeCaptureTimings(draftSequenceDurationMs, draftStartLatencyMs)
+        session.observeCaptureTimings(draftSequenceDurationMs, captureAvailableLatencyMs)
 
         val prediction = session.pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val backlogMs = session.backlogMsAt(nowUptimeMs)
         val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
         val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
-            draftSequenceStartBudgetMs = prediction.draftSequenceStartBudgetMs,
+            draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
             draftSequencePacingDurationMs = draftSequencePacingDurationMs,
         )
         val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
-            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
             draftSequencePacingDurationMs = draftSequencePacingDurationMs,
         )
 
@@ -105,7 +106,7 @@ class CaptureAvailablePacer(
             backlogDeficitMs = backlogDeficitMs,
             queuedDraftCount = session.queuedDraftCount,
             queuedPredictedWorkMs = session.queuedPredictedWorkMs,
-            maxDraftStartLatencyMs = session.maxDraftStartLatencyMs,
+            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
             maxDraftSequenceDurationMs = session.maxDraftSequenceDurationMs,
             decisionUptimeMs = nowUptimeMs,
             prediction = prediction,
@@ -115,13 +116,12 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * Records one completed draft's real wall against its own size and learns the wall time outside node processing.
-     * Both values come from the draft pipeline at completion, where the draft size, wall, and node sum are aligned.
+     * Records one completed draft's real wall against its own size. The same wall also teaches the predictor's
+     * overhead trend, but that is model learning and the draft pipeline feeds it there directly.
      */
     @Synchronized
-    fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long, nodeProcessingMs: Long) {
+    fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
         activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
-        draftDurationOverhead.observe(nodeProcessingMs, draftWallMs)
     }
 
     /** Burst-session identity for metrics: a new value every time the drained pipeline clears the pacer. */
@@ -141,27 +141,6 @@ class CaptureAvailablePacer(
      */
     private fun activeSession(): CaptureAvailablePacingSession =
         session ?: CaptureAvailablePacingSession().also { session = it }
-
-    /**
-     * Whole-draft time outside node processing: inter-node gaps, deinit, and scheduling. The recency-weighted mean
-     * prices each queued draft's real pipeline occupancy; a median would under-price its right-skewed distribution.
-     */
-    private class DraftDurationOverhead {
-        private val overheadScores = RecencyWeightedDistribution()
-        private var learnedOverheadMs = 0.0
-
-        fun estimateMs(): Double = learnedOverheadMs
-
-        fun observe(nodeProcessingMs: Long, draftWallMs: Long) {
-            if (draftWallMs <= 0L || nodeProcessingMs <= 0L) {
-                return
-            }
-
-            overheadScores.decay()
-            overheadScores.add((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
-            learnedOverheadMs = overheadScores.mean()
-        }
-    }
 }
 
 /**
@@ -171,21 +150,21 @@ class CaptureAvailablePacer(
  * sites - a wrapper around `maxOf` is not arithmetic that can drift.
  */
 internal fun computeCaptureAvailableLevelDeficitMs(
-    draftSequenceStartBudgetMs: Long,
+    draftSequenceBudgetMs: Long,
     draftSequencePacingDurationMs: Double,
-): Long = ceil(draftSequencePacingDurationMs - draftSequenceStartBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
+): Long = ceil(draftSequencePacingDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
 
 internal fun computeCaptureAvailableBacklogDeficitMs(
     backlogMs: Long,
-    maxDraftStartLatencyMs: Long,
+    maxCaptureAvailableLatencyMs: Long,
     draftSequencePacingDurationMs: Double,
-): Long = ceil(backlogMs + maxDraftStartLatencyMs + draftSequencePacingDurationMs - MakerFeature.CAPTURE_TIMEOUT_MS)
-    .toLong()
-    .coerceAtLeast(0L)
+): Long = ceil(
+    backlogMs + maxCaptureAvailableLatencyMs + draftSequencePacingDurationMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+).toLong().coerceAtLeast(0L)
 
 /** Latest runtime prediction for captureAvailable pacing. */
 data class CaptureAvailablePacingPrediction(
-    val draftSequenceStartBudgetMs: Long,
+    val draftSequenceBudgetMs: Long,
     val draftSequencePredictedDurationMs: Double,
     /** Learned between-node overhead added once per queued draft to the backlog clock (clock work = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
@@ -206,8 +185,8 @@ data class CaptureAvailablePacingDecision(
     val backlogDeficitMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** Session max shutter-to-draft-start wait consumed by the backlog deficit at decision time. */
-    val maxDraftStartLatencyMs: Long,
+    /** Session max takePicture-to-captureAvailable elapsed consumed by the backlog deficit at decision time. */
+    val maxCaptureAvailableLatencyMs: Long,
     /** Session max measured draft sequence duration at decision time, before re-projection onto the demoted shape. */
     val maxDraftSequenceDurationMs: Long,
     val decisionUptimeMs: Long,
