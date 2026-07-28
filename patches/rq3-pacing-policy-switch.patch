@@ -36,7 +36,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
              CaptureAvailablePacingPrediction(
                  draftSequenceBudgetMs = budgetMs,
                  draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
-@@ -71,13 +76,15 @@ class CaptureAvailablePacer(
+@@ -71,17 +76,16 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
@@ -47,18 +47,24 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
      }
  
      /**
--     * Records the APM timings observed for this capture (non-positive values mean no observation), then returns the
--     * larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is
--     * queued as the admission record consumed by the next draft start.
-+     * Records the APM timings observed for this capture (non-positive values mean no observation), delegates delay
-+     * arithmetic to the selected policy, and queues the resulting admission record for the next draft start.
+-     * Records the APM-observed draft duration (non-positive means no observation), then returns the larger of the
+-     * current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is queued as the
+-     * admission record consumed by the next draft start.
+-     *
+-     * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
+-     * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
+-     * the decision sits past it.
++     * Records the APM-observed draft duration (non-positive means no observation), delegates delay arithmetic to the
++     * selected policy, and queues the resulting admission record for the next draft start. The spent part of this
++     * capture's timeout window is still derived here; how it is charged is now the policy's business.
       */
      @Synchronized
-     override fun decideDelay(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long): CaptureAvailablePacingDecision? {
-@@ -86,23 +93,24 @@ class CaptureAvailablePacer(
+     override fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision? {
+@@ -86,24 +93,25 @@ class CaptureAvailablePacer(
  
          val prediction = session.pacingPrediction ?: return null
          val nowUptimeMs = SystemClock.uptimeMillis()
+         val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)
 -        val backlogMs = session.backlogMsAt(nowUptimeMs)
 +        val predictedBacklogMs = session.backlogMsAt(nowUptimeMs)
          val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
@@ -68,7 +74,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 -        )
 -        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
 -            backlogMs = backlogMs,
--            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
+-            shutterElapsedMs = shutterElapsedMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 +        val policyDecision = delayPolicy.decide(
 +            CaptureAvailableDelayPolicyInput(
@@ -77,7 +83,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +                draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 +                predictedBacklogMs = predictedBacklogMs,
 +                queuedDraftCount = session.queuedDraftCount,
-+                maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
++                shutterElapsedMs = shutterElapsedMs,
 +            )
          )
  
@@ -92,7 +98,7 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +            backlogDeficitMs = policyDecision.backlogDeficitMs,
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
-             maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
+             shutterElapsedMs = shutterElapsedMs,
 @@ -122,5 +130,6 @@ class CaptureAvailablePacer(
      fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
          activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
@@ -363,7 +369,7 @@ index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c
 +    val draftSequencePacingDurationMs: Double,
 +    val predictedBacklogMs: Long,
 +    val queuedDraftCount: Int,
-+    val maxCaptureAvailableLatencyMs: Long,
++    val shutterElapsedMs: Long,
 +)
 +
 +/**
@@ -395,7 +401,7 @@ index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c
 +        )
 +        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
 +            backlogMs = input.predictedBacklogMs,
-+            maxCaptureAvailableLatencyMs = input.maxCaptureAvailableLatencyMs,
++            shutterElapsedMs = input.shutterElapsedMs,
 +            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
 +        )
 +        return CaptureAvailableDelayPolicyDecision(

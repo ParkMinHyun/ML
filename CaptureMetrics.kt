@@ -65,8 +65,8 @@ data class CaptureAvailablePacingMetrics(
     val backlogMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** Session max takePicture-to-captureAvailable elapsed the backlog deficit used; null on rows before recording. */
-    val maxCaptureAvailableLatencyMs: Long?,
+    /** onShutter-to-decision elapsed the backlog deficit charged; null on rows persisted before recording. */
+    val shutterElapsedMs: Long?,
     /** Session max measured draft sequence duration at decision time; null on rows persisted before recording. */
     val maxDraftSequenceDurationMs: Long?,
     val draftSequenceBudgetMs: Long,

@@ -50,26 +50,16 @@ internal class CaptureAvailablePacingSession {
     var maxDraftSequenceDurationMs = 0L
         private set
 
-    /**
-     * Longest takePicture-to-captureAvailable elapsed observed this session, as the APM side measures it: the part of
-     * the capture timeout window already spent before a draft can start, which the backlog clock cannot see.
-     */
-    var maxCaptureAvailableLatencyMs = 0L
-        private set
-
     val queuedDraftCount: Int get() = pendingDecisions.size
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
         get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
 
-    /** Raises the session maxima by one capture's observed timings; non-positive values mean no observation. */
-    fun observeCaptureTimings(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long) {
+    /** Raises the size-agnostic maximum by one capture's APM-observed duration; non-positive means no observation. */
+    fun observeMaxDraftSequenceDuration(draftSequenceDurationMs: Long) {
         if (draftSequenceDurationMs > 0L) {
             maxDraftSequenceDurationMs = maxOf(maxDraftSequenceDurationMs, draftSequenceDurationMs)
-        }
-        if (captureAvailableLatencyMs > 0L) {
-            maxCaptureAvailableLatencyMs = maxOf(maxCaptureAvailableLatencyMs, captureAvailableLatencyMs)
         }
     }
 

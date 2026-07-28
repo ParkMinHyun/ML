@@ -46,8 +46,7 @@ public class SavingDraftImageTaskManager {
     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
-    private final CaptureAvailablePacer captureAvailablePacer =
-            new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
+    private final CaptureAvailablePacer captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
@@ -232,7 +231,6 @@ public class SavingDraftImageTaskManager {
                 waitForSavingDraftImageTaskMapDrain = false;
                 isWatchdogDrainInCurrentSession = false;
                 hasCaptureTimeoutInCurrentSession = false;
-                captureAvailablePacer.clear();
                 admissionPolicy.clear();
             }
         }

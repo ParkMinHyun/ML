@@ -123,7 +123,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
         }
 
         final CaptureAvailablePacingDecision pacingDecision =
-                pacingDecider != null ? pacingDecider.decideDelay(maxDraftTimeMs, captureAvailableTimeMs) : null;
+                pacingDecider != null ? pacingDecider.decideDelay(maxDraftTimeMs) : null;
 
         long appliedDelayMs = 0L;
         String reason = pacingDecider != null

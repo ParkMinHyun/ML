@@ -9,9 +9,12 @@ import kotlin.math.ceil
  * and receives back the delay decision data. Deliberately a single method - reading the admitted backlog against
  * "now", computing the delay, and recording the admission for the next draft start must happen under one lock, or
  * concurrent captureAvailable callbacks would double-admit against a stale backlog.
+ *
+ * The observed draft duration is the one timing only the APM side knows; everything else the decision needs is
+ * pipeline-owned state the pacer already holds.
  */
 fun interface CaptureAvailablePacingDecider {
-    fun decideDelay(draftSequenceDurationMs: Long, captureAvailableLatencyMs: Long): CaptureAvailablePacingDecision?
+    fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision?
 }
 
 /**
@@ -33,6 +36,13 @@ class CaptureAvailablePacer(
      * holds this one reference, and a pacer between sessions must stay reachable to answer "no delay".
      */
     private var session: CaptureAvailablePacingSession? = null
+
+    /**
+     * Timeout deadline of the newest capture the pipeline has taken in, deliberately outside [session]: a deadline
+     * belongs to a capture, not to a burst, and the newest one stays the right answer across a drain. Absent until the
+     * first capture whose onShutter stamped one (delayed-shutter IPP captures never do).
+     */
+    private var latestCaptureDeadlineUptimeMs: Long? = null
 
     /**
      * Refreshes the pacing prediction and consumes the oldest admitted callback. A null key means a draft with no
@@ -73,20 +83,22 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * Records the APM timings observed for this capture (non-positive values mean no observation), then returns the
-     * larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is
-     * queued as the admission record consumed by the next draft start.
+     * Records the APM-observed draft duration (non-positive means no observation), then returns the larger of the
+     * current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is queued as the
+     * admission record consumed by the next draft start.
+     *
+     * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
+     * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
+     * the decision sits past it.
      */
     @Synchronized
-    override fun decideDelay(
-        draftSequenceDurationMs: Long,
-        captureAvailableLatencyMs: Long,
-    ): CaptureAvailablePacingDecision? {
+    override fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision? {
         val session = activeSession()
-        session.observeCaptureTimings(draftSequenceDurationMs, captureAvailableLatencyMs)
+        session.observeMaxDraftSequenceDuration(draftSequenceDurationMs)
 
         val prediction = session.pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
+        val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)
         val backlogMs = session.backlogMsAt(nowUptimeMs)
         val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
         val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
@@ -95,7 +107,7 @@ class CaptureAvailablePacer(
         )
         val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
             backlogMs = backlogMs,
-            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
+            shutterElapsedMs = shutterElapsedMs,
             draftSequencePacingDurationMs = draftSequencePacingDurationMs,
         )
 
@@ -106,13 +118,24 @@ class CaptureAvailablePacer(
             backlogDeficitMs = backlogDeficitMs,
             queuedDraftCount = session.queuedDraftCount,
             queuedPredictedWorkMs = session.queuedPredictedWorkMs,
-            maxCaptureAvailableLatencyMs = session.maxCaptureAvailableLatencyMs,
+            shutterElapsedMs = shutterElapsedMs,
             maxDraftSequenceDurationMs = session.maxDraftSequenceDurationMs,
             decisionUptimeMs = nowUptimeMs,
             prediction = prediction,
         )
         session.admit(decision)
         return decision
+    }
+
+    /**
+     * Takes in the deadline stamped at this capture's onShutter, called when the pipeline accepts the capture - before
+     * its draft is queued, and so before the callback that paces it is decided. The pacer cannot read this itself: the
+     * captureAvailable callback carries no capture identity, and the APM timing data for a capture is not published
+     * until it completes.
+     */
+    @Synchronized
+    fun observeCaptureDeadline(timeoutTimestampMs: Long) {
+        latestCaptureDeadlineUptimeMs = timeoutTimestampMs
     }
 
     /**
@@ -135,6 +158,17 @@ class CaptureAvailablePacer(
     }
 
     /**
+     * How much of the newest capture's timeout window is already spent at [nowUptimeMs]. Clamped to the window: a
+     * capture that never stamped a deadline charges nothing, and a stale deadline cannot charge more than the whole
+     * window, so a missing or late stamp can only cost pacing pressure, never invent a delay out of a bad timestamp.
+     */
+    private fun computeShutterElapsedMs(nowUptimeMs: Long): Long {
+        val deadlineUptimeMs = latestCaptureDeadlineUptimeMs ?: return 0L
+        return (nowUptimeMs - (deadlineUptimeMs - MakerFeature.CAPTURE_TIMEOUT_MS))
+            .coerceIn(0L, MakerFeature.CAPTURE_TIMEOUT_MS)
+    }
+
+    /**
      * The session in progress, started by the first capture that needs it. Starting it here rather than in [clear]
      * is what lets [CaptureAvailablePacingSession.createdUptimeMs] mark the burst's real beginning instead of the
      * previous burst's drain, and leaves an idle pipeline holding no session at all.
@@ -154,12 +188,18 @@ internal fun computeCaptureAvailableLevelDeficitMs(
     draftSequencePacingDurationMs: Double,
 ): Long = ceil(draftSequencePacingDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
 
+/**
+ * How far past the capture timeout the paced draft is projected to finish. The three terms are the whole window a
+ * capture spends, and they are strictly sequential, so they sum: the deadline is stamped at onShutter, so
+ * [shutterElapsedMs] is already gone when the callback is decided, then the draft waits out [backlogMs] of admitted
+ * work, then runs for [draftSequencePacingDurationMs].
+ */
 internal fun computeCaptureAvailableBacklogDeficitMs(
     backlogMs: Long,
-    maxCaptureAvailableLatencyMs: Long,
+    shutterElapsedMs: Long,
     draftSequencePacingDurationMs: Double,
 ): Long = ceil(
-    backlogMs + maxCaptureAvailableLatencyMs + draftSequencePacingDurationMs - MakerFeature.CAPTURE_TIMEOUT_MS,
+    backlogMs + shutterElapsedMs + draftSequencePacingDurationMs - MakerFeature.CAPTURE_TIMEOUT_MS,
 ).toLong().coerceAtLeast(0L)
 
 /** Latest runtime prediction for captureAvailable pacing. */
@@ -185,8 +225,8 @@ data class CaptureAvailablePacingDecision(
     val backlogDeficitMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** Session max takePicture-to-captureAvailable elapsed consumed by the backlog deficit at decision time. */
-    val maxCaptureAvailableLatencyMs: Long,
+    /** This capture's onShutter-to-decision elapsed - the timeout window already spent when it was paced. */
+    val shutterElapsedMs: Long,
     /** Session max measured draft sequence duration at decision time, before re-projection onto the demoted shape. */
     val maxDraftSequenceDurationMs: Long,
     val decisionUptimeMs: Long,
