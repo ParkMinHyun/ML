@@ -44,6 +44,67 @@ class CaptureMetricsExcelExporter(
         val sizeScopedObservedMaxDraftMs: Long?,
     )
 
+    /**
+     * One measured queue snapshot reconstructed from completed Draft start/end timestamps. Backlog is the remaining
+     * wall time until every earlier Draft has completed; queue depth counts earlier Drafts that have not started yet.
+     * Outstanding depth additionally includes a Draft already running at the snapshot.
+     */
+    private class Rq3QueueState(
+        val traceComplete: Boolean,
+        val realBacklogMs: Long?,
+        val realQueueDepth: Int?,
+        val realOutstandingDraftCount: Int?,
+    )
+
+    /** Per-shot RQ3 row. The delay recorded on shot i gates the transition to shot i+1. */
+    private class Rq3CaptureRow(
+        val deviceModel: String,
+        val capture: CaptureRow,
+        val runId: Int,
+        val runShotIndex: Int,
+        val runShotCount: Int,
+        val startingOverheatLevel: Int?,
+        val sizeBucket: String?,
+        val isLowMemory: Boolean?,
+        val pacingDecisionRecorded: Boolean,
+        val delayAppliesBeforeShotIndex: Int?,
+        val appliedDelayMs: Long,
+        val transitionDelayMs: Long?,
+        val pacedTransition: Boolean?,
+        val cumulativeTransitionDelayMs: Long,
+        val releaseUptimeMs: Long?,
+        val beforeDelayState: Rq3QueueState,
+        val atReleaseState: Rq3QueueState,
+    )
+
+    /** One row per ppSequenceId-reset-delimited experiment run for direct RQ3 table aggregation. */
+    private class Rq3RunSummary(
+        val deviceModel: String,
+        val runId: Int,
+        val shotCount: Int,
+        val startingOverheatLevel: Int?,
+        val sizeBucket: String?,
+        val isLowMemory: Boolean?,
+        val transitionCount: Int,
+        val recordedPacingDecisionCount: Int,
+        val pacingDecisionCoveragePercent: Double?,
+        val pacedTransitionCount: Int,
+        val pacedPercent: Double?,
+        val totalDelayMs: Long,
+        val positiveDelayP50Ms: Double?,
+        val positiveDelayP95Ms: Double?,
+        val realTraceCoveragePercent: Double?,
+        val maxRealBacklogMs: Long?,
+        val maxRealBacklogAtReleaseMs: Long?,
+        val maxRealQueueDepth: Int?,
+        val maxRealQueueDepthAtRelease: Int?,
+    )
+
+    private class Rq3Export(
+        val captures: List<Rq3CaptureRow>,
+        val summaries: List<Rq3RunSummary>,
+    )
+
     /** First classified node's size bucket (MP12/MP24/...) - the draft's working resolution. */
     private fun draftSizeBucketOf(cap: CaptureRow): String? =
         cap.nodeRows.firstOrNull()?.node?.workloadKey
@@ -87,6 +148,209 @@ class CaptureMetricsExcelExporter(
         return WallBaseDiagnostics(inFlight, freshestWallMs, sizeScopedMaxMs)
     }
 
+    /**
+     * Reconstructs the real queue state at [snapshotUptimeMs] from earlier captures in the same experiment run.
+     * Returning null-valued diagnostics on an incomplete prior Draft timeline prevents a censored trace from being
+     * mistaken for zero backlog.
+     */
+    private fun computeRq3QueueState(
+        earlierCaptures: List<CaptureRow>,
+        snapshotUptimeMs: Long?,
+    ): Rq3QueueState {
+        if (snapshotUptimeMs == null) {
+            return Rq3QueueState(false, null, null, null)
+        }
+
+        val earlierDrafts = earlierCaptures.filter { capture -> capture.metrics.draftSequenceMetrics != null }
+        val traceComplete = earlierDrafts.all { capture ->
+            capture.draftStartUptimeMs != null && capture.draftEndUptimeMs != null
+        }
+        if (!traceComplete) {
+            return Rq3QueueState(false, null, null, null)
+        }
+
+        val outstandingDrafts = earlierDrafts.filter { capture ->
+            capture.draftEndUptimeMs?.let { endMs -> endMs > snapshotUptimeMs } == true
+        }
+        val drainEndUptimeMs = outstandingDrafts.mapNotNull { capture -> capture.draftEndUptimeMs }.maxOrNull()
+        val realBacklogMs = drainEndUptimeMs?.minus(snapshotUptimeMs)?.coerceAtLeast(0L) ?: 0L
+        val realQueueDepth = outstandingDrafts.count { capture ->
+            capture.draftStartUptimeMs?.let { startMs -> startMs > snapshotUptimeMs } == true
+        }
+        return Rq3QueueState(
+            traceComplete = true,
+            realBacklogMs = realBacklogMs,
+            realQueueDepth = realQueueDepth,
+            realOutstandingDraftCount = outstandingDrafts.size,
+        )
+    }
+
+    /**
+     * Builds the RQ3 rows without reusing pacer-session grouping: a successful pacer may drain the pipeline during
+     * one 30-shot trial, while an experiment run remains continuous until ppSequenceId resets.
+     */
+    private fun buildRq3Export(captures: List<CaptureRow>): Rq3Export {
+        val captureRows = mutableListOf<Rq3CaptureRow>()
+        val summaries = mutableListOf<Rq3RunSummary>()
+
+        groupRq3ExperimentRuns(captures).forEachIndexed { runIndex, run ->
+            val runId = runIndex + 1
+            val startingNode = run.asSequence()
+                .mapNotNull { capture -> capture.nodeRows.firstOrNull()?.node }
+                .firstOrNull()
+            val startingOverheatLevel = startingNode?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
+            val sizeBucket = run.asSequence().mapNotNull(::draftSizeBucketOf).firstOrNull()
+            val isLowMemory = startingNode?.preExecutionMetrics?.memorySnapshot?.isLowMemory
+            var cumulativeTransitionDelayMs = 0L
+            val runRows = mutableListOf<Rq3CaptureRow>()
+
+            run.forEachIndexed { shotOffset, capture ->
+                val shotIndex = shotOffset + 1
+                val pacing = capture.metrics.draftSequenceMetrics?.captureAvailablePacing
+                val appliedDelayMs = pacing?.appliedDelayMs ?: 0L
+                val delayAppliesBeforeShotIndex = (shotIndex + 1).takeIf { nextShot -> nextShot <= run.size }
+                val transitionDelayMs = appliedDelayMs.takeIf { delayAppliesBeforeShotIndex != null }
+                if (transitionDelayMs != null) {
+                    cumulativeTransitionDelayMs += transitionDelayMs
+                }
+
+                val decisionUptimeMs = pacing?.decisionUptimeMs
+                val releaseUptimeMs = decisionUptimeMs?.plus(appliedDelayMs)
+                val earlierCaptures = run.take(shotOffset)
+                val firstShotWithoutDecision = shotOffset == 0 && decisionUptimeMs == null
+                val beforeDelayState = if (firstShotWithoutDecision) {
+                    Rq3QueueState(true, 0L, 0, 0)
+                } else {
+                    computeRq3QueueState(earlierCaptures, decisionUptimeMs)
+                }
+                val atReleaseState = if (firstShotWithoutDecision) {
+                    Rq3QueueState(true, 0L, 0, 0)
+                } else {
+                    computeRq3QueueState(earlierCaptures, releaseUptimeMs)
+                }
+
+                runRows.add(
+                    Rq3CaptureRow(
+                        deviceModel = Build.MODEL,
+                        capture = capture,
+                        runId = runId,
+                        runShotIndex = shotIndex,
+                        runShotCount = run.size,
+                        startingOverheatLevel = startingOverheatLevel,
+                        sizeBucket = sizeBucket,
+                        isLowMemory = isLowMemory,
+                        pacingDecisionRecorded = pacing != null,
+                        delayAppliesBeforeShotIndex = delayAppliesBeforeShotIndex,
+                        appliedDelayMs = appliedDelayMs,
+                        transitionDelayMs = transitionDelayMs,
+                        pacedTransition = transitionDelayMs?.let { delayMs -> delayMs > 0L },
+                        cumulativeTransitionDelayMs = cumulativeTransitionDelayMs,
+                        releaseUptimeMs = releaseUptimeMs,
+                        beforeDelayState = beforeDelayState,
+                        atReleaseState = atReleaseState,
+                    )
+                )
+            }
+
+            val transitionRows = runRows.filter { row -> row.transitionDelayMs != null }
+            val positiveDelays = transitionRows.mapNotNull { row ->
+                row.transitionDelayMs?.takeIf { delayMs -> delayMs > 0L }
+            }
+            val pacedTransitionCount = positiveDelays.size
+            val recordedPacingDecisionCount = transitionRows.count { row -> row.pacingDecisionRecorded }
+            val realTraceRows = runRows.count { row -> row.beforeDelayState.realBacklogMs != null }
+            val beforeDelayTraceComplete = runRows.all { row -> row.beforeDelayState.traceComplete }
+            val atReleaseTraceComplete = runRows.all { row -> row.atReleaseState.traceComplete }
+            summaries.add(
+                Rq3RunSummary(
+                    deviceModel = Build.MODEL,
+                    runId = runId,
+                    shotCount = run.size,
+                    startingOverheatLevel = startingOverheatLevel,
+                    sizeBucket = sizeBucket,
+                    isLowMemory = isLowMemory,
+                    transitionCount = transitionRows.size,
+                    recordedPacingDecisionCount = recordedPacingDecisionCount,
+                    pacingDecisionCoveragePercent = percent(recordedPacingDecisionCount, transitionRows.size),
+                    pacedTransitionCount = pacedTransitionCount,
+                    pacedPercent = percent(pacedTransitionCount, transitionRows.size),
+                    totalDelayMs = transitionRows.sumOf { row -> row.transitionDelayMs ?: 0L },
+                    positiveDelayP50Ms = inclusivePercentile(positiveDelays, 0.50),
+                    positiveDelayP95Ms = inclusivePercentile(positiveDelays, 0.95),
+                    realTraceCoveragePercent = percent(realTraceRows, runRows.size),
+                    maxRealBacklogMs = if (beforeDelayTraceComplete) {
+                        runRows.mapNotNull { row -> row.beforeDelayState.realBacklogMs }.maxOrNull()
+                    } else {
+                        null
+                    },
+                    maxRealBacklogAtReleaseMs = if (atReleaseTraceComplete) {
+                        runRows.mapNotNull { row -> row.atReleaseState.realBacklogMs }.maxOrNull()
+                    } else {
+                        null
+                    },
+                    maxRealQueueDepth = if (beforeDelayTraceComplete) {
+                        runRows.mapNotNull { row -> row.beforeDelayState.realQueueDepth }.maxOrNull()
+                    } else {
+                        null
+                    },
+                    maxRealQueueDepthAtRelease = if (atReleaseTraceComplete) {
+                        runRows.mapNotNull { row -> row.atReleaseState.realQueueDepth }.maxOrNull()
+                    } else {
+                        null
+                    },
+                )
+            )
+            captureRows.addAll(runRows)
+        }
+
+        return Rq3Export(captureRows, summaries)
+    }
+
+    private fun groupRq3ExperimentRuns(captures: List<CaptureRow>): List<List<CaptureRow>> {
+        val runs = mutableListOf<List<CaptureRow>>()
+        var currentRun = mutableListOf<CaptureRow>()
+        var previousPpSequenceId: Int? = null
+
+        for (capture in captures) {
+            val previousId = previousPpSequenceId
+            if (currentRun.isNotEmpty() && previousId != null && capture.metrics.ppSequenceId <= previousId) {
+                runs.add(currentRun)
+                currentRun = mutableListOf()
+            }
+            currentRun.add(capture)
+            previousPpSequenceId = capture.metrics.ppSequenceId
+        }
+        if (currentRun.isNotEmpty()) {
+            runs.add(currentRun)
+        }
+        return runs
+    }
+
+    private fun percent(numerator: Int, denominator: Int): Double? {
+        if (denominator <= 0) {
+            return null
+        }
+        return 100.0 * numerator.toDouble() / denominator.toDouble()
+    }
+
+    /** Excel PERCENTILE.INC-compatible interpolation over positive applied delays. */
+    private fun inclusivePercentile(values: List<Long>, quantile: Double): Double? {
+        if (values.isEmpty()) {
+            return null
+        }
+
+        val sorted = values.sorted()
+        val rank = (sorted.size - 1) * quantile.coerceIn(0.0, 1.0)
+        val lowerIndex = floor(rank).toInt()
+        val upperIndex = ceil(rank).toInt()
+        if (lowerIndex == upperIndex) {
+            return sorted[lowerIndex].toDouble()
+        }
+
+        val fraction = rank - lowerIndex
+        return sorted[lowerIndex] + (sorted[upperIndex] - sorted[lowerIndex]) * fraction
+    }
+
     suspend fun export(): File {
         val outputDir = context.getExternalFilesDir(DIR_NAME)
             ?: throw IllegalStateException("External files dir is unavailable")
@@ -126,9 +390,12 @@ class CaptureMetricsExcelExporter(
             val replayCaptures = enrichedNormalCaptures.sortedBy { enriched -> enriched.row.captureIndex }
             val admissionReplayRows = nodeSheetRows(replayCaptures)
                 .filter { row -> row.nodeRow.isAdmissionWorkload && row.nodeRow.prediction != null }
+            val rq3Export = buildRq3Export(rawCaptures)
 
             writeSheet(workbook, styles, "AdmissionReplay", admissionReplayRows, buildAdmissionReplayColumns())
             writeSheet(workbook, styles, "PacingReplay", replayCaptures, buildPacingReplayColumns())
+            writeSheet(workbook, styles, "RQ3Pacing", rq3Export.captures, buildRq3PacingColumns())
+            writeSheet(workbook, styles, "RQ3Summary", rq3Export.summaries, buildRq3SummaryColumns())
             writeSheet(workbook, styles, "ReplayNotes", buildReplayNotes(), buildReplayNoteColumns())
 
             // Write main sheet
@@ -834,6 +1101,7 @@ class CaptureMetricsExcelExporter(
         private const val DIR_NAME = "metrics"
         private val FILE_NAME = "${Build.MODEL}_metrics.xlsx"
         private const val MAX_SHEET_NAME_LENGTH = 31
+        private const val RQ3_TARGET_SHOT_COUNT = 30
         private const val ADMIT_BOKEH_PREFIX = "BOKEH("
         private const val ADMIT_DECODING_PREFIX = "DECODING("
         private const val ADMIT_FILTER_PREFIX = "FILTER("
@@ -993,6 +1261,99 @@ class CaptureMetricsExcelExporter(
             Column("beforeNonvoluntaryCtxSwitches") { it.nodeRow.node.postExecutionMetrics.cpuProcessingSnapshot?.nonvoluntaryCtxSwitches },
             Column("beforeBlockingGcCount") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcCount },
             Column("beforeBlockingGcTimeMs") { it.nodeRow.node.postExecutionMetrics.gcSnapshot?.blockingGcTimeMs },
+        )
+
+        private fun buildRq3PacingColumns(): List<Column<Rq3CaptureRow>> = listOf(
+            Column("deviceModel") { it.deviceModel },
+            Column("runId") { it.runId },
+            Column("runShotIndex") { it.runShotIndex },
+            Column("runShotCount") { it.runShotCount },
+            Column("captureIndex") { it.capture.captureIndex },
+            Column("ppSequenceId") { it.capture.metrics.ppSequenceId },
+            Column("shotToShotTimeMs") { it.capture.metrics.shotToShotTimeMs },
+            Column("startingOverheatLevel") { it.startingOverheatLevel },
+            Column("sizeBucket") { it.sizeBucket },
+            Column("isLowMemory") { it.isLowMemory },
+            Column("captureTimedOut") { it.capture.hasTimeoutFailure },
+            Column("captureWatchdogFailed") { it.capture.hasWatchdogFailure },
+            Column("") { "" },
+            // Delay on shot i gates the transition to shot i+1; the final shot therefore has no transition delay.
+            Column("pacingDecisionRecorded") { it.pacingDecisionRecorded },
+            Column("delayAppliesBeforeShotIndex") { it.delayAppliesBeforeShotIndex },
+            Column("appliedDelayMs") { it.appliedDelayMs },
+            Column("transitionDelayMs") { it.transitionDelayMs },
+            Column("pacedTransition") { it.pacedTransition },
+            Column("cumulativeTransitionDelayMs") { it.cumulativeTransitionDelayMs },
+            Column("") { "" },
+            Column("decisionUptimeMs") {
+                it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.decisionUptimeMs
+            },
+            Column("releaseUptimeMs") { it.releaseUptimeMs },
+            Column("controllerBacklogMs") {
+                it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.backlogMs
+            },
+            Column("realTraceCompleteBeforeDelay") { it.beforeDelayState.traceComplete },
+            Column("realBacklogMs") { it.beforeDelayState.realBacklogMs },
+            Column("realQueueDepth") { it.beforeDelayState.realQueueDepth },
+            Column("realOutstandingDraftCount") { it.beforeDelayState.realOutstandingDraftCount },
+            Column("backlogEstimateErrorMs") {
+                val controllerBacklogMs =
+                    it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.backlogMs
+                val realBacklogMs = it.beforeDelayState.realBacklogMs
+                if (controllerBacklogMs != null && realBacklogMs != null) {
+                    controllerBacklogMs - realBacklogMs
+                } else {
+                    null
+                }
+            },
+            Column("") { "" },
+            Column("realTraceCompleteAtRelease") { it.atReleaseState.traceComplete },
+            Column("realBacklogAtReleaseMs") { it.atReleaseState.realBacklogMs },
+            Column("realQueueDepthAtRelease") { it.atReleaseState.realQueueDepth },
+            Column("realOutstandingDraftCountAtRelease") {
+                it.atReleaseState.realOutstandingDraftCount
+            },
+            Column("") { "" },
+            Column("controllerQueuedDraftCount") {
+                it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.queuedDraftCount
+            },
+            Column("draftStartUptimeMs") { it.capture.draftStartUptimeMs },
+            Column("draftEndUptimeMs") { it.capture.draftEndUptimeMs },
+            Column("draftWallMs") { it.capture.draftWallMs },
+            Column("shotOverheatLevel") {
+                it.capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
+            },
+            Column("shotThermalStatus") {
+                it.capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalStatus
+            },
+            Column("shotThermalHeadroom") {
+                it.capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.thermalHeadroom
+            },
+        )
+
+        private fun buildRq3SummaryColumns(): List<Column<Rq3RunSummary>> = listOf(
+            Column("deviceModel") { it.deviceModel },
+            Column("runId") { it.runId },
+            Column("shotCount") { it.shotCount },
+            Column("isComplete30ShotRun") { it.shotCount == RQ3_TARGET_SHOT_COUNT },
+            Column("startingOverheatLevel") { it.startingOverheatLevel },
+            Column("sizeBucket") { it.sizeBucket },
+            Column("isLowMemory") { it.isLowMemory },
+            Column("") { "" },
+            Column("transitionCount") { it.transitionCount },
+            Column("recordedPacingDecisionCount") { it.recordedPacingDecisionCount },
+            Column("pacingDecisionCoveragePercent") { it.pacingDecisionCoveragePercent },
+            Column("pacedTransitionCount") { it.pacedTransitionCount },
+            Column("pacedPercent") { it.pacedPercent },
+            Column("totalDelayMs") { it.totalDelayMs },
+            Column("positiveDelayP50Ms") { it.positiveDelayP50Ms },
+            Column("positiveDelayP95Ms") { it.positiveDelayP95Ms },
+            Column("") { "" },
+            Column("realTraceCoveragePercent") { it.realTraceCoveragePercent },
+            Column("maxRealBacklogMs") { it.maxRealBacklogMs },
+            Column("maxRealQueueDepth") { it.maxRealQueueDepth },
+            Column("maxRealBacklogAtReleaseMs") { it.maxRealBacklogAtReleaseMs },
+            Column("maxRealQueueDepthAtRelease") { it.maxRealQueueDepthAtRelease },
         )
 
         private fun buildPacingReplayColumns(): List<Column<EnrichedCaptureRow>> = listOf(
@@ -1204,6 +1565,35 @@ class CaptureMetricsExcelExporter(
                 topic = "Counterfactual outcomes",
                 note = "a changed decision whose workload was not observed online requires offline replay or shadow " +
                     "execution. afterOutcomeStatus and afterObservationStatus identify those rows.",
+            ),
+            ReplayNote(
+                topic = "RQ3 run boundary",
+                note = "RQ3Pacing starts a new experiment run whenever ppSequenceId is less than or equal to the " +
+                    "preceding value. This keeps a 30-shot trial intact even when the runtime pacer session changes " +
+                    "because the Draft queue drains.",
+            ),
+            ReplayNote(
+                topic = "RQ3 delay mapping",
+                note = "the delay recorded on shot i gates the transition to shot i+1. transitionDelayMs is therefore " +
+                    "blank on the final shot, and RQ3Summary excludes that final appliedDelayMs from pacedPercent, " +
+                    "totalDelayMs, and positive-delay percentiles.",
+            ),
+            ReplayNote(
+                topic = "RQ3 real backlog",
+                note = "realBacklogMs is max(draftEndUptimeMs) over unfinished earlier Drafts minus the pacing " +
+                    "decision time. realBacklogAtReleaseMs repeats the reconstruction at decision time plus applied " +
+                    "delay. Either value is blank when an earlier Draft timeline is incomplete.",
+            ),
+            ReplayNote(
+                topic = "RQ3 queue depth",
+                note = "realQueueDepth counts unfinished earlier Drafts whose draftStartUptimeMs is after the snapshot; " +
+                    "realOutstandingDraftCount additionally includes a Draft already running. The AtRelease columns " +
+                    "apply the same definitions after the pacing delay.",
+            ),
+            ReplayNote(
+                topic = "RQ3 summary",
+                note = "RQ3Summary reports P50 and P95 over positive transition delays using Excel PERCENTILE.INC " +
+                    "interpolation. deviceModel is the runtime Build.MODEL value.",
             ),
             ReplayNote(
                 topic = "Wall-base pacing",
