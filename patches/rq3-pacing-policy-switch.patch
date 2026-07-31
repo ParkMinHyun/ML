@@ -1,8 +1,208 @@
+Replace the captureAvailable delay arithmetic with a swappable pacing policy, and
+add the three comparison arms for RQ3.
+
+Base commit: c871d3a
+
+  NO_PACING    NoPacingDelayPolicy            - zero delay, same admission path
+  OURS         DeadlineDeficitDelayPolicy     - the deployed budget/backlog deficit
+  THERMAL_LUT  ThermalHeadroomLutDelayPolicy  - open-loop on ADPF thermal headroom
+  CODEL        ControlledDelayPacingPolicy    - RFC 8289 on measured queue wait
+
+Switch arms by changing CaptureAvailableDelayPolicyFactory.ACTIVE_POLICY, and
+clear the metrics database between arms.
+
+Device build:
+  CaptureAvailableDelayPolicy.kt          new  interface + NO_PACING + OURS
+  ThermalHeadroomLutDelayPolicy.kt        new  baseline 1
+  ControlledDelayPacingPolicy.kt          new  baseline 2
+  CaptureAvailableDelayPolicyFactory.kt   new  the one-constant switch
+  CaptureAvailablePacer.kt                     delegates the delay, feeds policy hooks
+  CaptureAvailablePacingSession.kt             takes the draft-start uptime from the pacer
+  DeviceStateReader.kt                         publishes the last valid thermal headroom
+  CaptureMetricsExcelExporter.kt               pacingPolicy column on the RQ3 sheets
+  external/.../CaptureAvailableApmPolicy.java  log wording
+  external/.../SavingDraftImageTaskManager.java  builds the pacer from the factory
+
+Analysis only, not part of the device build - drop these hunks when porting:
+  data/lut_calibration.py                 new  cost-matched Thermal LUT calibration
+  data/rq3_aggregate.py                        four arms; skips uncollected ones
+
+OURS is unchanged arithmetic: it calls the same computeCaptureAvailable*DeficitMs
+functions on the same inputs, and every policy still reports the pacer's own
+backlog clock so that column stays comparable across arms.
+
+diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
+new file mode 100644
+index 0000000..987f027
+--- /dev/null
++++ b/CaptureAvailableDelayPolicy.kt
+@@ -0,0 +1,105 @@
++package com.samsung.android.camera.core2.ml
++
++/**
++ * The delay arithmetic [CaptureAvailablePacer] runs at each captureAvailable callback, made swappable so a pacing
++ * policy can be exchanged without exchanging anything else.
++ *
++ * Everything that is not the delay decision stays with the pacer: admission pairing, workload prediction, session
++ * boundaries, the backlog clock it reports, and the persisted decision record. A policy therefore cannot give itself
++ * a different admission path, a different callback, or a different metrics definition than the policy it is compared
++ * against - it sees one immutable snapshot per callback and answers with a delay.
++ *
++ * Not synchronized: [CaptureAvailablePacer] calls every method under its own lock.
++ */
++interface CaptureAvailableDelayPolicy {
++
++    fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision
++
++    /**
++     * A draft entered the single-worker pipeline, consuming [gatingDecision] - the admission this draft start was
++     * paired with, absent when nothing gated it. [queuedDraftCount] is the depth left behind it.
++     */
++    fun onDraftStarted(
++        startUptimeMs: Long,
++        gatingDecision: CaptureAvailablePacingDecision?,
++        queuedDraftCount: Int,
++    ) = Unit
++
++    /** A draft left the single-worker pipeline with a measured wall time. */
++    fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) = Unit
++
++    /** The burst session ended. Pipeline-lifetime calibration may deliberately survive this. */
++    fun clearSession() = Unit
++}
++
++/**
++ * Runtime facts available at one captureAvailable decision.
++ *
++ * [backlogMs] is the pacer's own admitted-work clock. It is passed to every policy and reported on every decision so
++ * that it stays one comparable observation across policies, but only a policy that chooses to price against it reads
++ * it - a queue-observation policy is free to maintain its own estimate instead.
++ */
++data class CaptureAvailableDelayPolicyInput(
++    val decisionUptimeMs: Long,
++    val draftSequenceBudgetMs: Long,
++    val draftSequencePacingDurationMs: Double,
++    val backlogMs: Long,
++    val queuedDraftCount: Int,
++    val shutterElapsedMs: Long,
++)
++
++/**
++ * One policy's answer. [delayMs] is what the callback actually waits.
++ *
++ * The two deficit fields exist because the persisted metrics and the APM log already carry them; a policy that does
++ * not decompose its delay that way reports the components it does have and leaves the rest at zero. They are
++ * diagnostics, never re-combined into the applied delay.
++ */
++data class CaptureAvailableDelayPolicyDecision @JvmOverloads constructor(
++    val delayMs: Long,
++    val levelDeficitMs: Long = 0L,
++    val backlogDeficitMs: Long = 0L,
++) {
++    init {
++        require(delayMs >= 0L) { "delayMs must be non-negative but was $delayMs" }
++        require(levelDeficitMs >= 0L) { "levelDeficitMs must be non-negative but was $levelDeficitMs" }
++        require(backlogDeficitMs >= 0L) { "backlogDeficitMs must be non-negative but was $backlogDeficitMs" }
++    }
++}
++
++/**
++ * Never delays. The parallel-capture pipeline runs exactly as it does with no pacer at all, but through the same
++ * admission path, the same predictor, and the same metrics writer as every other policy - so an unpaced arm is a
++ * one-constant change rather than a separately built binary whose differences have to be argued away.
++ */
++object NoPacingDelayPolicy : CaptureAvailableDelayPolicy {
++    override fun decide(input: CaptureAvailableDelayPolicyInput) = CaptureAvailableDelayPolicyDecision(delayMs = 0L)
++}
++
++/**
++ * The deployed policy: the larger of this capture's draft-budget deficit and the admitted-backlog deficit against
++ * the Capture Timeout. It is deadline-aware (it charges the window this capture has already spent) and
++ * workload-aware (it prices the draft sequence it is about to admit), which is exactly what the two baselines drop.
++ *
++ * The arithmetic itself stays in [computeCaptureAvailableLevelDeficitMs] and
++ * [computeCaptureAvailableBacklogDeficitMs] so offline replay keeps calling the same functions the device ran.
++ */
++object DeadlineDeficitDelayPolicy : CaptureAvailableDelayPolicy {
++
++    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
++        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
++            draftSequenceBudgetMs = input.draftSequenceBudgetMs,
++            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++        )
++        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
++            backlogMs = input.backlogMs,
++            shutterElapsedMs = input.shutterElapsedMs,
++            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++        )
++        return CaptureAvailableDelayPolicyDecision(
++            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
++            levelDeficitMs = levelDeficitMs,
++            backlogDeficitMs = backlogDeficitMs,
++        )
++    }
++}
+diff --git a/CaptureAvailableDelayPolicyFactory.kt b/CaptureAvailableDelayPolicyFactory.kt
+new file mode 100644
+index 0000000..1d98bb4
+--- /dev/null
++++ b/CaptureAvailableDelayPolicyFactory.kt
+@@ -0,0 +1,50 @@
++package com.samsung.android.camera.core2.ml
++
++/**
++ * The pacing-policy switch. Changing [ACTIVE_POLICY] is the whole experiment protocol: every arm then runs the same
++ * admission path, the same predictor, the same captureAvailable callback, and the same metrics writer, differing
++ * only in the delay arithmetic.
++ *
++ * The selected policy is logged when the draft pipeline is built and exported on every RQ3 row, so a collected
++ * workbook says which arm produced it rather than relying on the file name. Clear the metrics database between arms.
++ */
++object CaptureAvailableDelayPolicyFactory {
++
++    /** Change this one value to switch arms. Keep it at [PolicyType.OURS] for production-reference builds. */
++    private val ACTIVE_POLICY = PolicyType.OURS
++
++    @JvmStatic
++    fun create(deviceStateReader: DeviceStateReader): CaptureAvailableDelayPolicy = when (ACTIVE_POLICY) {
++        PolicyType.NO_PACING -> NoPacingDelayPolicy
++        PolicyType.OURS -> DeadlineDeficitDelayPolicy
++        PolicyType.THERMAL_LUT -> ThermalHeadroomLutDelayPolicy(
++            thermalHeadroomSupplier = { deviceStateReader.latestThermalHeadroom.toDouble() },
++        )
++        PolicyType.CODEL -> ControlledDelayPacingPolicy()
++    }
++
++    @JvmStatic
++    fun activePolicyName(): String = ACTIVE_POLICY.name
++
++    /**
++     * The arms, ordered from no control to full control.
++     *
++     * [THERMAL_LUT] and [CODEL] are the two baselines: one open-loop on the thermal signal alone, one closed-loop on
++     * the measured queue wait alone. Between them they cover the two things [OURS] adds - deadline awareness and a
++     * model of the draft work being admitted - so a result that separates OURS from both says which of those the
++     * separation came from.
++     */
++    enum class PolicyType {
++        /** No delay ever; the unpaced parallel-capture pipeline. */
++        NO_PACING,
++
++        /** [DeadlineDeficitDelayPolicy] - the deployed budget/backlog deficit policy. */
++        OURS,
++
++        /** [ThermalHeadroomLutDelayPolicy] - open-loop on thermal headroom; queue- and deadline-blind. */
++        THERMAL_LUT,
++
++        /** [ControlledDelayPacingPolicy] - CoDel on measured queue wait; workload- and deadline-blind. */
++        CODEL,
++    }
++}
 diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd76fcfed5 100644
+index 313e684..890a42a 100644
 --- a/CaptureAvailablePacer.kt
 +++ b/CaptureAvailablePacer.kt
-@@ -21,9 +21,10 @@ fun interface CaptureAvailablePacingDecider {
+@@ -24,9 +24,10 @@ fun interface CaptureAvailablePacingDecider {
   * Asks the [DraftSequenceAdmissionPolicy] which sequence key a planned one becomes in this session's plan.
   * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
   */
@@ -10,64 +210,62 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +class CaptureAvailablePacer @JvmOverloads constructor(
      private val predictor: DraftSequenceExecutionPredictor,
      private val admissionPolicy: DraftSequenceAdmissionPolicy,
-+    private val delayPolicy: CaptureAvailableDelayPolicy = ContextAwareCaptureAvailableDelayPolicy,
++    private val delayPolicy: CaptureAvailableDelayPolicy = DeadlineDeficitDelayPolicy,
  ) : CaptureAvailablePacingDecider {
  
      /**
-@@ -47,7 +48,10 @@ class CaptureAvailablePacer(
+@@ -53,7 +54,9 @@ class CaptureAvailablePacer(
      fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
          val session = activeSession()
          if (plannedSequenceKey == null) {
 -            return session.startDraftSequence(null)
 +            val startUptimeMs = SystemClock.uptimeMillis()
-+            val gatingDecision = session.startDraftSequence(null, startUptimeMs)
-+            delayPolicy.onDraftStarted(null, startUptimeMs)
-+            return gatingDecision
++            return session.startDraftSequence(null, startUptimeMs)
++                .also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
          }
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
          val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
-@@ -63,7 +67,8 @@ class CaptureAvailablePacer(
+@@ -71,6 +74,10 @@ class CaptureAvailablePacer(
              predictor.estimateDraftSequenceWallMs(draftSequenceKey),
          )
  
--        return session.startDraftSequence(
++        // Read after the prediction work, where the session used to read it: one "now" now serves both the clock
++        // rebase and the delay policy's queue-wait measurement, so a policy cannot measure a wait the clock never
++        // charged, and the clock base is unchanged from before the policy seam existed.
 +        val startUptimeMs = SystemClock.uptimeMillis()
-+        val gatingDecision = session.startDraftSequence(
+         return session.startDraftSequence(
              CaptureAvailablePacingPrediction(
                  draftSequenceBudgetMs = budgetMs,
-                 draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
-@@ -71,17 +76,16 @@ class CaptureAvailablePacer(
+@@ -79,17 +86,17 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
+-        )
 +            startUptimeMs,
-         )
-+        delayPolicy.onDraftStarted(currentSizeBucket, startUptimeMs)
-+        return gatingDecision
++        ).also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
      }
  
      /**
 -     * Records the APM-observed draft duration (non-positive means no observation), then returns the larger of the
 -     * current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is queued as the
 -     * admission record consumed by the next draft start.
--     *
++     * Records the APM-observed draft duration (non-positive means no observation), asks the [delayPolicy] what this
++     * callback waits, and queues the resulting decision as the admission record the next draft start consumes.
+      *
 -     * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
 -     * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
 -     * the decision sits past it.
-+     * Records the APM-observed draft duration (non-positive means no observation), delegates delay arithmetic to the
-+     * selected policy, and queues the resulting admission record for the next draft start. The spent part of this
-+     * capture's timeout window is still derived here; how it is charged is now the policy's business.
++     * The pacer still derives and reports what this capture's timeout window has already spent - the deadline was
++     * stamped at onShutter, so the spent part is simply how far the decision sits past it - and still reports its own
++     * admitted-backlog clock, so both stay comparable across policies. Only whether they are charged is the policy's.
       */
      @Synchronized
      override fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision? {
-@@ -86,24 +93,25 @@ class CaptureAvailablePacer(
- 
-         val prediction = session.pacingPrediction ?: return null
+@@ -100,22 +107,22 @@ class CaptureAvailablePacer(
          val nowUptimeMs = SystemClock.uptimeMillis()
          val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)
--        val backlogMs = session.backlogMsAt(nowUptimeMs)
-+        val predictedBacklogMs = session.backlogMsAt(nowUptimeMs)
-         val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
+         val backlogMs = session.backlogMsAt(nowUptimeMs)
+-        val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
 -        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
 -            draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
@@ -80,41 +278,50 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 +            CaptureAvailableDelayPolicyInput(
 +                decisionUptimeMs = nowUptimeMs,
 +                draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
-+                draftSequencePacingDurationMs = draftSequencePacingDurationMs,
-+                predictedBacklogMs = predictedBacklogMs,
++                draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs,
++                backlogMs = backlogMs,
 +                queuedDraftCount = session.queuedDraftCount,
 +                shutterElapsedMs = shutterElapsedMs,
-+            )
++            ),
          )
  
          val decision = CaptureAvailablePacingDecision(
 -            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
--            backlogMs = backlogMs,
++            delayMs = policyDecision.delayMs,
+             backlogMs = backlogMs,
 -            levelDeficitMs = levelDeficitMs,
 -            backlogDeficitMs = backlogDeficitMs,
-+            delayMs = policyDecision.delayMs,
-+            backlogMs = policyDecision.backlogMs,
 +            levelDeficitMs = policyDecision.levelDeficitMs,
 +            backlogDeficitMs = policyDecision.backlogDeficitMs,
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
              shutterElapsedMs = shutterElapsedMs,
-@@ -122,5 +130,6 @@ class CaptureAvailablePacer(
+@@ -145,6 +152,7 @@ class CaptureAvailablePacer(
+     @Synchronized
      fun observeDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
          activeSession().observeDraftSequenceDuration(sizeBucket, draftWallMs)
 +        delayPolicy.onDraftMeasured(sizeBucket, draftWallMs)
      }
  
      /** Burst-session identity for metrics: a new value every time the drained pipeline clears the pacer. */
-@@ -132,6 +141,7 @@ class CaptureAvailablePacer(
+@@ -155,6 +163,16 @@ class CaptureAvailablePacer(
      @Synchronized
      fun clear() {
          session = null
 +        delayPolicy.clearSession()
++    }
++
++    /** Hands the delay policy the draft start the pacer just recorded, with the admission that gated it. */
++    private fun notifyDraftStarted(
++        session: CaptureAvailablePacingSession,
++        startUptimeMs: Long,
++        gatingDecision: CaptureAvailablePacingDecision?,
++    ) {
++        delayPolicy.onDraftStarted(startUptimeMs, gatingDecision, session.queuedDraftCount)
      }
  
      /**
-@@ -165,10 +175,9 @@ class CaptureAvailablePacer(
+@@ -178,10 +196,10 @@ class CaptureAvailablePacer(
  }
  
  /**
@@ -122,17 +329,18 @@ index de37893ef6eb8e57deadf5ee93d9c891b995fbc2..1bc2edcdbe3de15c614ee30e7a237dfd
 - * calls these exact functions to answer "what would today's pacing delay be"; a copy of this arithmetic would let the
 - * two drift and report a pacing change as no change. The delay they feed is their plain max, written out at both call
 - * sites - a wrapper around `maxOf` is not arithmetic that can drift.
-+ * Ours' two deficits, stateless so its decision can be re-derived from persisted pacing inputs alone. The default
-+ * policy and offline replay call these exact functions; a copy of this arithmetic would let the two drift and report
-+ * a pacing change as no change.
++ * [DeadlineDeficitDelayPolicy]'s two deficits, stateless so a decision can be re-derived from persisted pacing inputs
++ * alone. That policy and offline replay call these exact functions to answer "what would today's pacing delay be"; a
++ * copy of this arithmetic would let the two drift and report a pacing change as no change. The delay they feed is
++ * their plain max, written out at both call sites - a wrapper around `maxOf` is not arithmetic that can drift.
   */
  internal fun computeCaptureAvailableLevelDeficitMs(
      draftSequenceBudgetMs: Long,
 diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
-index f168fa1eac0965bb72b9e733ee01753a9e91eda5..2c0ff7a7c35013e457da45ebb399db77c9e9f90f 100644
+index a130af3..f5f3124 100644
 --- a/CaptureAvailablePacingSession.kt
 +++ b/CaptureAvailablePacingSession.kt
-@@ -116,6 +116,7 @@ internal class CaptureAvailablePacingSession {
+@@ -109,6 +109,7 @@ internal class CaptureAvailablePacingSession {
       */
      fun startDraftSequence(
          draftStartPrediction: CaptureAvailablePacingPrediction?,
@@ -140,7 +348,7 @@ index f168fa1eac0965bb72b9e733ee01753a9e91eda5..2c0ff7a7c35013e457da45ebb399db77
      ): CaptureAvailablePacingDecision? {
          if (draftStartPrediction != null) {
              pacingPrediction = draftStartPrediction
-@@ -124,7 +125,7 @@ internal class CaptureAvailablePacingSession {
+@@ -117,7 +118,7 @@ internal class CaptureAvailablePacingSession {
          val startingPredictedMs = draftStartPrediction?.draftSequencePredictedDurationMs ?: 0.0
          val draftOverheadMs = pacingPrediction?.draftSequenceOverheadDurationMs ?: 0.0
          val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
@@ -149,33 +357,8 @@ index f168fa1eac0965bb72b9e733ee01753a9e91eda5..2c0ff7a7c35013e457da45ebb399db77
          return gatingDecision
      }
  }
-diff --git a/CaptureMetrics.kt b/CaptureMetrics.kt
-index 811210842d770173b0a91458646883c0d6688e9c..38ed2e9bd4c6ff028a6ea685965f65757fad4b36 100644
---- a/CaptureMetrics.kt
-+++ b/CaptureMetrics.kt
-@@ -53,9 +53,8 @@ data class NodeExecutionMetrics(
- )
- 
- /**
-- * Runtime captureAvailable pacing decision persisted for offline replay: the applied callback delay plus every
-- * backlog-clock input that produced it, so skip/pacing counterfactuals can re-run the policy on real state
-- * instead of exporter-side proxies.
-+ * Runtime captureAvailable pacing decision persisted for offline replay: the applied callback delay, the selected
-+ * policy's deficit/backlog projection, and the shared Ours inputs needed for counterfactual replay.
-  */
- data class CaptureAvailablePacingMetrics(
-     val decisionUptimeMs: Long,
-@@ -73,7 +72,7 @@ data class CaptureAvailablePacingMetrics(
-     val draftSequencePredictedDurationMs: Double,
-     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
-     val draftSequenceOverheadDurationMs: Double,
--    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingPrediction]. */
-+    /** Draft-sequence duration Ours' two pacing deficits use; see [CaptureAvailablePacingPrediction]. */
-     val draftSequencePacingDurationMs: Double,
-     val draftSequenceKey: String,
- )
 diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
-index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c38838235acfa1dd 100644
+index c1c57ef..0547b7d 100644
 --- a/CaptureMetricsExcelExporter.kt
 +++ b/CaptureMetricsExcelExporter.kt
 @@ -59,6 +59,7 @@ class CaptureMetricsExcelExporter(
@@ -194,15 +377,16 @@ index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c3883823
          val runId: Int,
          val shotCount: Int,
          val startingOverheatLevel: Int?,
-@@ -192,6 +194,7 @@ class CaptureMetricsExcelExporter(
+@@ -192,6 +194,8 @@ class CaptureMetricsExcelExporter(
      private fun buildRq3Export(captures: List<CaptureRow>): Rq3Export {
          val captureRows = mutableListOf<Rq3CaptureRow>()
          val summaries = mutableListOf<Rq3RunSummary>()
++        // The exporting build's pacing arm, not the one the rows were collected under - see the RQ3 policy note.
 +        val pacingPolicy = CaptureAvailableDelayPolicyFactory.activePolicyName()
  
          groupRq3ExperimentRuns(captures).forEachIndexed { runIndex, run ->
              val runId = runIndex + 1
-@@ -232,6 +235,7 @@ class CaptureMetricsExcelExporter(
+@@ -232,6 +236,7 @@ class CaptureMetricsExcelExporter(
                  runRows.add(
                      Rq3CaptureRow(
                          deviceModel = Build.MODEL,
@@ -210,7 +394,7 @@ index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c3883823
                          capture = capture,
                          runId = runId,
                          runShotIndex = shotIndex,
-@@ -264,6 +268,7 @@ class CaptureMetricsExcelExporter(
+@@ -264,6 +269,7 @@ class CaptureMetricsExcelExporter(
              summaries.add(
                  Rq3RunSummary(
                      deviceModel = Build.MODEL,
@@ -218,7 +402,7 @@ index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c3883823
                      runId = runId,
                      shotCount = run.size,
                      startingOverheatLevel = startingOverheatLevel,
-@@ -1265,6 +1270,7 @@ class CaptureMetricsExcelExporter(
+@@ -1266,6 +1272,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3PacingColumns(): List<Column<Rq3CaptureRow>> = listOf(
              Column("deviceModel") { it.deviceModel },
@@ -226,7 +410,7 @@ index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c3883823
              Column("runId") { it.runId },
              Column("runShotIndex") { it.runShotIndex },
              Column("runShotCount") { it.runShotCount },
-@@ -1333,6 +1339,7 @@ class CaptureMetricsExcelExporter(
+@@ -1334,6 +1341,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3SummaryColumns(): List<Column<Rq3RunSummary>> = listOf(
              Column("deviceModel") { it.deviceModel },
@@ -234,393 +418,337 @@ index cb6ffe3fc20860a44ff0b54bf6713385e26589f9..041a66d4102853390a61b7e5c3883823
              Column("runId") { it.runId },
              Column("shotCount") { it.shotCount },
              Column("isComplete30ShotRun") { it.shotCount == RQ3_TARGET_SHOT_COUNT },
-@@ -1593,7 +1600,8 @@ class CaptureMetricsExcelExporter(
-             ReplayNote(
-                 topic = "RQ3 summary",
+@@ -1599,6 +1607,13 @@ class CaptureMetricsExcelExporter(
                  note = "RQ3Summary reports P50 and P95 over positive transition delays using Excel PERCENTILE.INC " +
--                    "interpolation. deviceModel is the runtime Build.MODEL value.",
-+                    "interpolation. deviceModel is the runtime Build.MODEL value. pacingPolicy is the active factory " +
-+                    "policy in the exporting build; clear the metrics DB between policy builds.",
+                     "interpolation. deviceModel is the runtime Build.MODEL value.",
              ),
++            ReplayNote(
++                topic = "RQ3 pacing policy",
++                note = "pacingPolicy is CaptureAvailableDelayPolicyFactory's active arm in the build that exported " +
++                    "the workbook, not a per-row record of the arm each row ran under. It is only trustworthy if " +
++                    "the metrics database is cleared between arms; a workbook holding rows from two arms will " +
++                    "label them all with the exporting build's arm.",
++            ),
              ReplayNote(
                  topic = "Wall-base pacing",
+                 note = "columns for judging a future draft-wall-time-based clock. draftOccupancyUnderpriceMs " +
+diff --git a/ControlledDelayPacingPolicy.kt b/ControlledDelayPacingPolicy.kt
+new file mode 100644
+index 0000000..5059991
+--- /dev/null
++++ b/ControlledDelayPacingPolicy.kt
+@@ -0,0 +1,196 @@
++package com.samsung.android.camera.core2.ml
++
++import com.samsung.android.camera.core2.maker.MakerFeature
++import kotlin.math.ceil
++import kotlin.math.sqrt
++
++/**
++ * Closed-loop queue-feedback pacing baseline: the CoDel controlled-delay algorithm (RFC 8289; Nichols and Jacobson,
++ * "Controlling Queue Delay", ACM Queue 10(5), 2012) applied to the single-worker draft queue.
++ *
++ * CoDel controls how long work waits rather than how much work is waiting, and acts only once that wait has stayed
++ * above a target for a full interval - which is what makes it absorb bursts instead of draining the queue. Three
++ * properties carry over unchanged: the controlled quantity is the measured queue wait, the controller holds no model
++ * of the work it paces, and the action rate ramps as `interval / sqrt(count)` rather than engaging all at once.
++ * [decide] and [onDraftStarted] follow the RFC's `dequeue` and `dodequeue` routines statement for statement.
++ *
++ * Three adaptations, each forced by the pipeline rather than chosen:
++ *
++ *  1. **The action.** CoDel sheds standing queue by dropping a packet. A draft cannot be dropped - every capture must
++ *     produce an image - so the equivalent action shifts the next capture later instead, and one action is sized at
++ *     one draft's measured service time, the analogue of one packet.
++ *  2. **Where the routines run.** The RFC runs both routines at dequeue. Here the queue wait first becomes
++ *     observable when a draft starts, while the only actuator is the captureAvailable callback, so `dodequeue` runs
++ *     at draft start and the `dequeue` state machine runs at the callback.
++ *  3. **One action per callback.** The RFC's drop loop can shed several packets in one dequeue when it has fallen
++ *     behind schedule. A callback can only carry one delay, so the loop becomes a single conditional; a controller
++ *     that is behind schedule catches up on the following callbacks.
++ *
++ * What it deliberately cannot see: this capture's deadline and how much of it is already spent, and the size of the
++ * draft sequence about to be admitted. It knows only how long the last draft waited.
++ *
++ * **This policy does not collapse the queue.** It is inert while the measured wait is under target, and one action
++ * removes at most one draft's worth of work, so the queue settles near `target / serviceTime` drafts rather than at
++ * zero. Replayed over the nine collected S26 Ultra No-pacing bursts at starting level 3, that is 8 drafts at the
++ * unpaced median draft wall of 422 ms and 5 at the 726 ms wall the reference arm's heavier admitted workload
++ * produces; it stays inert on 24% of shots, and the queue is already 4 deep when it first acts, at a median of shot
++ * 9 of 30. Driving the queue empty would take a near-zero target, which is neither what RFC 8289 does nor what is
++ * configured here.
++ *
++ * Service-time learning is pipeline-lifetime, matching how the deployed policy's learned overhead outlives a burst.
++ * [clearSession] resets only the burst-local control state.
++ */
++class ControlledDelayPacingPolicy(
++    private val config: Config = Config(),
++) : CaptureAvailableDelayPolicy {
++
++    /** EWMA of measured draft wall times, which sizes one action; non-positive until the first draft completes. */
++    private var serviceTimeMs = 0.0
++
++    /** Queue wait of the draft that started most recently - the controlled quantity. */
++    private var latestQueueWaitMs = 0L
++
++    /** RFC 8289 `first_above_time_`: when the current above-target excursion becomes actionable; 0 while under. */
++    private var firstAboveTimeUptimeMs = 0L
++
++    /** RFC 8289 `ok_to_drop`, produced by [onDraftStarted] and consumed by the next [decide]. */
++    private var okToAct = false
++
++    /** RFC 8289 `dropping_`. */
++    private var acting = false
++
++    /** RFC 8289 `drop_next_`. */
++    private var nextActionUptimeMs = 0L
++
++    /** RFC 8289 `count_` and `lastcount_`. */
++    private var count = 0
++    private var lastCount = 0
++
++    /**
++     * RFC 8289 `dequeue`: the two-state control loop, run here at the callback because that is where the actuator
++     * is. Leaves the control state consistent even when the action it decides on is zero-length.
++     */
++    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
++        val nowUptimeMs = input.decisionUptimeMs
++        var delayMs = 0L
++
++        if (acting) {
++            if (!okToAct) {
++                acting = false
++            } else if (nowUptimeMs >= nextActionUptimeMs) {
++                delayMs = actionDelayMs()
++                count += 1
++                nextActionUptimeMs = controlLaw(nextActionUptimeMs, count)
++            }
++        } else if (okToAct) {
++            delayMs = actionDelayMs()
++            acting = true
++            // RFC 8289 resumes rather than restarts the ramp when an excursion returns soon after the last one, so
++            // a queue that keeps crossing the target is not repeatedly paced from the slowest action rate.
++            val delta = count - lastCount
++            count = if (delta > 1 && nowUptimeMs - nextActionUptimeMs < config.intervalMs * REENTRY_INTERVALS) {
++                delta
++            } else {
++                1
++            }
++            nextActionUptimeMs = controlLaw(nowUptimeMs, count)
++            lastCount = count
++        }
++
++        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs, backlogDeficitMs = delayMs)
++    }
++
++    /**
++     * RFC 8289 `dodequeue`: measures this draft's queue wait and decides whether the excursion above target has
++     * lasted a full interval. [queuedDraftCount] is the depth left behind this draft, so zero is the RFC's
++     * `bytes() <= maxpacket_` case - a queue that cannot be shortened without emptying it is not acted on.
++     *
++     * The wait excludes the delay that gated the draft. Charging a policy's own delay back to it as queue wait would
++     * close a positive feedback loop in which pacing manufactures the evidence that more pacing is needed.
++     */
++    override fun onDraftStarted(
++        startUptimeMs: Long,
++        gatingDecision: CaptureAvailablePacingDecision?,
++        queuedDraftCount: Int,
++    ) {
++        latestQueueWaitMs = gatingDecision
++            ?.let { decision -> startUptimeMs - (decision.decisionUptimeMs + decision.delayMs) }
++            ?.coerceAtLeast(0L)
++            ?: 0L
++
++        okToAct = false
++        if (latestQueueWaitMs < config.targetMs || queuedDraftCount <= 0) {
++            firstAboveTimeUptimeMs = 0L
++        } else if (firstAboveTimeUptimeMs == 0L) {
++            firstAboveTimeUptimeMs = startUptimeMs + config.intervalMs
++        } else if (startUptimeMs >= firstAboveTimeUptimeMs) {
++            okToAct = true
++        }
++    }
++
++    override fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
++        if (draftWallMs <= 0L) {
++            return
++        }
++        serviceTimeMs = if (serviceTimeMs <= 0.0) {
++            draftWallMs.toDouble()
++        } else {
++            serviceTimeMs * (1.0 - config.serviceTimeAlpha) + draftWallMs * config.serviceTimeAlpha
++        }
++    }
++
++    override fun clearSession() {
++        latestQueueWaitMs = 0L
++        firstAboveTimeUptimeMs = 0L
++        okToAct = false
++        acting = false
++        nextActionUptimeMs = 0L
++        count = 0
++        lastCount = 0
++    }
++
++    /** One packet's worth of standing queue: the excess wait above target, capped at one draft's service time. */
++    private fun actionDelayMs(): Long =
++        minOf(latestQueueWaitMs - config.targetMs, ceil(serviceTimeMs).toLong()).coerceAtLeast(0L)
++
++    /** RFC 8289 `control_law`. */
++    private fun controlLaw(fromUptimeMs: Long, actionCount: Int): Long =
++        fromUptimeMs + ceil(config.intervalMs / sqrt(actionCount.toDouble())).toLong()
++
++    /**
++     * @param targetMs standing queue wait tolerated before pacing engages. RFC 8289's 5 ms does not transfer: there
++     *   the queue is pure overhead and the target is set from the TCP round trip, whereas here the queue is the
++     *   parallel-capture feature itself. The target is therefore stated against the Capture Timeout budget - at most
++     *   half of a capture's deadline may be consumed by waiting. Halving it roughly halves the queue depth the
++     *   controller settles at.
++     * @param intervalMs how long the wait must stay above target before acting, and the base of the action-rate
++     *   ramp. This is the RFC's INTERVAL, which is one round trip - the lag before an action reaches the queue. Here
++     *   that is one shot-to-shot period, since a delay applied at this callback first affects the queue when the
++     *   next capture's draft is enqueued.
++     * @param serviceTimeAlpha EWMA weight for measured draft wall times.
++     */
++    data class Config(
++        val targetMs: Long = (MakerFeature.CAPTURE_TIMEOUT_MS * TARGET_DEADLINE_FRACTION).toLong(),
++        val intervalMs: Long = DEFAULT_INTERVAL_MS,
++        val serviceTimeAlpha: Double = DEFAULT_SERVICE_TIME_ALPHA,
++    ) {
++        init {
++            require(targetMs >= 0L) { "targetMs must be non-negative but was $targetMs" }
++            require(intervalMs > 0L) { "intervalMs must be positive but was $intervalMs" }
++            require(serviceTimeAlpha > 0.0 && serviceTimeAlpha <= 1.0) {
++                "serviceTimeAlpha must be in (0, 1] but was $serviceTimeAlpha"
++            }
++        }
++
++        private companion object {
++            private const val TARGET_DEADLINE_FRACTION = 0.5
++            private const val DEFAULT_INTERVAL_MS = 500L
++            private const val DEFAULT_SERVICE_TIME_ALPHA = 0.25
++        }
++    }
++
++    private companion object {
++        /** RFC 8289's 16-interval window for treating a new excursion as a continuation of the previous one. */
++        private const val REENTRY_INTERVALS = 16L
++    }
++}
 diff --git a/DeviceStateReader.kt b/DeviceStateReader.kt
-index a9103bfec2db2ecb8a85be0431e211cb4ccb3513..28a1edd6edc070cc1a779ce6f1a025bb9e60cc71 100644
+index a9103bf..75d8725 100644
 --- a/DeviceStateReader.kt
 +++ b/DeviceStateReader.kt
-@@ -20,6 +20,12 @@ class DeviceStateReader(
+@@ -20,6 +20,19 @@ class DeviceStateReader(
      private val overheatLevelSupplier: Supplier<Int>,
  ) {
  
++    /**
++     * Most recent *valid* thermal headroom, or a negative value until the first one arrives. Published so the
++     * captureAvailable callback can consult thermal state without a blocking read.
++     *
++     * Last valid rather than last read: the platform rate-limits headroom and answers NaN when polled faster than
++     * roughly once every ten seconds, while [read] runs once per draft - several times a second during a burst. A
++     * reader that overwrote this with the rate-limited miss would see "unavailable" far more often than it sees the
++     * device's actual thermal state.
++     */
 +    @Volatile
-+    private var latestThermalHeadroom = Float.NaN
-+
-+    /** Latest profiler snapshot; reading it does not poll PowerManager again from the captureAvailable callback. */
-+    fun readLatestThermalHeadroom(): Float = latestThermalHeadroom
++    var latestThermalHeadroom: Float = -1f
++        private set
 +
      fun read(): DeviceStateSnapshot {
          return runBlocking(Dispatchers.Default) {
              readInternal()
-@@ -88,6 +94,7 @@ class DeviceStateReader(
+@@ -88,6 +101,9 @@ class DeviceStateReader(
              .takeIf { !it.isNaN() }
              ?.let { (round(it * 1000) / 1000f) }
              ?: -1f
-+        latestThermalHeadroom = thermalHeadroom
++        if (thermalHeadroom >= 0f) {
++            latestThermalHeadroom = thermalHeadroom
++        }
  
          return ThermalSnapshot(
              overheatLevel = overheatLevelSupplier.get(),
-diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
-index ac1d6935d527fb1296a76f3fbc324ed70f75b825..6dedfbb2f25947d0d2fe096f4e13cfcfd52b494b 100644
---- a/external/apm/policy/CaptureAvailableApmPolicy.java
-+++ b/external/apm/policy/CaptureAvailableApmPolicy.java
-@@ -141,14 +141,14 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
-             } else if (appliedDelayMs > 0L) {
-                 reason = "pace draft sequence by " + appliedDelayMs + "ms";
-             } else {
--                reason = "budget is enough";
-+                reason = "selected pacing policy requires no delay";
-             }
- 
-             pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
-                     + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
-                     + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
-                     + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"
--                    + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
-+                    + ", policyBacklog=" + pacingDecision.getBacklogMs() + "ms"
-                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
-                     + ", draftSequenceKey=" + pacingPrediction.getDraftSequenceKey();
-         }
-diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
-index 437e1e034a81c269a63c62f824216b1c3ef52312..75338cdcfb6253c01fbde3d63446a49e42417395 100644
---- a/external/draftSaving/SavingDraftImageTaskManager.java
-+++ b/external/draftSaving/SavingDraftImageTaskManager.java
-@@ -10,6 +10,7 @@ import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
- import com.samsung.android.camera.core2.container.ExtraBundle;
- import com.samsung.android.camera.core2.container.SavingInfoContainer;
- import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
-+import com.samsung.android.camera.core2.ml.CaptureAvailableDelayPolicyFactory;
- import com.samsung.android.camera.core2.ml.CaptureMetrics;
- import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
- import com.samsung.android.camera.core2.ml.DeviceStateReader;
-@@ -46,8 +47,7 @@ public class SavingDraftImageTaskManager {
-     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
-     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
-     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
--    private final CaptureAvailablePacer captureAvailablePacer =
--            new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
-+    private final CaptureAvailablePacer captureAvailablePacer;
-     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
-     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
-     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
-@@ -70,6 +70,12 @@ public class SavingDraftImageTaskManager {
-     public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
-         this.context = context;
-         this.deviceStateReader = deviceStateReader;
-+        this.captureAvailablePacer = new CaptureAvailablePacer(
-+                draftSequenceExecutionPredictor,
-+                admissionPolicy,
-+                CaptureAvailableDelayPolicyFactory.create(deviceStateReader));
-+        PLog.i(TAG, "[mhyun2.park] captureAvailable delay policy: %s",
-+                CaptureAvailableDelayPolicyFactory.activePolicyName());
-     }
- 
-     /**
-@@ -321,4 +327,4 @@ public class SavingDraftImageTaskManager {
-             hasCaptureTimeoutInCurrentSession = false;
-         }
-     }
--}
-\ No newline at end of file
-+}
-diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
+diff --git a/ThermalHeadroomLutDelayPolicy.kt b/ThermalHeadroomLutDelayPolicy.kt
 new file mode 100644
-index 0000000000000000000000000000000000000000..6658da33f6f051db0e6a195a94593c9c3f9e751c
+index 0000000..8c882a6
 --- /dev/null
-+++ b/CaptureAvailableDelayPolicy.kt
-@@ -0,0 +1,74 @@
++++ b/ThermalHeadroomLutDelayPolicy.kt
+@@ -0,0 +1,122 @@
 +package com.samsung.android.camera.core2.ml
 +
-+/**
-+ * Delay arithmetic selected by [CaptureAvailablePacer].
-+ *
-+ * The pacer continues to own admission pairing, workload prediction, session boundaries, and metrics.  A policy sees
-+ * one immutable decision snapshot and returns only the delay components it actually used.  This keeps RQ3 policies
-+ * interchangeable without giving a baseline a different admission path or a different captureAvailable callback.
-+ *
-+ * Not synchronized: [CaptureAvailablePacer] invokes every method under its own lock.
-+ */
-+interface CaptureAvailableDelayPolicy {
-+    fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision
-+
-+    /** A Draft entered the single-worker pipeline. */
-+    fun onDraftStarted(sizeBucket: SizeBucket?, startUptimeMs: Long) = Unit
-+
-+    /** A Draft left the single-worker pipeline with an observable wall time. */
-+    fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) = Unit
-+
-+    /** Clears burst-local state.  Pipeline-lifetime calibration may deliberately remain. */
-+    fun clearSession() = Unit
-+}
-+
-+/** Runtime facts available at one captureAvailable decision. */
-+data class CaptureAvailableDelayPolicyInput(
-+    val decisionUptimeMs: Long,
-+    val draftSequenceBudgetMs: Long,
-+    val draftSequencePacingDurationMs: Double,
-+    val predictedBacklogMs: Long,
-+    val queuedDraftCount: Int,
-+    val shutterElapsedMs: Long,
-+)
-+
-+/**
-+ * Policy result projected into the existing pacing metrics.
-+ *
-+ * [backlogMs] is the backlog estimate used by this policy.  It is therefore the predicted-work clock for Ours, zero
-+ * for Thermal LUT, and the queue/EWMA estimate for Queue-EWMA.
-+ */
-+data class CaptureAvailableDelayPolicyDecision(
-+    val delayMs: Long,
-+    val levelDeficitMs: Long,
-+    val backlogDeficitMs: Long,
-+    val backlogMs: Long,
-+) {
-+    init {
-+        require(delayMs >= 0L)
-+        require(levelDeficitMs >= 0L)
-+        require(backlogDeficitMs >= 0L)
-+        require(backlogMs >= 0L)
-+    }
-+}
-+
-+/** Existing context-aware budget/backlog arithmetic, extracted as the default swappable policy. */
-+object ContextAwareCaptureAvailableDelayPolicy : CaptureAvailableDelayPolicy {
-+    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
-+        val levelDeficitMs = computeCaptureAvailableLevelDeficitMs(
-+            draftSequenceBudgetMs = input.draftSequenceBudgetMs,
-+            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
-+        )
-+        val backlogDeficitMs = computeCaptureAvailableBacklogDeficitMs(
-+            backlogMs = input.predictedBacklogMs,
-+            shutterElapsedMs = input.shutterElapsedMs,
-+            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
-+        )
-+        return CaptureAvailableDelayPolicyDecision(
-+            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
-+            levelDeficitMs = levelDeficitMs,
-+            backlogDeficitMs = backlogDeficitMs,
-+            backlogMs = input.predictedBacklogMs,
-+        )
-+    }
-+}
-diff --git a/CaptureAvailableDelayPolicyFactory.kt b/CaptureAvailableDelayPolicyFactory.kt
-new file mode 100644
-index 0000000000000000000000000000000000000000..37142753eb041a60c07a8b3de780e73f2888e68e
---- /dev/null
-+++ b/CaptureAvailableDelayPolicyFactory.kt
-@@ -0,0 +1,66 @@
-+package com.samsung.android.camera.core2.ml
-+
-+import android.os.Build
-+import java.util.function.DoubleSupplier
-+
-+/**
-+ * One experiment switch for RQ3 pacing-policy runs.
-+ *
-+ * Keep [activePolicy] at OURS for production-reference builds.  To collect a baseline, add the exact Build.MODEL
-+ * configuration to the corresponding map and change only [activePolicy].  A missing device calibration fails at
-+ * construction instead of silently running an uncalibrated zero-delay baseline.
-+ */
-+object CaptureAvailableDelayPolicyFactory {
-+    private val activePolicy = PolicyType.OURS
-+
-+    /*
-+     * Populate from calibration sessions only.  Each map key is the exact Build.MODEL string exported as deviceModel.
-+     * Do not reuse one device's LUT or EWMA parameters for another device merely to make an evaluation build run.
-+     */
-+    private val thermalLutConfigByDevice:
-+        Map<String, ThermalLutCaptureAvailableDelayPolicy.Config> = emptyMap()
-+    private val queueEwmaConfigByDevice:
-+        Map<String, QueueEwmaCaptureAvailableDelayPolicy.Config> = emptyMap()
-+
-+    @JvmStatic
-+    fun create(deviceStateReader: DeviceStateReader): CaptureAvailableDelayPolicy {
-+        val deviceModel = Build.MODEL
-+        return when (activePolicy) {
-+            PolicyType.OURS -> ContextAwareCaptureAvailableDelayPolicy
-+            PolicyType.THERMAL_LUT -> ThermalLutCaptureAvailableDelayPolicy(
-+                config = requireDeviceConfig(
-+                    policyName = PolicyType.THERMAL_LUT.name,
-+                    deviceModel = deviceModel,
-+                    configByDevice = thermalLutConfigByDevice,
-+                ),
-+                thermalHeadroomSupplier = DoubleSupplier {
-+                    deviceStateReader.readLatestThermalHeadroom().toDouble()
-+                },
-+            )
-+            PolicyType.QUEUE_EWMA -> QueueEwmaCaptureAvailableDelayPolicy(
-+                config = requireDeviceConfig(
-+                    policyName = PolicyType.QUEUE_EWMA.name,
-+                    deviceModel = deviceModel,
-+                    configByDevice = queueEwmaConfigByDevice,
-+                ),
-+            )
-+        }
-+    }
-+
-+    @JvmStatic
-+    fun activePolicyName(): String = activePolicy.name
-+
-+    private fun <T> requireDeviceConfig(
-+        policyName: String,
-+        deviceModel: String,
-+        configByDevice: Map<String, T>,
-+    ): T = requireNotNull(configByDevice[deviceModel]) {
-+        "$policyName has no calibrated configuration for Build.MODEL=$deviceModel"
-+    }
-+
-+    enum class PolicyType {
-+        OURS,
-+        THERMAL_LUT,
-+        QUEUE_EWMA,
-+    }
-+}
-diff --git a/QueueEwmaCaptureAvailableDelayPolicy.kt b/QueueEwmaCaptureAvailableDelayPolicy.kt
-new file mode 100644
-index 0000000000000000000000000000000000000000..2d3d7e67ac752df998049cb937d18ef8fce60c8a
---- /dev/null
-+++ b/QueueEwmaCaptureAvailableDelayPolicy.kt
-@@ -0,0 +1,87 @@
-+package com.samsung.android.camera.core2.ml
-+
-+import kotlin.math.ceil
-+
-+/**
-+ * RQ3 queue-feedback baseline.
-+ *
-+ * The policy estimates the unfinished single-worker occupancy from only observable queue state and an EWMA of Drafts
-+ * that completed before the decision.  It does not read the pacer's per-workload predictions or its predicted backlog
-+ * clock.  The active Draft is charged only its estimated remaining wall time; not-yet-started Drafts are each charged
-+ * one full EWMA service time.  Its target is fixed for the calibrated configuration, so thermal bucket changes
-+ * cannot abruptly alter the feedback response.
-+ *
-+ * The EWMA is pipeline-lifetime learned state, matching Ours' learned overhead lifetime.  [clearSession] removes only
-+ * burst-local occupancy so repeated 30-shot trials can choose explicitly between a new policy instance (cold) and a
-+ * retained instance (warm).
-+ */
-+class QueueEwmaCaptureAvailableDelayPolicy(
-+    private val config: Config,
-+) : CaptureAvailableDelayPolicy {
-+
-+    private val serviceTimeMsBySize = config.initialServiceTimeMsBySize.toMutableMap()
-+    private var activeDraftStartUptimeMs: Long? = null
-+    private var activeSizeBucket: SizeBucket? = null
-+
-+    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
-+        val serviceTimeMs = serviceTimeMs(activeSizeBucket)
-+        val activeRemainingMs = activeDraftStartUptimeMs?.let { startUptimeMs ->
-+            (serviceTimeMs - (input.decisionUptimeMs - startUptimeMs).coerceAtLeast(0L)).coerceAtLeast(0.0)
-+        } ?: 0.0
-+        val queuedWorkMs = input.queuedDraftCount.coerceAtLeast(0).toDouble() * serviceTimeMs
-+        val estimatedBacklogMs = ceil(activeRemainingMs + queuedWorkMs).toLong()
-+        val backlogDeficitMs = (estimatedBacklogMs - config.targetBacklogMs).coerceAtLeast(0L)
-+
-+        return CaptureAvailableDelayPolicyDecision(
-+            delayMs = backlogDeficitMs,
-+            levelDeficitMs = 0L,
-+            backlogDeficitMs = backlogDeficitMs,
-+            backlogMs = estimatedBacklogMs,
-+        )
-+    }
-+
-+    override fun onDraftStarted(sizeBucket: SizeBucket?, startUptimeMs: Long) {
-+        activeDraftStartUptimeMs = startUptimeMs
-+        activeSizeBucket = sizeBucket
-+    }
-+
-+    override fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
-+        activeDraftStartUptimeMs = null
-+        activeSizeBucket = null
-+        if (draftWallMs <= 0L) {
-+            return
-+        }
-+
-+        val previousEstimateMs = serviceTimeMs(sizeBucket)
-+        serviceTimeMsBySize[sizeBucket] =
-+            previousEstimateMs * (1.0 - config.alpha) + draftWallMs.toDouble() * config.alpha
-+    }
-+
-+    override fun clearSession() {
-+        activeDraftStartUptimeMs = null
-+        activeSizeBucket = null
-+    }
-+
-+    /** Explicit cold reset for a test harness; normal burst drain intentionally keeps learned service times. */
-+    fun resetLearnedServiceTimes() {
-+        serviceTimeMsBySize.clear()
-+        serviceTimeMsBySize.putAll(config.initialServiceTimeMsBySize)
-+    }
-+
-+    private fun serviceTimeMs(sizeBucket: SizeBucket?): Double =
-+        sizeBucket?.let { serviceTimeMsBySize[it] } ?: config.fallbackInitialServiceTimeMs
-+
-+    data class Config(
-+        val alpha: Double,
-+        val initialServiceTimeMsBySize: Map<SizeBucket, Double>,
-+        val fallbackInitialServiceTimeMs: Double,
-+        val targetBacklogMs: Long,
-+    ) {
-+        init {
-+            require(alpha > 0.0 && alpha <= 1.0)
-+            require(initialServiceTimeMsBySize.values.all { serviceTimeMs -> serviceTimeMs > 0.0 })
-+            require(fallbackInitialServiceTimeMs > 0.0)
-+            require(targetBacklogMs >= 0L)
-+        }
-+    }
-+}
-diff --git a/ThermalLutCaptureAvailableDelayPolicy.kt b/ThermalLutCaptureAvailableDelayPolicy.kt
-new file mode 100644
-index 0000000000000000000000000000000000000000..a9178a67aa08353efee992b4d777a3ac3f3d3d62
---- /dev/null
-+++ b/ThermalLutCaptureAvailableDelayPolicy.kt
-@@ -0,0 +1,62 @@
-+package com.samsung.android.camera.core2.ml
-+
-+import java.util.function.DoubleSupplier
 +import kotlin.math.roundToLong
 +
 +/**
-+ * RQ3 Thermal-LUT baseline.
++ * Open-loop thermal pacing baseline: delay is a function of thermal state and of nothing else.
 + *
-+ * The only runtime input is continuous thermal headroom.  Delay is linearly interpolated between calibrated control
-+ * points, avoiding a discontinuous jump at a thermal bucket boundary.  This class deliberately has no queue,
-+ * workload-prediction, or online-duration input.
++ * This is the pacing form of the guidance Android publishes for sustained workloads under the Adaptive Performance
++ * Framework - poll `getThermalHeadroom()`, and shed or space work before the device is actually throttled, with
++ * documented action thresholds at 0.85 (watch), 0.95 (reduce), and 1.0 (reduce immediately). Headroom is used rather
++ * than the ordinal overheat level for two reasons: it is continuous, so the baseline does not inherit the step
++ * discontinuity that the production guard is criticised for, and it moves within a burst rather than only between
++ * bursts. That makes this the strong form of "just react to the thermal signal", not the weak one.
++ *
++ * What it deliberately cannot see: how deep the draft queue is, how much of this capture's deadline has already been
++ * spent waiting, and how large the draft sequence it is about to admit is. Two captures at identical headroom are
++ * paced identically whether the pipeline is idle or eight drafts deep.
++ *
++ * The policy holds no state, so a burst boundary means nothing to it.
++ *
++ * @param thermalHeadroomSupplier latest valid headroom in `[0, 1]` (0 no throttling, 1 severe), or a negative value
++ *   until the device has reported one. Sampled, not polled: the platform rate-limits headroom and answers NaN when
++ *   asked faster than roughly once every ten seconds, and this runs on the captureAvailable callback.
 + */
-+class ThermalLutCaptureAvailableDelayPolicy(
-+    private val config: Config,
-+    private val thermalHeadroomSupplier: DoubleSupplier,
++class ThermalHeadroomLutDelayPolicy(
++    private val thermalHeadroomSupplier: () -> Double,
++    private val config: Config = Config(),
 +) : CaptureAvailableDelayPolicy {
 +
 +    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
-+        val delayMs = config.delayMs(thermalHeadroomSupplier.getAsDouble())
-+        return CaptureAvailableDelayPolicyDecision(
-+            delayMs = delayMs,
-+            levelDeficitMs = delayMs,
-+            backlogDeficitMs = 0L,
-+            backlogMs = 0L,
-+        )
++        // The one queue fact this policy reads, and it reads only the bit: is anything waiting at all. The deployed
++        // policy never delays an empty pipeline, so a baseline that charged an isolated shot a thermal delay would
++        // be paying a cost that buys nothing and losing the comparison on that alone. How much is waiting stays
++        // invisible here - that is the axis the baseline is meant to be missing.
++        if (input.queuedDraftCount <= 0) {
++            return CaptureAvailableDelayPolicyDecision(delayMs = 0L)
++        }
++        val delayMs = config.delayMs(thermalHeadroomSupplier())
++        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs, levelDeficitMs = delayMs)
 +    }
 +
++    /**
++     * Piecewise-linear map from thermal headroom to per-transition delay.
++     *
++     * The shipped values are calibrated for the S26 Ultra at 12MP normal, starting overheat level 3, by
++     * `data/lut_calibration.py`. Recalibrate for any other device or capture configuration - the breakpoints carry
++     * over, the magnitudes do not:
++     *
++     *  1. Run the burst protocol under [CaptureAvailableDelayPolicyFactory.PolicyType.NO_PACING] and record the
++     *     headroom range the run actually visits. Points outside that range never fire and are decoration; if the
++     *     range never reaches the first non-zero point, move the knees down rather than reporting an arm that
++     *     never paced.
++     *  2. Run it under the policy being compared against and take that arm's total applied delay per burst.
++     *  3. Scale these points so this policy spends the same total over the same burst. A LUT that spends materially
++     *     less total delay cannot be reported as a losing baseline - it was simply paced less.
++     *
++     * @param delayMsByThermalHeadroom control points; headroom outside the outermost points clamps to them.
++     * @param fallbackDelayMs applied when the device reports no headroom, which degenerates this policy to
++     *   fixed-rate pacing. Kept explicit so a run on such a device is recognisable rather than silently unpaced.
++     */
 +    data class Config(
-+        val delayMsByThermalHeadroom: Map<Double, Long>,
-+        val fallbackDelayMs: Long,
++        val delayMsByThermalHeadroom: Map<Double, Long> = DEFAULT_CONTROL_POINTS,
++        val fallbackDelayMs: Long = DEFAULT_FALLBACK_DELAY_MS,
 +    ) {
-+        private val controlPoints = delayMsByThermalHeadroom.entries.sortedBy { it.key }
++        private val controlPoints = delayMsByThermalHeadroom.entries.sortedBy { entry -> entry.key }
 +
 +        init {
-+            require(delayMsByThermalHeadroom.isNotEmpty())
-+            require(delayMsByThermalHeadroom.keys.all { headroom -> headroom.isFinite() })
-+            require(delayMsByThermalHeadroom.values.all { delayMs -> delayMs >= 0L })
-+            require(fallbackDelayMs >= 0L)
++            require(delayMsByThermalHeadroom.isNotEmpty()) { "at least one control point is required" }
++            require(delayMsByThermalHeadroom.keys.all { headroom -> headroom.isFinite() }) {
++                "control point headrooms must be finite"
++            }
++            require(delayMsByThermalHeadroom.values.all { delayMs -> delayMs >= 0L }) {
++                "control point delays must be non-negative"
++            }
++            require(fallbackDelayMs >= 0L) { "fallbackDelayMs must be non-negative" }
 +        }
 +
 +        fun delayMs(thermalHeadroom: Double): Long {
@@ -639,9 +767,283 @@ index 0000000000000000000000000000000000000000..a9178a67aa08353efee992b4d777a3ac
 +            val lower = controlPoints[upperIndex - 1]
 +            val upper = controlPoints[upperIndex]
 +            val ratio = (thermalHeadroom - lower.key) / (upper.key - lower.key)
-+            return (lower.value.toDouble() + (upper.value - lower.value).toDouble() * ratio)
-+                .roundToLong()
-+                .coerceAtLeast(0L)
++            return (lower.value + (upper.value - lower.value) * ratio).roundToLong().coerceAtLeast(0L)
++        }
++
++        private companion object {
++            /**
++             * Breakpoints are Android's own published action thresholds - 0.85 watch, 0.95 reduce, 1.0 reduce
++             * immediately - plus one earlier knee, because spacing captures is a cheaper reaction than dropping
++             * work and can therefore start before the platform asks for a reduction. A LUT that only acts from 0.85
++             * up will never fire on a burst that stays cool and would then be an unpaced arm under another name.
++             *
++             * Magnitudes are the cost-matched calibration: replayed over the nine collected No-pacing bursts, these
++             * values spend a run-median 4582 ms per 30-shot burst, equal to the reference arm's 4582 ms, so neither
++             * arm can win the comparison by simply pacing less. The observed headroom band on those runs is
++             * 0.876-0.947, over which these points vary the delay from 118 ms to 201 ms - narrow, because the
++             * thermal signal itself is narrow at a fixed starting level, which is part of what the baseline shows.
++             */
++            private val DEFAULT_CONTROL_POINTS = mapOf(
++                0.00 to 0L,
++                0.70 to 0L,
++                0.85 to 88L,
++                0.95 to 205L,
++                1.00 to 409L,
++            )
++
++            /** The calibrated delay at the median headroom observed, so an unreadable sample costs the usual amount. */
++            private const val DEFAULT_FALLBACK_DELAY_MS = 164L
 +        }
 +    }
 +}
+diff --git a/data/lut_calibration.py b/data/lut_calibration.py
+new file mode 100644
+index 0000000..7dbffc1
+--- /dev/null
++++ b/data/lut_calibration.py
+@@ -0,0 +1,86 @@
++"""Calibrate ThermalHeadroomLutDelayPolicy magnitudes against the collected S26 Ultra runs.
++
++Cost-matching: scale the LUT so its burst-total applied delay equals the reference
++arm's, so the baseline cannot be reported as losing on cost it never spent.
++
++Open-loop by construction: the LUT is replayed over the No-pacing headroom and
++queue-depth trajectory. Under real pacing both would shift. This sets the
++magnitude; it does not predict the paced trajectory.
++"""
++import numpy as np
++import pandas as pd
++
++SEIP = r"C:\Users\sal_eunki\Desktop\SEIP-27\data"
++ML = r"C:\Users\sal_eunki\Desktop\ML\data"
++
++NO_PACING = [rf"{SEIP}\48U_metrics_12MP_normal_0729_AdmitOnly_1.xlsx",
++             rf"{SEIP}\48U_metrics_12MP_normal_0729_AdmitOnly_2.xlsx"]
++OURS = [rf"{ML}\48U_metrics_12MP_normal_0729.xlsx"]
++
++START_LEVEL, WINDOW = 3, 30
++
++# Shape only; step 3 scales the magnitudes. Breakpoints are Android's published
++# ADPF action thresholds plus one earlier knee.
++SHAPE = [(0.00, 0.0), (0.70, 0.0), (0.85, 150.0), (0.95, 350.0), (1.00, 700.0)]
++
++
++def runs(files):
++    """Per-workbook run keys, so runId 1 in two workbooks stays two runs."""
++    out = []
++    for fi, path in enumerate(files):
++        df = pd.ExcelFile(path).parse("RQ3Pacing")
++        df = df[(df.startingOverheatLevel == START_LEVEL) &
++                (df.runShotCount >= WINDOW) & (df.runShotIndex <= WINDOW)].copy()
++        df["runKey"] = f"w{fi}_" + df.runId.astype(str)
++        out.append(df)
++    return pd.concat(out, ignore_index=True)
++
++
++def lut(headroom, scale):
++    xs = [p[0] for p in SHAPE]
++    ys = [p[1] * scale for p in SHAPE]
++    if not np.isfinite(headroom) or headroom < 0:
++        return ys[2]                      # fallback = the 0.85 point
++    return float(np.interp(headroom, xs, ys))
++
++
++def run_total(df, scale):
++    """Burst-total delay: transitions only, gated on a non-empty draft queue."""
++    d = df[df.transitionDelayMs.notna()]
++    h = pd.to_numeric(d.shotThermalHeadroom, errors="coerce")
++    q = pd.to_numeric(d.controllerQueuedDraftCount, errors="coerce").fillna(0)
++    return sum(lut(hi, scale) for hi, qi in zip(h, q) if qi > 0)
++
++
++npac, ours = runs(NO_PACING), runs(OURS)
++
++target = ours[ours.transitionDelayMs.notna()].groupby("runKey").transitionDelayMs.sum().median()
++print(f"reference (Ours) run-median total delay : {target:.0f} ms")
++
++base = npac.groupby("runKey").apply(lambda d: run_total(d, 1.0), include_groups=False)
++print(f"unscaled LUT run-median total delay     : {base.median():.0f} ms"
++      f"   (range {base.min():.0f}-{base.max():.0f})")
++
++scale = target / base.median()
++print(f"\nscale = {scale:.4f}")
++
++got = npac.groupby("runKey").apply(lambda d: run_total(d, scale), include_groups=False)
++print(f"calibrated LUT run-median total delay   : {got.median():.0f} ms"
++      f"   (range {got.min():.0f}-{got.max():.0f})")
++
++h = pd.to_numeric(npac.shotThermalHeadroom, errors="coerce").dropna()
++
++print("\nDEFAULT_CONTROL_POINTS for ThermalHeadroomLutDelayPolicy.Config:")
++for x, y in SHAPE:
++    print(f"    {x:.2f} to {round(y * scale):d}L,")
++print(f"DEFAULT_FALLBACK_DELAY_MS = {round(lut(h.median(), scale))}L"
++      f"   (the calibrated delay at the median observed headroom)")
++
++print(f"\nheadroom band actually visited: p05={h.quantile(.05):.3f} "
++      f"p50={h.median():.3f} p95={h.quantile(.95):.3f} "
++      f"(min={h.min():.3f} max={h.max():.3f})")
++print(f"  delay at p05/p50/p95 headroom: "
++      f"{lut(h.quantile(.05), scale):.0f} / {lut(h.median(), scale):.0f} / "
++      f"{lut(h.quantile(.95), scale):.0f} ms")
++gate = pd.to_numeric(npac.controllerQueuedDraftCount, errors="coerce").fillna(0)
++print(f"  transitions with a non-empty queue: {(gate > 0).mean() * 100:.1f}%")
+diff --git a/data/rq3_aggregate.py b/data/rq3_aggregate.py
+index 1c4a383..eb7a2ae 100644
+--- a/data/rq3_aggregate.py
++++ b/data/rq3_aggregate.py
+@@ -26,15 +26,29 @@ from scipy.stats import mannwhitneyu
+ warnings.filterwarnings("ignore")
+ 
+ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+-PAPER_RQ3_DIR = r"C:\Users\algus\Documents\SEIP'27\data\rq3"
++PAPER_RQ3_DIR = os.environ.get("RQ3_PAPER_DIR", r"C:\Users\algus\Documents\SEIP'27\data\rq3")
+ OUT_DIR = os.path.join(PAPER_RQ3_DIR, "s26_ultra")
+ 
+-# Operator-supplied policy labels; the exporter does not store an RQ3 policy name.
++# One key per CaptureAvailableDelayPolicyFactory.PolicyType arm, keyed by the CSV
++# stem the figure reads. Order is the figure's legend order.
++#
++# Workbooks are listed by the operator. The exporter does write a pacingPolicy
++# column, but it records the arm of the build that *exported* the workbook rather
++# than the arm each row ran under, so it audits this mapping rather than replacing
++# it: check that every workbook listed here reports the matching pacingPolicy.
++#
++# An arm with no workbooks yet is skipped and emits a header-only CSV, so the
++# figure keeps compiling before its data is collected.
+ ARMS = {
+     "no_pacing": ["48U_metrics_12MP_normal_0729_AdmitOnly_1.xlsx",
+                   "48U_metrics_12MP_normal_0729_AdmitOnly_2.xlsx"],
++    "thermal_lut": [],
++    "codel_inspired": [],
+     "ours": ["48U_metrics_12MP_normal_0729.xlsx"],
+ }
++
++# The arm every other arm is read as a delta against.
++BASELINE_ARM = "no_pacing"
+ START_LEVEL = 3
+ WINDOW = 30                   # shots 1..30
+ TRANSITIONS = WINDOW - 1      # delay on shot i gates shot i+1
+@@ -265,6 +279,15 @@ def main():
+     os.makedirs(OUT_DIR, exist_ok=True)
+     results, runs = {}, {}
+     for arm in ARMS:
++        if not ARMS[arm]:
++            # Header-only CSV so the figure's \addplot still finds a table to read.
++            per_shot(pd.DataFrame(columns=["runShotIndex", "realBacklogMs", "realQueueDepth",
++                                           "transitionDelayMs"])).iloc[0:0].to_csv(
++                os.path.join(OUT_DIR, f"{arm}.csv"), index=False, lineterminator="\n")
++            print("=" * 96)
++            print(f"[{arm}] no workbooks listed - skipped, wrote an empty {arm}.csv")
++            continue
++
+         rq3, capture = load(arm)
+         window, audit = select_runs(rq3)
+         summary = summarize(window)
+@@ -283,35 +306,39 @@ def main():
+         print(runs[arm].round(1).to_string())
+         per_shot(window).to_csv(os.path.join(OUT_DIR, f"{arm}.csv"), index=False, lineterminator="\n")
+ 
+-    cost = pd.DataFrame([{
+-        "no_pacing_delay_s": round(results["no_pacing"]["totalDelayMedianS"], 3),
+-        "no_pacing_max_backlog_s": round(results["no_pacing"]["bMaxS"], 3),
+-        "static_delay_s": "nan", "static_max_backlog_s": "nan",
+-        "queue_dynamic_delay_s": "nan", "queue_dynamic_max_backlog_s": "nan",
+-        "ours_delay_s": round(results["ours"]["totalDelayMedianS"], 3),
+-        "ours_max_backlog_s": round(results["ours"]["bMaxS"], 3),
+-    }])
+-    cost.to_csv(os.path.join(OUT_DIR, "backlog_cost.csv"), index=False, lineterminator="\n")
++    row = {}
++    for arm in ARMS:
++        summary = results.get(arm)
++        row[f"{arm}_delay_s"] = round(summary["totalDelayMedianS"], 3) if summary else "nan"
++        row[f"{arm}_max_backlog_s"] = round(summary["bMaxS"], 3) if summary else "nan"
++    pd.DataFrame([row]).to_csv(os.path.join(OUT_DIR, "backlog_cost.csv"),
++                               index=False, lineterminator="\n")
+ 
+     # Run-level rank test. n is 8 and 9, so report the exact test rather than a
+     # normal approximation, and keep the per-run range alongside every p-value.
+-    print("=" * 96)
+     comparison = {}
+-    for metric in runs["no_pacing"].columns:
+-        a, b = runs["no_pacing"][metric], runs["ours"][metric]
+-        _, p = mannwhitneyu(a, b, alternative="two-sided")
+-        comparison[metric] = dict(
+-            noPacingMedian=float(a.median()), noPacingMin=float(a.min()), noPacingMax=float(a.max()),
+-            oursMedian=float(b.median()), oursMin=float(b.min()), oursMax=float(b.max()),
+-            mannWhitneyP=float(p))
+-        print(f"{metric:22s} NoPacing {a.median():9.1f} [{a.min():.1f}, {a.max():.1f}]"
+-              f"   Ours {b.median():9.1f} [{b.min():.1f}, {b.max():.1f}]   p={p:.4f}")
++    for arm in runs:
++        if arm == BASELINE_ARM:
++            continue
++        print("=" * 96)
++        print(f"[{BASELINE_ARM} vs {arm}]")
++        armComparison = {}
++        for metric in runs[BASELINE_ARM].columns:
++            a, b = runs[BASELINE_ARM][metric], runs[arm][metric]
++            _, p = mannwhitneyu(a, b, alternative="two-sided")
++            armComparison[metric] = dict(
++                baselineMedian=float(a.median()), baselineMin=float(a.min()), baselineMax=float(a.max()),
++                armMedian=float(b.median()), armMin=float(b.min()), armMax=float(b.max()),
++                mannWhitneyP=float(p))
++            print(f"{metric:22s} {BASELINE_ARM} {a.median():9.1f} [{a.min():.1f}, {a.max():.1f}]"
++                  f"   {arm} {b.median():9.1f} [{b.min():.1f}, {b.max():.1f}]   p={p:.4f}")
++        comparison[arm] = armComparison
+ 
+     payload = dict(condition=dict(resolution="12MP normal", startingOverheatLevel=START_LEVEL,
+                                   window=WINDOW, transitionsPerRun=TRANSITIONS,
+                                   nearDeadlineFraction=NEAR_DEADLINE_FRACTION,
+                                   workbooks=ARMS),
+-                   arms=results, runLevelComparison=comparison)
++                   arms=results, runLevelComparisonByArm=comparison)
+     with open(os.path.join(PAPER_RQ3_DIR, "rq3_metrics.json"), "w", encoding="utf-8") as handle:
+         json.dump(payload, handle, indent=2, default=float)
+         handle.write("\n")
+diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
+index 81b6d1b..492fddb 100644
+--- a/external/apm/policy/CaptureAvailableApmPolicy.java
++++ b/external/apm/policy/CaptureAvailableApmPolicy.java
+@@ -141,7 +141,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
+             } else if (appliedDelayMs > 0L) {
+                 reason = "pace draft sequence by " + appliedDelayMs + "ms";
+             } else {
+-                reason = "budget is enough";
++                reason = "the selected pacing policy asked for no delay";
+             }
+ 
+             pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
+diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
+index ad17d4f..5025134 100644
+--- a/external/draftSaving/SavingDraftImageTaskManager.java
++++ b/external/draftSaving/SavingDraftImageTaskManager.java
+@@ -9,6 +9,7 @@ import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;
+ import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
+ import com.samsung.android.camera.core2.container.ExtraBundle;
+ import com.samsung.android.camera.core2.container.SavingInfoContainer;
++import com.samsung.android.camera.core2.ml.CaptureAvailableDelayPolicyFactory;
+ import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
+ import com.samsung.android.camera.core2.ml.CaptureMetrics;
+ import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+@@ -46,7 +47,8 @@ public class SavingDraftImageTaskManager {
+     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
+     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
+     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
+-    private final CaptureAvailablePacer captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
++    // The pacing policy is the RQ3 experiment switch; it needs deviceStateReader, so it is built in the constructor.
++    private final CaptureAvailablePacer captureAvailablePacer;
+     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
+     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
+     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
+@@ -69,6 +71,11 @@ public class SavingDraftImageTaskManager {
+     public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
+         this.context = context;
+         this.deviceStateReader = deviceStateReader;
++        this.captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy,
++                CaptureAvailableDelayPolicyFactory.create(deviceStateReader));
++        // Logged once per pipeline so a collected logcat states which pacing arm produced the run.
++        PLog.i(TAG, "[mhyun2.park] captureAvailable delay policy: %s",
++                CaptureAvailableDelayPolicyFactory.activePolicyName());
+     }
+ 
+     /**
