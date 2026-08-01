@@ -105,9 +105,6 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "shutter_elapsed_ms")
     val shutterElapsedMs: Long?,
 
-    @ColumnInfo(name = "max_draft_sequence_duration_ms")
-    val maxDraftSequenceDurationMs: Long?,
-
     @ColumnInfo(name = "draft_sequence_budget_ms")
     val draftSequenceBudgetMs: Long,
 

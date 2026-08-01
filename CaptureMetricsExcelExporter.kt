@@ -38,10 +38,17 @@ class CaptureMetricsExcelExporter(
         val freshestCompletedDraftWallMs: Long?,
         /**
          * Session max draft wall of the SAME draft size as this capture, observed before its decision. The pacer's
-         * ceiling uses beforeObservedMaxDraftMs (max over all sizes); the gap between the two is the cross-size
-         * contamination a heavy other-size draft (e.g. MP24) adds to this size's (e.g. MP12) reserve.
+         * ceiling falls back to [observedMaxDraftMs] (max over all sizes) only while this size is still cold; the gap
+         * between the two is the cross-size contamination a heavy other-size draft (e.g. MP24) can add to this size's
+         * (e.g. MP12) reserve.
          */
         val sizeScopedObservedMaxDraftMs: Long?,
+        /**
+         * Session max draft wall over every size, observed before this capture's decision - the pacer's cold-size
+         * fallback. Reconstructed rather than recorded: the runtime no longer carries it on the decision, so a capture
+         * whose Draft timeline is missing a start/end pair is invisible here and the max reads low on those rows.
+         */
+        val observedMaxDraftMs: Long?,
     )
 
     /**
@@ -110,19 +117,20 @@ class CaptureMetricsExcelExporter(
         cap.nodeRows.firstOrNull()?.node?.workloadKey
             ?.let { key -> Regex("sizeBucket=([A-Za-z0-9]+)").find(key)?.groupValues?.get(1) }
 
-    /** Per capture: in-flight count, freshest completed wall, and same-size observed max as of its pacing decision. */
+    /** Per capture: in-flight count, freshest completed wall, and the observed maxima as of its pacing decision. */
     private fun computeWallBaseDiagnostics(group: List<CaptureRow>, member: CaptureRow): WallBaseDiagnostics {
         val decisionMs = member.pacingReplay?.before?.decisionUptimeMs ?: member.draftStartUptimeMs
-            ?: return WallBaseDiagnostics(null, null, null)
+            ?: return WallBaseDiagnostics(null, null, null, null)
         val memberSize = draftSizeBucketOf(member)
-        // The pacer's observed max resets when the pipeline drains (a new pacer session), so scope this to the same
-        // pacer session to stay comparable to beforeObservedMaxDraftMs. In-flight/freshest are physical pipeline
-        // facts, so they stay session-agnostic.
+        // The pacer's maxima reset when the pipeline drains (a new pacer session), so scope both to the same pacer
+        // session to reconstruct what it actually held. In-flight/freshest are physical pipeline facts, so they stay
+        // session-agnostic.
         val memberPacerSession = member.metrics.draftSequenceMetrics?.pacerSessionId
         var inFlight = 0
         var freshestEndMs = Long.MIN_VALUE
         var freshestWallMs: Long? = null
         var sizeScopedMaxMs: Long? = null
+        var observedMaxMs: Long? = null
         for (other in group) {
             if (other === member) {
                 continue
@@ -136,16 +144,20 @@ class CaptureMetricsExcelExporter(
                 freshestEndMs = endMs
                 freshestWallMs = other.draftWallMs
             }
-            val sameSize = memberSize != null && draftSizeBucketOf(other) == memberSize
             val samePacerSession = other.metrics.draftSequenceMetrics?.pacerSessionId == memberPacerSession
-            if (endMs <= decisionMs && sameSize && samePacerSession) {
-                val wallMs = other.draftWallMs
-                if (wallMs != null && (sizeScopedMaxMs == null || wallMs > sizeScopedMaxMs)) {
-                    sizeScopedMaxMs = wallMs
-                }
+            if (endMs > decisionMs || !samePacerSession) {
+                continue
+            }
+            val wallMs = other.draftWallMs ?: continue
+            if (observedMaxMs == null || wallMs > observedMaxMs) {
+                observedMaxMs = wallMs
+            }
+            val sameSize = memberSize != null && draftSizeBucketOf(other) == memberSize
+            if (sameSize && (sizeScopedMaxMs == null || wallMs > sizeScopedMaxMs)) {
+                sizeScopedMaxMs = wallMs
             }
         }
-        return WallBaseDiagnostics(inFlight, freshestWallMs, sizeScopedMaxMs)
+        return WallBaseDiagnostics(inFlight, freshestWallMs, sizeScopedMaxMs, observedMaxMs)
     }
 
     /**
@@ -807,16 +819,16 @@ class CaptureMetricsExcelExporter(
             else -> PACING_SHUTTER_ELAPSED_BOUNDED
         }
 
-        val afterLevelDeficitMs: Long = computeCaptureAvailableLevelDeficitMs(
+        val afterLevelDeficitMs: Long = computeLevelDeficitMs(
             draftSequenceBudgetMs = before.draftSequenceBudgetMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
-        val afterBacklogDeficitMinMs: Long = computeCaptureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMinMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
             shutterElapsedMs = shutterElapsedMinMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
-        val afterBacklogDeficitMaxMs: Long = computeCaptureAvailableBacklogDeficitMs(
+        val afterBacklogDeficitMaxMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
             shutterElapsedMs = shutterElapsedMaxMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
@@ -1419,9 +1431,6 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeDraftSequenceKey") { it.row.pacingReplay?.before?.draftSequenceKey },
             Column("beforeDraftSequenceBudgetMs") { it.row.pacingReplay?.before?.draftSequenceBudgetMs },
-            Column("beforeMaxDraftSequenceDurationMs") {
-                it.row.pacingReplay?.before?.maxDraftSequenceDurationMs
-            },
             Column("beforeDraftSequencePredictedDurationMs") {
                 it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
             },
@@ -1437,7 +1446,6 @@ class CaptureMetricsExcelExporter(
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
             },
             Column("beforeShutterElapsedMs") { it.row.pacingReplay?.before?.shutterElapsedMs },
-            Column("beforeMaxDraftSequenceDurationMs") { it.row.pacingReplay?.before?.maxDraftSequenceDurationMs },
             Column("beforeLevelDeficitMs") { it.row.pacingReplay?.before?.levelDeficitMs },
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
@@ -1501,13 +1509,14 @@ class CaptureMetricsExcelExporter(
                     null
                 }
             },
-            // Session max draft wall of THIS capture's own draft size, vs the pacer's size-agnostic observed max.
+            // Session max draft wall of THIS capture's own draft size, and over every size - the cold-size fallback.
             Column("sizeScopedObservedMaxDraftMs") { it.wallBase.sizeScopedObservedMaxDraftMs },
-            // How much the size-agnostic observed max inflates this size's ceiling (cross-size contamination): a heavy
-            // MP24 draft raising an MP12 capture's reserve. Clamped at 0 (when obsMax is below this size's own max, or
-            // freshly reset to 0, the ceiling is not cross-size inflated).
+            Column("observedMaxDraftMs") { it.wallBase.observedMaxDraftMs },
+            // How much the all-size fallback would inflate this size's ceiling (cross-size contamination): a heavy
+            // MP24 draft raising an MP12 capture's reserve. Only charged while this size is cold, so a non-zero value
+            // is an upper bound on the inflation, not proof of it. Clamped at 0 when this size's own max is the larger.
             Column("draftSequencePacingCrossSizeContaminationMs") {
-                val obsMaxMs = it.row.pacingReplay?.before?.maxDraftSequenceDurationMs
+                val obsMaxMs = it.wallBase.observedMaxDraftMs
                 val sizeScopedMs = it.wallBase.sizeScopedObservedMaxDraftMs
                 if (obsMaxMs != null && sizeScopedMs != null) (obsMaxMs - sizeScopedMs).coerceAtLeast(0L) else null
             },
@@ -1608,10 +1617,12 @@ class CaptureMetricsExcelExporter(
                     "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
                     "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
                     "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
-                    "(compare to beforeBacklogMs + beforeShutterElapsedMs). ceilingCrossSizeContaminationMs " +
-                    "(beforeObservedMaxDraftMs minus sizeScopedObservedMaxDraftMs) is how much a heavier other-size " +
-                    "draft inflates this capture's ceiling - the mixed-size over-pacing channel left after the point " +
-                    "prediction is made size-aware.",
+                    "(compare to beforeBacklogMs + beforeShutterElapsedMs). draftSequencePacingCrossSizeContaminationMs " +
+                    "(observedMaxDraftMs minus sizeScopedObservedMaxDraftMs) bounds how much a heavier other-size " +
+                    "draft can inflate this capture's ceiling - the mixed-size over-pacing channel left after the " +
+                    "point prediction is made size-aware; the pacer charges it only while this size is still cold. " +
+                    "Both maxima are reconstructed from the Draft timeline, not recorded on the decision, so a " +
+                    "capture missing a draft start/end pair is invisible to them.",
             ),
         )
 

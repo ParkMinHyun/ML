@@ -24,7 +24,7 @@ internal class CaptureAvailablePacingSession {
     /**
      * Latest draft-start snapshot the next [CaptureAvailablePacer.decideDelay] prices against; null until this
      * session's first draft start, which is what makes an idle pipeline answer "no delay". Only
-     * [startDraftSequence] writes it, so the stored prediction and the clock it rebased can never disagree.
+     * [updateDraftSequencePrediction] writes it, so the stored prediction and the clock it rebased can never disagree.
      */
     var pacingPrediction: CaptureAvailablePacingPrediction? = null
         private set
@@ -46,55 +46,11 @@ internal class CaptureAvailablePacingSession {
      */
     private var backlogEndTimeMs = 0L
 
-    /**
-     * Longest whole draft sequence measured this session over every size - the fallback a cold size prices by, and
-     * the value a decision reports. Derived from [maxDraftSequenceDurationMsBySize] rather than tracked on its own:
-     * the APM-fed maximum this replaced measured a wider span (the whole draft task, outside the draft process lock),
-     * so a cold size priced by a number tens of milliseconds above any wall the per-size map holds.
-     */
-    val maxDraftSequenceDurationMs: Long
-        get() = maxDraftSequenceDurationMsBySize.values.maxOrNull() ?: 0L
-
     val queuedDraftCount: Int get() = pendingDecisions.size
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
         get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
-
-    /** Records one completed draft's real duration against its own size; non-positive means no observation. */
-    fun observeDraftSequenceDuration(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
-        if (draftSequenceDurationMs <= 0L) {
-            return
-        }
-        maxDraftSequenceDurationMsBySize[sizeBucket] =
-            maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
-    }
-
-    /**
-     * Measured max duration to price [sizeBucket] by, fed by the draft pipeline at completion
-     * ([observeDraftSequenceDuration]) where both the size and the real duration are known. Reading the current
-     * draft's own size keeps a heavy other-size draft (a MP24 burst) from inflating a MP12 capture's reserve; a size
-     * not yet measured this session falls back to [maxDraftSequenceDurationMs], the heaviest size this session did
-     * measure - conservative for a genuinely cold size, exact once its own size has run.
-     */
-    fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
-        maxDraftSequenceDurationMsBySize[sizeBucket] ?: maxDraftSequenceDurationMs
-
-    /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
-    fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
-
-    /**
-     * Queues one admitted callback and advances the clock past the draft it admits. Everything is read back off the
-     * decision, so the clock can only ever advance by the delay and work that decision was actually built on.
-     */
-    fun admit(decision: CaptureAvailablePacingDecision) {
-        pendingDecisions.addLast(decision)
-        val prediction = decision.prediction
-        val draftWorkMs =
-            prediction.draftSequencePredictedDurationMs + prediction.draftSequenceOverheadDurationMs
-        backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) +
-            ceil(draftWorkMs).toLong()
-    }
 
     /**
      * Adopts the starting draft's prediction and rebases the clock onto it. Reuses the decision FIFO as the
@@ -105,7 +61,7 @@ internal class CaptureAvailablePacingSession {
      * A null [draftStartPrediction] is a draft with no predictable workloads (e.g. JPEG passthrough): it contributes
      * zero starting work and leaves the previous prediction standing, so the next pacing decision still has one.
      */
-    fun startDraftSequence(
+    fun updateDraftSequencePrediction(
         draftStartPrediction: CaptureAvailablePacingPrediction?,
     ): CaptureAvailablePacingDecision? {
         if (draftStartPrediction != null) {
@@ -118,4 +74,44 @@ internal class CaptureAvailablePacingSession {
         backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
         return gatingDecision
     }
+
+    /** Records one completed draft's real duration against its own size; non-positive means no observation. */
+    fun updateDraftSequenceDuration(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+        if (draftSequenceDurationMs <= 0L) {
+            return
+        }
+        maxDraftSequenceDurationMsBySize[sizeBucket] =
+            maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
+    }
+
+    /**
+     * Queues one decided callback - the [queuedDraftCount] and [queuedPredictedWorkMs] this adds to - and advances the
+     * clock past the draft it admits. Everything is read back off the decision, so the clock can only ever advance by
+     * the delay and work that decision was actually built on.
+     */
+    fun queueDecision(decision: CaptureAvailablePacingDecision) {
+        pendingDecisions.addLast(decision)
+        val prediction = decision.prediction
+        val draftWorkMs = prediction.draftSequencePredictedDurationMs + prediction.draftSequenceOverheadDurationMs
+        backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
+    }
+
+    /**
+     * Measured max duration to price [sizeBucket] by, fed by the draft pipeline at completion
+     * ([updateDraftSequenceDuration]) where both the size and the real duration are known. Reading the current
+     * draft's own size keeps a heavy other-size draft (a MP24 burst) from inflating a MP12 capture's reserve; a size
+     * not yet measured this session falls back to the heaviest size this session did measure - conservative for a
+     * genuinely cold size, exact once its own size has run.
+     *
+     * The APM-fed maximum this fallback replaced measured a wider span (the whole draft task, outside the draft
+     * process lock), so a cold size priced by a number tens of milliseconds above any wall the map holds.
+     */
+    fun getMaxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
+        maxDraftSequenceDurationMsBySize[sizeBucket]
+            ?: maxDraftSequenceDurationMsBySize.values.maxOrNull()
+            ?: 0L
+
+    /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
+    fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
+
 }

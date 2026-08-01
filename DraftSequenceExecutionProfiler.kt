@@ -48,7 +48,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         // Hands the pacer this capture's timeout deadline as early as the pipeline knows it - one profiler is built
         // when the capture is accepted, before its draft is queued, so before the callback that paces it is decided.
         // Absent only when onShutter never stamped one (delayed-shutter IPP), and then the pacer charges nothing.
-        captureMetrics.timeoutTimestampMs?.let(captureAvailablePacer::observeCaptureDeadline)
+        captureMetrics.timeoutTimestampMs?.let(captureAvailablePacer::setCaptureTimeoutMs)
     }
 
     /**
@@ -72,7 +72,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         )
         metricsRecorder.onDraftStart(
             gatingPacingDecision = gatingPacingDecision,
-            pacerSessionId = captureAvailablePacer.readCurrentSessionId(),
+            pacerSessionId = captureAvailablePacer.getCurrentSessionId(),
         )
 
         // Memory, thermal, and storage are observability inputs; only the timeout budget must stay fresh per node.
@@ -192,7 +192,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftWallMs)
         }
         // Keep the session's size-scoped duration estimate aligned to this completed draft.
-        captureAvailablePacer.observeDraftMeasured(sizeBucket, draftWallMs)
+        captureAvailablePacer.endDraftSequence(sizeBucket, draftWallMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
         val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
@@ -298,7 +298,7 @@ private class MetricsRecorder(
         captureMetrics.draftSequenceMetrics = draftSequenceMetrics
     }
 
-    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?, pacerSessionId: Long) {
+    fun onDraftStart(gatingPacingDecision: CaptureAvailablePacingDecision?, pacerSessionId: Long?) {
         synchronized(draftSequenceMetrics) {
             draftSequenceMetrics.draftStartUptimeMs = SystemClock.uptimeMillis()
             draftSequenceMetrics.pacerSessionId = pacerSessionId
