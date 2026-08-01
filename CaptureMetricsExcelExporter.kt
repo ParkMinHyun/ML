@@ -797,40 +797,46 @@ class CaptureMetricsExcelExporter(
         val before: CaptureAvailablePacingMetrics,
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
-        private val backlogBaseWithoutShutterElapsedMs =
+        private val backlogBaseWithoutShutterToDecisionMs =
             before.backlogMs + before.draftSequencePacingDurationMs - captureTimeoutMs
 
-        val inferredShutterElapsedMs: Long? = if (before.backlogDeficitMs > 0L) {
-            (before.backlogDeficitMs - ceil(backlogBaseWithoutShutterElapsedMs).toLong()).coerceAtLeast(0L)
+        val inferredShutterToDecisionMs: Long? = if (before.backlogDeficitMs > 0L) {
+            (before.backlogDeficitMs - ceil(backlogBaseWithoutShutterToDecisionMs).toLong()).coerceAtLeast(0L)
         } else {
             null
         }
 
-        /** Recorded runtime input wins; inference only covers rows persisted before the field existed. */
-        private val knownShutterElapsedMs: Long? =
-            before.shutterElapsedMs ?: inferredShutterElapsedMs
-        val shutterElapsedMinMs: Long = knownShutterElapsedMs ?: 0L
-        val shutterElapsedMaxMs: Long = knownShutterElapsedMs ?: floor(
+        /**
+         * The runtime records the window it had left; the spent part is its complement, which is what these diagnostics
+         * and the legacy columns are expressed in. Inference only covers rows persisted before the field existed.
+         */
+        val recordedShutterToDecisionMs: Long? =
+            before.timeToDeadlineMs?.let { timeToDeadlineMs -> captureTimeoutMs - timeToDeadlineMs }
+        private val knownShutterToDecisionMs: Long? =
+            recordedShutterToDecisionMs ?: inferredShutterToDecisionMs
+        val shutterToDecisionMinMs: Long = knownShutterToDecisionMs ?: 0L
+        val shutterToDecisionMaxMs: Long = knownShutterToDecisionMs ?: floor(
             (captureTimeoutMs - before.backlogMs - before.draftSequencePacingDurationMs).coerceAtLeast(0.0),
         ).toLong()
-        val shutterElapsedInference: String = when {
-            before.shutterElapsedMs != null -> PACING_SHUTTER_ELAPSED_RECORDED
-            inferredShutterElapsedMs != null -> PACING_SHUTTER_ELAPSED_EXACT
-            else -> PACING_SHUTTER_ELAPSED_BOUNDED
+        val shutterToDecisionInference: String = when {
+            recordedShutterToDecisionMs != null -> PACING_SHUTTER_TO_DECISION_RECORDED
+            inferredShutterToDecisionMs != null -> PACING_SHUTTER_TO_DECISION_EXACT
+            else -> PACING_SHUTTER_TO_DECISION_BOUNDED
         }
 
         val afterLevelDeficitMs: Long = computeLevelDeficitMs(
             draftSequenceBudgetMs = before.draftSequenceBudgetMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
+        // Least spent leaves the most window, which is the smallest deficit - so the bounds cross over here.
         val afterBacklogDeficitMinMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
-            shutterElapsedMs = shutterElapsedMinMs,
+            timeToDeadlineMs = captureTimeoutMs - shutterToDecisionMinMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
         val afterBacklogDeficitMaxMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
-            shutterElapsedMs = shutterElapsedMaxMs,
+            timeToDeadlineMs = captureTimeoutMs - shutterToDecisionMaxMs,
             draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
@@ -850,7 +856,7 @@ class CaptureMetricsExcelExporter(
         val delayDeltaMs: Long? = afterAppliedDelayMs?.minus(before.appliedDelayMs)
         val pacingChanged: Boolean? = afterAppliedDelayMs?.let { delayMs -> delayMs != before.appliedDelayMs }
         val replayStatus: String = when {
-            knownShutterElapsedMs != null -> PACING_REPLAY_EXACT
+            knownShutterToDecisionMs != null -> PACING_REPLAY_EXACT
             afterAppliedDelayMs != null -> PACING_REPLAY_BOUNDED_DETERMINISTIC
             else -> PACING_REPLAY_BOUNDED
         }
@@ -1134,9 +1140,9 @@ class CaptureMetricsExcelExporter(
         private const val AFTER_CORRECT_SKIP = "Correct Skip"
         private const val SESSION_BOUNDARY_PACER = "runtime pacer session id"
         private const val SESSION_BOUNDARY_TIMEOUT_PROXY = "timeout-delimited proxy"
-        private const val PACING_SHUTTER_ELAPSED_RECORDED = "Recorded runtime input"
-        private const val PACING_SHUTTER_ELAPSED_EXACT = "Exact from positive backlog deficit"
-        private const val PACING_SHUTTER_ELAPSED_BOUNDED = "Bounded because backlog deficit was zero"
+        private const val PACING_SHUTTER_TO_DECISION_RECORDED = "Recorded runtime input"
+        private const val PACING_SHUTTER_TO_DECISION_EXACT = "Exact from positive backlog deficit"
+        private const val PACING_SHUTTER_TO_DECISION_BOUNDED = "Bounded because backlog deficit was zero"
         private const val PACING_REPLAY_EXACT = "Exact"
         private const val PACING_REPLAY_BOUNDED_DETERMINISTIC = "Bounded input, deterministic delay"
         private const val PACING_REPLAY_BOUNDED = "Bounded delay"
@@ -1445,7 +1451,10 @@ class CaptureMetricsExcelExporter(
             Column("beforeQueuedPredictedWorkMs") {
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
             },
-            Column("beforeShutterElapsedMs") { it.row.pacingReplay?.before?.shutterElapsedMs },
+            // The runtime records the window it had left; report the spent complement, which every earlier export and
+            // the RQ3 aggregation are keyed on.
+            Column("beforeShutterToDecisionMs") { it.row.pacingReplay?.recordedShutterToDecisionMs },
+            Column("beforeTimeToDeadlineMs") { it.row.pacingReplay?.before?.timeToDeadlineMs },
             Column("beforeLevelDeficitMs") { it.row.pacingReplay?.before?.levelDeficitMs },
             Column("beforeBacklogDeficitMs") { it.row.pacingReplay?.before?.backlogDeficitMs },
             Column("beforeDominantDeficit") { it.row.pacingReplay?.beforeDominantDeficit },
@@ -1498,7 +1507,7 @@ class CaptureMetricsExcelExporter(
             },
             // Ground-truth pipeline wait this capture actually hit (draft start minus its release = decision + applied
             // delay): the real backlog to compare against the priced beforeBacklogMs +
-            // beforeShutterElapsedMs.
+            // beforeShutterToDecisionMs.
             Column("realQueueWaitMs") {
                 val draftStartMs = it.row.draftStartUptimeMs
                 val decisionMs = it.row.pacingReplay?.before?.decisionUptimeMs
@@ -1522,10 +1531,10 @@ class CaptureMetricsExcelExporter(
             },
             Column("") { "" },
             Column("captureTimeoutMs") { it.row.pacingReplay?.captureTimeoutMs },
-            Column("shutterElapsedInference") { it.row.pacingReplay?.shutterElapsedInference },
-            Column("inferredShutterElapsedMs") { it.row.pacingReplay?.inferredShutterElapsedMs },
-            Column("shutterElapsedMinMs") { it.row.pacingReplay?.shutterElapsedMinMs },
-            Column("shutterElapsedMaxMs") { it.row.pacingReplay?.shutterElapsedMaxMs },
+            Column("shutterToDecisionInference") { it.row.pacingReplay?.shutterToDecisionInference },
+            Column("inferredShutterToDecisionMs") { it.row.pacingReplay?.inferredShutterToDecisionMs },
+            Column("shutterToDecisionMinMs") { it.row.pacingReplay?.shutterToDecisionMinMs },
+            Column("shutterToDecisionMaxMs") { it.row.pacingReplay?.shutterToDecisionMaxMs },
             Column("afterReplayStatus") { it.row.pacingReplay?.replayStatus },
             Column("") { "" },
             Column("afterLevelDeficitMs") { it.row.pacingReplay?.afterLevelDeficitMs },
@@ -1561,12 +1570,12 @@ class CaptureMetricsExcelExporter(
             ),
             ReplayNote(
                 topic = "Pacing captureAvailable latency",
-                note = "the backlog deficit's pre-draft term is this capture's own onShutter-to-decision elapsed " +
-                    "(the timeout deadline is stamped at onShutter), read from the recorded runtime input " +
-                    "(beforeShutterElapsedMs) when present. " +
-                    "On legacy rows without it, a positive backlog deficit recovers it exactly; a zero " +
-                    "deficit only provides a min/max range, so after delay is reported as a range unless both bounds " +
-                    "produce the same result.",
+                note = "the backlog deficit measures queued work against the timeout window this capture had left at " +
+                    "the decision, recorded as beforeTimeToDeadlineMs. beforeShutterToDecisionMs is its complement - " +
+                    "the spent part of the window, which every earlier export is keyed on - so the two always sum to " +
+                    "captureTimeoutMs. On legacy rows carrying neither, a positive backlog deficit recovers the spent " +
+                    "part exactly; a zero deficit only provides a min/max range, so after delay is reported as a range " +
+                    "unless both bounds produce the same result.",
             ),
             ReplayNote(
                 topic = "Pacing prediction scope",
@@ -1617,7 +1626,7 @@ class CaptureMetricsExcelExporter(
                     "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
                     "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
                     "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
-                    "(compare to beforeBacklogMs + beforeShutterElapsedMs). draftSequencePacingCrossSizeContaminationMs " +
+                    "(compare to beforeBacklogMs + beforeShutterToDecisionMs). draftSequencePacingCrossSizeContaminationMs " +
                     "(observedMaxDraftMs minus sizeScopedObservedMaxDraftMs) bounds how much a heavier other-size " +
                     "draft can inflate this capture's ceiling - the mixed-size over-pacing channel left after the " +
                     "point prediction is made size-aware; the pacer charges it only while this size is still cold. " +

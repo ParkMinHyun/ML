@@ -45,9 +45,11 @@ NEAR_DEADLINE_FRACTION = 0.8
 
 PACING_REPLAY_COLUMNS = [
     "captureIndex", "captureTimeoutMs", "timeoutMarginMs",
-    "beforeBacklogMs", "beforeShutterElapsedMs", "realQueueWaitMs",
+    "beforeBacklogMs", "beforeShutterToDecisionMs", "realQueueWaitMs",
     "beforeDominantDeficit",
 ]
+# Workbooks exported before the pacer renamed this term still carry the old header.
+LEGACY_COLUMNS = {"beforeShutterElapsedMs": "beforeShutterToDecisionMs"}
 
 
 def pct_inc(values, quantile):
@@ -76,7 +78,7 @@ def load(arm):
     for name in ARMS[arm]:
         book = pd.ExcelFile(os.path.join(DATA_DIR, name))
         rq3 = book.parse("RQ3Pacing")
-        replay = book.parse("PacingReplay")[PACING_REPLAY_COLUMNS]
+        replay = book.parse("PacingReplay").rename(columns=LEGACY_COLUMNS)[PACING_REPLAY_COLUMNS]
         capture = book.parse("Capture")
         rq3["workbook"] = name
         capture["workbook"] = name
@@ -194,9 +196,9 @@ def decision_quality(window):
         result["delayOverQueueWaitP90"] = pct(ratio, 0.90)
         result["delayOverQueueWaitMax"] = float(ratio.max())
 
-    clock = window.dropna(subset=["realQueueWaitMs", "beforeBacklogMs", "beforeShutterElapsedMs"])
+    clock = window.dropna(subset=["realQueueWaitMs", "beforeBacklogMs", "beforeShutterToDecisionMs"])
     if len(clock) and float(clock["beforeBacklogMs"].abs().max()) > 0:
-        error = clock["beforeBacklogMs"] + clock["beforeShutterElapsedMs"] - clock["realQueueWaitMs"]
+        error = clock["beforeBacklogMs"] + clock["beforeShutterToDecisionMs"] - clock["realQueueWaitMs"]
         result.update(clockErrorP5Ms=pct(error, 0.05), clockErrorP50Ms=pct(error, 0.50),
                       clockErrorP95Ms=pct(error, 0.95),
                       clockUnderPredictPercent=100.0 * float((error < 0).mean()))

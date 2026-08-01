@@ -65,13 +65,16 @@ data class CaptureAvailablePacingMetrics(
     val backlogMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /** onShutter-to-decision elapsed the backlog deficit charged; null on rows persisted before recording. */
-    val shutterElapsedMs: Long?,
+    /**
+     * Timeout window left when the callback was paced - what the backlog deficit measured the queued work against.
+     * Null on rows persisted before it was recorded; offline replay then infers or brackets it.
+     */
+    val timeToDeadlineMs: Long?,
     val draftSequenceBudgetMs: Long,
     val draftSequencePredictedDurationMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
-    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingPrediction]. */
+    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingSnapshot]. */
     val draftSequencePacingDurationMs: Double,
     val draftSequenceKey: String,
 )

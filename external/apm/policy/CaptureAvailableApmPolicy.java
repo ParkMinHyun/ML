@@ -29,7 +29,7 @@ import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultDa
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecider;
-import com.samsung.android.camera.core2.ml.CaptureAvailablePacingPrediction;
+import com.samsung.android.camera.core2.ml.CaptureAvailablePacingSnapshot;
 import com.samsung.android.camera.core2.util.PLog;
 
 import java.util.List;
@@ -127,12 +127,12 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
         long appliedDelayMs = 0L;
         String reason = pacingDecider != null
-                ? "captureAvailable pacing waits for the first draft prediction"
+                ? "captureAvailable pacing waits for the first draft snapshot"
                 : "no pacing decider published - no pacing";
         String pacingDetails = ", maxDraftTime=" + maxDraftTimeMs + "ms, captureAvailableTime=" + captureAvailableTimeMs + "ms";
 
         if (pacingDecision != null) {
-            final CaptureAvailablePacingPrediction pacingPrediction = pacingDecision.getPrediction();
+            final CaptureAvailablePacingSnapshot pacingSnapshot = pacingDecision.getSnapshot();
 
             appliedDelayMs = pacingDecision.getDelayMs();
 
@@ -144,18 +144,18 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                 reason = "budget is enough";
             }
 
-            pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
-                    + ", draftSequencePredictedDuration=" + pacingPrediction.getDraftSequencePredictedDurationMs() + "ms"
-                    + ", draftSequenceOverheadDuration=" + pacingPrediction.getDraftSequenceOverheadDurationMs() + "ms"
-                    + ", draftSequencePacingDuration=" + pacingPrediction.getDraftSequencePacingDurationMs() + "ms"
+            pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
+                    + ", draftSequencePredictedDuration=" + pacingSnapshot.getDraftSequencePredictedDurationMs() + "ms"
+                    + ", draftSequenceOverheadDuration=" + pacingSnapshot.getDraftSequenceOverheadDurationMs() + "ms"
+                    + ", draftSequencePacingDuration=" + pacingSnapshot.getDraftSequencePacingDurationMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
-                    + ", draftSequenceKey=" + pacingPrediction.getDraftSequenceKey();
+                    + ", draftSequenceKey=" + pacingSnapshot.getDraftSequenceKey();
         }
 
         final boolean scheduled = singleThreadDelayedScheduler.schedule(runnable, appliedDelayMs);
         final String message = "[mhyun2.park] executeInternal(id:" + sequenceId + ") - " + reason
-                + ", pacingPredictionAvailable=" + (pacingDecision != null)
+                + ", pacingSnapshotAvailable=" + (pacingDecision != null)
                 + ", appliedDelay=" + appliedDelayMs + "ms"
                 + pacingDetails
                 + ", scheduled=" + scheduled;

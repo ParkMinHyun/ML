@@ -24,9 +24,9 @@ internal class CaptureAvailablePacingSession {
     /**
      * Latest draft-start snapshot the next [CaptureAvailablePacer.decideDelay] prices against; null until this
      * session's first draft start, which is what makes an idle pipeline answer "no delay". Only
-     * [updateDraftSequencePrediction] writes it, so the stored prediction and the clock it rebased can never disagree.
+     * [updatePacingSnapshot] writes it, so the stored snapshot and the clock it rebased can never disagree.
      */
-    var pacingPrediction: CaptureAvailablePacingPrediction? = null
+    var pacingSnapshot: CaptureAvailablePacingSnapshot? = null
         private set
 
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
@@ -34,7 +34,7 @@ internal class CaptureAvailablePacingSession {
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
-     * capture's point prediction plus the learned between-node overhead snapshotted into the pacing prediction,
+     * capture's point prediction plus the learned between-node overhead snapshotted into the pacing snapshot,
      * never by its draft-sequence duration estimate. The point sum alone under-prices real pipeline occupancy (it
      * omits the inter-node/deinit time), and that shortfall compounds with queue depth into a timeout; adding the
      * overhead prices each queued draft by its real occupancy. The duration estimate is still avoided here - summing
@@ -50,26 +50,26 @@ internal class CaptureAvailablePacingSession {
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
-        get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
+        get() = pendingDecisions.sumOf { it.snapshot.draftSequencePredictedDurationMs }
 
     /**
-     * Adopts the starting draft's prediction and rebases the clock onto it. Reuses the decision FIFO as the
+     * Adopts the starting draft's snapshot and rebases the clock onto it. Reuses the decision FIFO as the
      * admitted-work FIFO instead of maintaining a second queue: pops the admission this draft start consumes, then
      * restarts the clock from the draft starting now plus everything still queued behind it, each priced at its point
      * work plus one between-node overhead - so one overhead per queued draft, and one more for the starting draft.
      *
-     * A null [draftStartPrediction] is a draft with no predictable workloads (e.g. JPEG passthrough): it contributes
-     * zero starting work and leaves the previous prediction standing, so the next pacing decision still has one.
+     * A null [snapshot] is a draft with no predictable workloads (e.g. JPEG passthrough): it contributes zero starting
+     * work and leaves the previous snapshot standing, so the next pacing decision still has one.
      */
-    fun updateDraftSequencePrediction(
-        draftStartPrediction: CaptureAvailablePacingPrediction?,
+    fun updatePacingSnapshot(
+        snapshot: CaptureAvailablePacingSnapshot?,
     ): CaptureAvailablePacingDecision? {
-        if (draftStartPrediction != null) {
-            pacingPrediction = draftStartPrediction
+        if (snapshot != null) {
+            pacingSnapshot = snapshot
         }
         val gatingDecision = pendingDecisions.removeFirstOrNull()
-        val startingPredictedMs = draftStartPrediction?.draftSequencePredictedDurationMs ?: 0.0
-        val draftOverheadMs = pacingPrediction?.draftSequenceOverheadDurationMs ?: 0.0
+        val startingPredictedMs = snapshot?.draftSequencePredictedDurationMs ?: 0.0
+        val draftOverheadMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
         val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
         backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
         return gatingDecision
@@ -89,10 +89,10 @@ internal class CaptureAvailablePacingSession {
      * clock past the draft it admits. Everything is read back off the decision, so the clock can only ever advance by
      * the delay and work that decision was actually built on.
      */
-    fun queueDecision(decision: CaptureAvailablePacingDecision) {
+    fun queuePacingDecision(decision: CaptureAvailablePacingDecision) {
         pendingDecisions.addLast(decision)
-        val prediction = decision.prediction
-        val draftWorkMs = prediction.draftSequencePredictedDurationMs + prediction.draftSequenceOverheadDurationMs
+        val snapshot = decision.snapshot
+        val draftWorkMs = snapshot.draftSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
         backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
     }
 

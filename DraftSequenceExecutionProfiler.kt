@@ -48,7 +48,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         // Hands the pacer this capture's timeout deadline as early as the pipeline knows it - one profiler is built
         // when the capture is accepted, before its draft is queued, so before the callback that paces it is decided.
         // Absent only when onShutter never stamped one (delayed-shutter IPP), and then the pacer charges nothing.
-        captureMetrics.timeoutTimestampMs?.let(captureAvailablePacer::setCaptureTimeoutMs)
+        captureMetrics.timeoutTimestampMs?.let(captureAvailablePacer::setCaptureDeadlineMs)
     }
 
     /**
@@ -119,7 +119,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             workloadSequenceKey = workloadSequenceKey,
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
-            prediction = prediction,
+            snapshot = snapshot,
         )
     }
 

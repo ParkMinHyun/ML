@@ -33,7 +33,7 @@ backlog clock so that column stays comparable across arms.
 
 diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
 new file mode 100644
-index 0000000..4397080
+index 0000000..01bb460
 --- /dev/null
 +++ b/CaptureAvailableDelayPolicy.kt
 @@ -0,0 +1,105 @@
@@ -84,7 +84,7 @@ index 0000000..4397080
 +    val draftSequencePacingDurationMs: Double,
 +    val backlogMs: Long,
 +    val queuedDraftCount: Int,
-+    val shutterElapsedMs: Long,
++    val timeToDeadlineMs: Long,
 +)
 +
 +/**
@@ -132,7 +132,7 @@ index 0000000..4397080
 +        )
 +        val backlogDeficitMs = computeBacklogDeficitMs(
 +            backlogMs = input.backlogMs,
-+            shutterElapsedMs = input.shutterElapsedMs,
++            timeToDeadlineMs = input.timeToDeadlineMs,
 +            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
 +        )
 +        return CaptureAvailableDelayPolicyDecision(
@@ -199,7 +199,7 @@ index 0000000..1d98bb4
 +    }
 +}
 diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index d4a8b85..32cfd95 100644
+index 9961ed2..2b33d51 100644
 --- a/CaptureAvailablePacer.kt
 +++ b/CaptureAvailablePacer.kt
 @@ -24,9 +24,10 @@ fun interface CaptureAvailablePacingDecider {
@@ -215,7 +215,7 @@ index d4a8b85..32cfd95 100644
  
      /**
 @@ -51,12 +52,12 @@ class CaptureAvailablePacer(
-     private var latestCaptureTimeoutMs: Long? = null
+     private var latestCaptureDeadlineMs: Long? = null
  
      /**
 -     * Returns the larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same
@@ -223,36 +223,36 @@ index d4a8b85..32cfd95 100644
 +     * Asks the [delayPolicy] what this callback waits and queues the resulting decision as the admission record the
 +     * next draft start consumes.
       *
--     * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
--     * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
--     * the decision sits past it.
+-     * The backlog deficit prices the queued work against what is left of this capture's timeout window, which is
+-     * derived here rather than passed in: the pipeline stamps the deadline at onShutter, so how much remains is simply
+-     * how far that deadline still is from now.
 +     * The pacer still derives and reports what this capture's timeout window has already spent - the deadline was
 +     * stamped at onShutter, so the spent part is simply how far the decision sits past it - and still reports its own
 +     * admitted-backlog clock, so both stay comparable across policies. Only whether they are charged is the policy's.
       *
       * Opens the burst session when none is open - see [session] for why this is the only place that does. The very
-      * first callback of a burst then finds no prediction and answers "no delay", which is what leaves an idle pipeline
-@@ -70,22 +71,22 @@ class CaptureAvailablePacer(
+      * first callback of a burst then finds no snapshot and answers "no delay", which is what leaves an idle pipeline
+@@ -69,22 +70,22 @@ class CaptureAvailablePacer(
          val nowUptimeMs = SystemClock.uptimeMillis()
-         val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)
+         val timeToDeadlineMs = computeTimeToDeadlineMs(nowUptimeMs)
          val backlogMs = session.backlogMsAt(nowUptimeMs)
--        val draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs
+-        val draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs
 -        val levelDeficitMs = computeLevelDeficitMs(
--            draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
+-            draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 -        )
 -        val backlogDeficitMs = computeBacklogDeficitMs(
 -            backlogMs = backlogMs,
--            shutterElapsedMs = shutterElapsedMs,
+-            timeToDeadlineMs = timeToDeadlineMs,
 -            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
 +        val policyDecision = delayPolicy.decide(
 +            CaptureAvailableDelayPolicyInput(
 +                decisionUptimeMs = nowUptimeMs,
-+                draftSequenceBudgetMs = prediction.draftSequenceBudgetMs,
-+                draftSequencePacingDurationMs = prediction.draftSequencePacingDurationMs,
++                draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
++                draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs,
 +                backlogMs = backlogMs,
 +                queuedDraftCount = session.queuedDraftCount,
-+                shutterElapsedMs = shutterElapsedMs,
++                timeToDeadlineMs = timeToDeadlineMs,
 +            ),
          )
  
@@ -266,30 +266,30 @@ index d4a8b85..32cfd95 100644
 +            backlogDeficitMs = policyDecision.backlogDeficitMs,
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
-             shutterElapsedMs = shutterElapsedMs,
-@@ -108,7 +109,9 @@ class CaptureAvailablePacer(
+             timeToDeadlineMs = timeToDeadlineMs,
+@@ -107,7 +108,9 @@ class CaptureAvailablePacer(
      fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
          val session = session ?: return null
          if (plannedSequenceKey == null) {
--            return session.updateDraftSequencePrediction(null)
+-            return session.updatePacingSnapshot(null)
 +            val startUptimeMs = SystemClock.uptimeMillis()
-+            return session.updateDraftSequencePrediction(null, startUptimeMs)
++            return session.updatePacingSnapshot(null, startUptimeMs)
 +                .also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
          }
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
          val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
-@@ -126,6 +129,10 @@ class CaptureAvailablePacer(
+@@ -125,6 +128,10 @@ class CaptureAvailablePacer(
              predictor.estimateDraftSequenceWallMs(draftSequenceKey),
          )
  
-+        // Read after the prediction work, where the session used to read it: one "now" now serves both the clock
++        // Read after the snapshot work, where the session used to read it: one "now" now serves both the clock
 +        // rebase and the delay policy's queue-wait measurement, so a policy cannot measure a wait the clock never
 +        // charged, and the clock base is unchanged from before the policy seam existed.
 +        val startUptimeMs = SystemClock.uptimeMillis()
-         return session.updateDraftSequencePrediction(
-             CaptureAvailablePacingPrediction(
+         return session.updatePacingSnapshot(
+             CaptureAvailablePacingSnapshot(
                  draftSequenceBudgetMs = budgetMs,
-@@ -134,7 +141,8 @@ class CaptureAvailablePacer(
+@@ -133,7 +140,8 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
@@ -299,7 +299,7 @@ index d4a8b85..32cfd95 100644
      }
  
      /**
-@@ -144,6 +152,7 @@ class CaptureAvailablePacer(
+@@ -143,6 +151,7 @@ class CaptureAvailablePacer(
      @Synchronized
      fun endDraftSequence(sizeBucket: SizeBucket, draftWallMs: Long) {
          session?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
@@ -307,7 +307,7 @@ index d4a8b85..32cfd95 100644
      }
  
      /**
-@@ -168,6 +177,16 @@ class CaptureAvailablePacer(
+@@ -167,6 +176,16 @@ class CaptureAvailablePacer(
      @Synchronized
      fun clear() {
          session = null
@@ -324,7 +324,7 @@ index d4a8b85..32cfd95 100644
      }
  
      /**
-@@ -184,10 +203,10 @@ class CaptureAvailablePacer(
+@@ -189,10 +208,10 @@ class CaptureAvailablePacer(
  }
  
  /**
@@ -340,20 +340,20 @@ index d4a8b85..32cfd95 100644
  internal fun computeLevelDeficitMs(
      draftSequenceBudgetMs: Long,
 diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
-index 49e525b..0cf808b 100644
+index c9caac7..ae14059 100644
 --- a/CaptureAvailablePacingSession.kt
 +++ b/CaptureAvailablePacingSession.kt
 @@ -63,6 +63,7 @@ internal class CaptureAvailablePacingSession {
       */
-     fun updateDraftSequencePrediction(
-         draftStartPrediction: CaptureAvailablePacingPrediction?,
+     fun updatePacingSnapshot(
+         snapshot: CaptureAvailablePacingSnapshot?,
 +        startUptimeMs: Long,
      ): CaptureAvailablePacingDecision? {
-         if (draftStartPrediction != null) {
-             pacingPrediction = draftStartPrediction
+         if (snapshot != null) {
+             pacingSnapshot = snapshot
 @@ -71,7 +72,7 @@ internal class CaptureAvailablePacingSession {
-         val startingPredictedMs = draftStartPrediction?.draftSequencePredictedDurationMs ?: 0.0
-         val draftOverheadMs = pacingPrediction?.draftSequenceOverheadDurationMs ?: 0.0
+         val startingPredictedMs = snapshot?.draftSequencePredictedDurationMs ?: 0.0
+         val draftOverheadMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
          val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
 -        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
 +        backlogEndTimeMs = startUptimeMs + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
@@ -361,7 +361,7 @@ index 49e525b..0cf808b 100644
      }
  
 diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
-index 6096bef..d41d985 100644
+index a70b0e6..8b3ad90 100644
 --- a/CaptureMetricsExcelExporter.kt
 +++ b/CaptureMetricsExcelExporter.kt
 @@ -66,6 +66,7 @@ class CaptureMetricsExcelExporter(
@@ -405,7 +405,7 @@ index 6096bef..d41d985 100644
                      runId = runId,
                      shotCount = run.size,
                      startingOverheatLevel = startingOverheatLevel,
-@@ -1278,6 +1284,7 @@ class CaptureMetricsExcelExporter(
+@@ -1284,6 +1290,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3PacingColumns(): List<Column<Rq3CaptureRow>> = listOf(
              Column("deviceModel") { it.deviceModel },
@@ -413,7 +413,7 @@ index 6096bef..d41d985 100644
              Column("runId") { it.runId },
              Column("runShotIndex") { it.runShotIndex },
              Column("runShotCount") { it.runShotCount },
-@@ -1346,6 +1353,7 @@ class CaptureMetricsExcelExporter(
+@@ -1352,6 +1359,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3SummaryColumns(): List<Column<Rq3RunSummary>> = listOf(
              Column("deviceModel") { it.deviceModel },
@@ -421,7 +421,7 @@ index 6096bef..d41d985 100644
              Column("runId") { it.runId },
              Column("shotCount") { it.shotCount },
              Column("isComplete30ShotRun") { it.shotCount == RQ3_TARGET_SHOT_COUNT },
-@@ -1608,6 +1616,13 @@ class CaptureMetricsExcelExporter(
+@@ -1617,6 +1625,13 @@ class CaptureMetricsExcelExporter(
                  note = "RQ3Summary reports P50 and P95 over positive transition delays using Excel PERCENTILE.INC " +
                      "interpolation. deviceModel is the runtime Build.MODEL value.",
              ),
@@ -892,7 +892,7 @@ index 0000000..7dbffc1
 +gate = pd.to_numeric(npac.controllerQueuedDraftCount, errors="coerce").fillna(0)
 +print(f"  transitions with a non-empty queue: {(gate > 0).mean() * 100:.1f}%")
 diff --git a/data/rq3_aggregate.py b/data/rq3_aggregate.py
-index 1c4a383..eb7a2ae 100644
+index 785bcc7..c02dcf3 100644
 --- a/data/rq3_aggregate.py
 +++ b/data/rq3_aggregate.py
 @@ -26,15 +26,29 @@ from scipy.stats import mannwhitneyu
@@ -927,7 +927,7 @@ index 1c4a383..eb7a2ae 100644
  START_LEVEL = 3
  WINDOW = 30                   # shots 1..30
  TRANSITIONS = WINDOW - 1      # delay on shot i gates shot i+1
-@@ -265,6 +279,15 @@ def main():
+@@ -267,6 +281,15 @@ def main():
      os.makedirs(OUT_DIR, exist_ok=True)
      results, runs = {}, {}
      for arm in ARMS:
@@ -943,7 +943,7 @@ index 1c4a383..eb7a2ae 100644
          rq3, capture = load(arm)
          window, audit = select_runs(rq3)
          summary = summarize(window)
-@@ -283,35 +306,39 @@ def main():
+@@ -285,35 +308,39 @@ def main():
          print(runs[arm].round(1).to_string())
          per_shot(window).to_csv(os.path.join(OUT_DIR, f"{arm}.csv"), index=False, lineterminator="\n")
  
@@ -1004,7 +1004,7 @@ index 1c4a383..eb7a2ae 100644
          json.dump(payload, handle, indent=2, default=float)
          handle.write("\n")
 diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
-index 81af6e7..a522b83 100644
+index 0e72879..22ee384 100644
 --- a/external/apm/policy/CaptureAvailableApmPolicy.java
 +++ b/external/apm/policy/CaptureAvailableApmPolicy.java
 @@ -141,7 +141,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
@@ -1015,7 +1015,7 @@ index 81af6e7..a522b83 100644
 +                reason = "the selected pacing policy asked for no delay";
              }
  
-             pacingDetails += ", draftSequenceBudget=" + pacingPrediction.getDraftSequenceBudgetMs() + "ms"
+             pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
 diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
 index ad17d4f..5025134 100644
 --- a/external/draftSaving/SavingDraftImageTaskManager.java

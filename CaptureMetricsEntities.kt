@@ -102,8 +102,8 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "queued_predicted_work_ms")
     val queuedPredictedWorkMs: Double,
 
-    @ColumnInfo(name = "shutter_elapsed_ms")
-    val shutterElapsedMs: Long?,
+    @ColumnInfo(name = "time_to_deadline_ms")
+    val timeToDeadlineMs: Long?,
 
     @ColumnInfo(name = "draft_sequence_budget_ms")
     val draftSequenceBudgetMs: Long,
