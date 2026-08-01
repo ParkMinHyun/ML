@@ -236,7 +236,7 @@ index 313e684..890a42a 100644
          return session.startDraftSequence(
              CaptureAvailablePacingPrediction(
                  draftSequenceBudgetMs = budgetMs,
-@@ -79,17 +86,17 @@ class CaptureAvailablePacer(
+@@ -79,16 +86,17 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
@@ -246,11 +246,10 @@ index 313e684..890a42a 100644
      }
  
      /**
--     * Records the APM-observed draft duration (non-positive means no observation), then returns the larger of the
--     * current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is queued as the
--     * admission record consumed by the next draft start.
-+     * Records the APM-observed draft duration (non-positive means no observation), asks the [delayPolicy] what this
-+     * callback waits, and queues the resulting decision as the admission record the next draft start consumes.
+-     * Returns the larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same
+-     * decision is queued as the admission record consumed by the next draft start.
++     * Asks the [delayPolicy] what this callback waits and queues the resulting decision as the admission record the
++     * next draft start consumes.
       *
 -     * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
 -     * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
@@ -260,7 +259,7 @@ index 313e684..890a42a 100644
 +     * admitted-backlog clock, so both stay comparable across policies. Only whether they are charged is the policy's.
       */
      @Synchronized
-     override fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision? {
+     override fun decideDelay(): CaptureAvailablePacingDecision? {
 @@ -100,22 +107,22 @@ class CaptureAvailablePacer(
          val nowUptimeMs = SystemClock.uptimeMillis()
          val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)

@@ -54,8 +54,8 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * Reads the whole draft-task times and capture-available latency the {@link ProcessingResultData} repository
-     * collected. The max draft time (not a mean) feeds the pacer's draft-sequence duration estimate; a mean would
-     * lag a rising thermal trend and let the queue overrun.
+     * collected. Both are logged only: the pacer prices its own maxima off the draft walls the pipeline measures,
+     * which exclude the draft-task time spent outside the draft process lock that these carry.
      */
     private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
             new CaptureAvailableData(
@@ -123,7 +123,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
         }
 
         final CaptureAvailablePacingDecision pacingDecision =
-                pacingDecider != null ? pacingDecider.decideDelay(maxDraftTimeMs) : null;
+                pacingDecider != null ? pacingDecider.decideDelay() : null;
 
         long appliedDelayMs = 0L;
         String reason = pacingDecider != null
@@ -197,14 +197,15 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
     /**
      * <div class="camera_en">
-     * Snapshot the pacer reads each callback: the max of the recorded whole draft-task times (measured outside the
-     * draft process lock) and the capture-available latency. Max, not mean, so a rising thermal trend is not
-     * averaged away.
+     * Log snapshot taken each callback: the max of the recorded whole draft-task times (measured outside the draft
+     * process lock) and the capture-available latency. Max, not mean, so a rising thermal trend is not averaged away.
+     * The pacing decision itself no longer reads either - it prices by the draft walls the pipeline measures.
      * </div>
      *
      * <div class="camera_kr" style="display:none;">
-     * pacer가 콜백마다 읽는 스냅샷: 기록된 draft task 전체 시간(draft process lock 밖 측정)의 최댓값과
+     * 콜백마다 찍는 로그 스냅샷: 기록된 draft task 전체 시간(draft process lock 밖 측정)의 최댓값과
      * capture-available 지연. 평균이 아니라 max라 상승하는 thermal 추세가 평균으로 희석되지 않습니다.
+     * pacing 결정 자체는 둘 다 읽지 않고, 파이프라인이 측정한 draft wall로 가격을 매깁니다.
      * </div>
      */
     private static class CaptureAvailableData {

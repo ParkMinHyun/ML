@@ -5,21 +5,21 @@ import com.samsung.android.camera.core2.maker.MakerFeature
 import kotlin.math.ceil
 
 /**
- * The one call CaptureAvailableApmPolicy exchanges with the draft pipeline: it hands over the timings it observed
- * and receives back the delay decision data. Deliberately a single method - reading the admitted backlog against
- * "now", computing the delay, and recording the admission for the next draft start must happen under one lock, or
- * concurrent captureAvailable callbacks would double-admit against a stale backlog.
+ * The one call CaptureAvailableApmPolicy exchanges with the draft pipeline: it asks for the delay decision data.
+ * Deliberately a single method - reading the admitted backlog against "now", computing the delay, and recording the
+ * admission for the next draft start must happen under one lock, or concurrent captureAvailable callbacks would
+ * double-admit against a stale backlog.
  *
- * The observed draft duration is the one timing only the APM side knows; everything else the decision needs is
- * pipeline-owned state the pacer already holds.
+ * Takes nothing: every timing the decision needs is pipeline-owned state the pacer already holds, measured where the
+ * draft actually ran rather than around the whole draft task.
  */
 fun interface CaptureAvailablePacingDecider {
-    fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision?
+    fun decideDelay(): CaptureAvailablePacingDecision?
 }
 
 /**
  * Paces captureAvailable callbacks for one burst session. Draft starts refresh the draft-sequence duration estimate,
- * observed APM timings update the session maxima, and each admission is paired with the next draft start through one
+ * completed drafts update the session maxima, and each admission is paired with the next draft start through one
  * FIFO.
  * Asks the [DraftSequenceAdmissionPolicy] which sequence key a planned one becomes in this session's plan.
  * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
@@ -83,19 +83,16 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * Records the APM-observed draft duration (non-positive means no observation), then returns the larger of the
-     * current draft-budget deficit and the admitted-backlog timeout deficit. The same decision is queued as the
-     * admission record consumed by the next draft start.
+     * Returns the larger of the current draft-budget deficit and the admitted-backlog timeout deficit. The same
+     * decision is queued as the admission record consumed by the next draft start.
      *
      * The backlog deficit additionally charges what this capture's timeout window has already spent by now, which is
      * derived here rather than passed in: the deadline was stamped at onShutter, so the spent part is simply how far
      * the decision sits past it.
      */
     @Synchronized
-    override fun decideDelay(draftSequenceDurationMs: Long): CaptureAvailablePacingDecision? {
+    override fun decideDelay(): CaptureAvailablePacingDecision? {
         val session = activeSession()
-        session.observeMaxDraftSequenceDuration(draftSequenceDurationMs)
-
         val prediction = session.pacingPrediction ?: return null
         val nowUptimeMs = SystemClock.uptimeMillis()
         val shutterElapsedMs = computeShutterElapsedMs(nowUptimeMs)
@@ -227,7 +224,10 @@ data class CaptureAvailablePacingDecision(
     val queuedPredictedWorkMs: Double,
     /** This capture's onShutter-to-decision elapsed - the timeout window already spent when it was paced. */
     val shutterElapsedMs: Long,
-    /** Session max measured draft sequence duration at decision time, before re-projection onto the demoted shape. */
+    /**
+     * Session max measured draft wall at decision time, over every size, before re-projection onto the demoted shape.
+     * Compare to the size-scoped max the metrics reconstruct offline: the gap is the cross-size reserve inflation.
+     */
     val maxDraftSequenceDurationMs: Long,
     val decisionUptimeMs: Long,
     val prediction: CaptureAvailablePacingPrediction,

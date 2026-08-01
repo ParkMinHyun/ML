@@ -46,22 +46,20 @@ internal class CaptureAvailablePacingSession {
      */
     private var backlogEndTimeMs = 0L
 
-    /** Longest whole draft sequence measured this session, over every size - the fallback a cold size prices by. */
-    var maxDraftSequenceDurationMs = 0L
-        private set
+    /**
+     * Longest whole draft sequence measured this session over every size - the fallback a cold size prices by, and
+     * the value a decision reports. Derived from [maxDraftSequenceDurationMsBySize] rather than tracked on its own:
+     * the APM-fed maximum this replaced measured a wider span (the whole draft task, outside the draft process lock),
+     * so a cold size priced by a number tens of milliseconds above any wall the per-size map holds.
+     */
+    val maxDraftSequenceDurationMs: Long
+        get() = maxDraftSequenceDurationMsBySize.values.maxOrNull() ?: 0L
 
     val queuedDraftCount: Int get() = pendingDecisions.size
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
         get() = pendingDecisions.sumOf { it.prediction.draftSequencePredictedDurationMs }
-
-    /** Raises the size-agnostic maximum by one capture's APM-observed duration; non-positive means no observation. */
-    fun observeMaxDraftSequenceDuration(draftSequenceDurationMs: Long) {
-        if (draftSequenceDurationMs > 0L) {
-            maxDraftSequenceDurationMs = maxOf(maxDraftSequenceDurationMs, draftSequenceDurationMs)
-        }
-    }
 
     /** Records one completed draft's real duration against its own size; non-positive means no observation. */
     fun observeDraftSequenceDuration(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
@@ -76,8 +74,8 @@ internal class CaptureAvailablePacingSession {
      * Measured max duration to price [sizeBucket] by, fed by the draft pipeline at completion
      * ([observeDraftSequenceDuration]) where both the size and the real duration are known. Reading the current
      * draft's own size keeps a heavy other-size draft (a MP24 burst) from inflating a MP12 capture's reserve; a size
-     * not yet measured this session falls back to the size-agnostic max - conservative for a genuinely cold size,
-     * exact once its own size has run.
+     * not yet measured this session falls back to [maxDraftSequenceDurationMs], the heaviest size this session did
+     * measure - conservative for a genuinely cold size, exact once its own size has run.
      */
     fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
         maxDraftSequenceDurationMsBySize[sizeBucket] ?: maxDraftSequenceDurationMs
