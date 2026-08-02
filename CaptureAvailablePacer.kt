@@ -85,21 +85,27 @@ class CaptureAvailablePacer(
     ): CaptureAvailablePacingDecision? {
         val session = captureAvailablePacingSession ?: return null
         if (workloadSequenceKey == null) {
-            return session.updatePacingSnapshot(null)
+            return session.dequeuePacingDecision(null)
         }
         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(workloadSequenceKey)
-        val draftSequenceReservedDurationMs = session.reserveDraftSequenceDurationMs(
-            workloadSequenceKey.headWorkloadKey.sizeBucket,
-            predictor.estimateDemotedWorkloadDurationMs(workloadSequenceKey, draftSequenceKey),
+        // The burst's measured max was measured on undemoted drafts, so drop what demotion took out of this one, and
+        // floor it by the whole-draft estimate - all a burst's first capture has, and the same occupancy the backlog
+        // clock charges per queued draft, which the node point sum alone would under-price.
+        val maxDraftSequenceDurationMs =
+            session.getMaxDraftSequenceDurationMs(workloadSequenceKey.headWorkloadKey.sizeBucket)
+        val demotedWorkloadPredictedDurationMs =
+            predictor.estimateDemotedWorkloadDurationMs(workloadSequenceKey, draftSequenceKey)
+        val draftSequenceReservedDurationMs = maxOf(
+            maxDraftSequenceDurationMs - demotedWorkloadPredictedDurationMs,
             predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
         )
 
-        return session.updatePacingSnapshot(
+        return session.dequeuePacingDecision(
             CaptureAvailablePacingSnapshot(
                 draftSequenceKey = draftSequenceKey.toReplayString(),
                 draftSequenceBudgetMs = budgetMs,
-                draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
+                draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
                 workloadSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey),
             ),
         )
@@ -119,7 +125,7 @@ class CaptureAvailablePacer(
      */
     @Synchronized
     fun setCaptureDeadlineMs(timeoutTimestampMs: Long) {
-        captureAvailablePacingSession?.updateCaptureDeadlineMs(timeoutTimestampMs)
+        captureAvailablePacingSession?.updateBacklogDeadlineMs(timeoutTimestampMs)
     }
 
     /**

@@ -2,30 +2,6 @@ package com.samsung.android.camera.core2.ml
 
 import com.samsung.android.camera.watermark.Watermark.WatermarkType
 
-/** Workload groups admitted or demoted as one unit; a demotion sticks until [DraftSequenceAdmissionPolicy.clear]. */
-enum class AdmissionGroup {
-    /** Depth-driven rendering of the image itself. */
-    PORTRAIT,
-
-    /** Looks laid over the finished image: Filter and Overlay Watermark, plus the Decoding they need. */
-    DECORATION,
-    ;
-
-    companion object {
-        /**
-         * Admission group the workload belongs to. Membership only - admission exceptions (FRAME watermark,
-         * Decoding forced by Frame Watermark) are [DraftSequenceAdmissionPolicy] rules, not group boundaries.
-         */
-        fun of(workloadKey: WorkloadKey): AdmissionGroup? {
-            return when (workloadKey) {
-                is WorkloadKey.Bokeh -> PORTRAIT
-                is WorkloadKey.Decoding, is WorkloadKey.Filter, is WorkloadKey.Watermark -> DECORATION
-                is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> null
-            }
-        }
-    }
-}
-
 /**
  * Session-sticky admission rules for draft workloads: the product-rule layer between the Predictor's model admits
  * and what actually runs. The first in-session rejection of [AdmissionGroup.PORTRAIT] (Bokeh), or of the
@@ -46,23 +22,16 @@ class DraftSequenceAdmissionPolicy {
         if (workloadKey is WorkloadKey.Decoding && hasFrameWatermark) {
             return true
         }
-        return when (workloadKey) {
-            is WorkloadKey.Bokeh ->
-                admitWithDemotion(AdmissionGroup.PORTRAIT, modelAdmit)
-            is WorkloadKey.Decoding, is WorkloadKey.Filter ->
-                admitWithDemotion(AdmissionGroup.DECORATION, modelAdmit)
-            is WorkloadKey.Watermark -> if (workloadKey.watermarkType == WatermarkType.FRAME) {
-                modelAdmit
-            } else {
-                modelAdmit && AdmissionGroup.DECORATION !in demotedGroups
-            }
-            is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> modelAdmit
+        if (isDemotedWorkload(workloadKey, hasFrameWatermark)) {
+            return false
         }
+        // Overlay Watermark is the DECORATION chain's OPTIONAL tail: rejecting it drops itself, not the whole group.
+        if (modelAdmit || workloadKey is WorkloadKey.Watermark) {
+            return modelAdmit
+        }
+        AdmissionGroup.of(workloadKey)?.let { demotedGroups += it }
+        return false
     }
-
-    /** Returns whether the group is already demoted in this burst session. */
-    @Synchronized
-    fun isDemoted(group: AdmissionGroup): Boolean = group in demotedGroups
 
     /** What this burst will actually run: [workloadSequenceKey] minus the workloads whose group is demoted. */
     @Synchronized
@@ -71,17 +40,9 @@ class DraftSequenceAdmissionPolicy {
             return workloadSequenceKey
         }
 
-        val portraitDemoted = AdmissionGroup.PORTRAIT in demotedGroups
-        val decorationDemoted = AdmissionGroup.DECORATION in demotedGroups
-        val hasFrameWatermark = decorationDemoted && workloadSequenceKey.hasFrameWatermark()
+        val hasFrameWatermark = workloadSequenceKey.hasFrameWatermark()
         val draftWorkloadKeys = workloadSequenceKey.workloadKeys.filterNot { workloadKey ->
-            when (workloadKey) {
-                is WorkloadKey.Bokeh -> portraitDemoted
-                is WorkloadKey.Filter -> decorationDemoted
-                is WorkloadKey.Watermark -> decorationDemoted && workloadKey.watermarkType != WatermarkType.FRAME
-                is WorkloadKey.Decoding -> decorationDemoted && !hasFrameWatermark
-                is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> false
-            }
+            isDemotedWorkload(workloadKey, hasFrameWatermark)
         }
         return if (draftWorkloadKeys.isEmpty()) {
             workloadSequenceKey
@@ -90,19 +51,54 @@ class DraftSequenceAdmissionPolicy {
         }
     }
 
+    /** Returns whether the group is already demoted in this burst session. */
+    @Synchronized
+    fun isDemoted(group: AdmissionGroup): Boolean = group in demotedGroups
+
+    /**
+     * Whether the sticky demotions take this workload out of the burst. Frame Watermark and the Decoding it forces
+     * are the chain's REQUIRED members and stay in regardless of their group.
+     */
+    private fun isDemotedWorkload(workloadKey: WorkloadKey, hasFrameWatermark: Boolean): Boolean {
+        val requiredByFrameWatermark = when (workloadKey) {
+            is WorkloadKey.Decoding -> hasFrameWatermark
+            is WorkloadKey.Watermark -> workloadKey.watermarkType == WatermarkType.FRAME
+            is WorkloadKey.Bokeh, is WorkloadKey.Filter,
+            is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> false
+        }
+        if (requiredByFrameWatermark) {
+            return false
+        }
+        val group = AdmissionGroup.of(workloadKey) ?: return false
+        return group in demotedGroups
+    }
+
     /** Clears the sticky demotions when the burst session ends. */
     @Synchronized
     fun clear() {
         demotedGroups.clear()
     }
+}
 
-    private fun admitWithDemotion(group: AdmissionGroup, modelAdmit: Boolean): Boolean {
-        if (group in demotedGroups) {
-            return false
+/** Workload groups admitted or demoted as one unit; a demotion sticks until [DraftSequenceAdmissionPolicy.clear]. */
+enum class AdmissionGroup {
+    /** Depth-driven rendering of the image itself. */
+    PORTRAIT,
+
+    /** Looks laid over the finished image: Filter and Overlay Watermark, plus the Decoding they need. */
+    DECORATION;
+
+    companion object {
+        /**
+         * Admission group the workload belongs to. Membership only - admission exceptions (FRAME watermark,
+         * Decoding forced by Frame Watermark) are [DraftSequenceAdmissionPolicy] rules, not group boundaries.
+         */
+        fun of(workloadKey: WorkloadKey): AdmissionGroup? {
+            return when (workloadKey) {
+                is WorkloadKey.Bokeh -> PORTRAIT
+                is WorkloadKey.Decoding, is WorkloadKey.Filter, is WorkloadKey.Watermark -> DECORATION
+                is WorkloadKey.DynamicFunction, is WorkloadKey.Encoding -> null
+            }
         }
-        if (!modelAdmit) {
-            demotedGroups += group
-        }
-        return modelAdmit
     }
 }

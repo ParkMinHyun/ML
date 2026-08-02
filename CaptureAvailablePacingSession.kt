@@ -20,9 +20,9 @@ internal class CaptureAvailablePacingSession {
     val createdUptimeMs: Long = SystemClock.uptimeMillis()
 
     /**
-     * Latest draft-start snapshot the next [CaptureAvailablePacer.decideDelay] prices against; null until this burst's
-     * first draft start, which is what makes an idle pipeline answer "no delay". Only [updatePacingSnapshot] writes it,
-     * so the snapshot and the clock it rebased cannot disagree.
+     * What the next [CaptureAvailablePacer.decideDelay] prices against; null until this burst's first dequeue, which is
+     * what makes an idle pipeline answer "no delay". Only [dequeuePacingDecision] writes it, so the snapshot and the
+     * clock it rebased cannot disagree.
      */
     var pacingSnapshot: CaptureAvailablePacingSnapshot? = null
         private set
@@ -43,14 +43,15 @@ internal class CaptureAvailablePacingSession {
     private var backlogEndTimeMs = 0L
 
     /**
-     * Timeout deadline of the newest capture the pipeline has committed - what [timeToDeadlineMsAt] counts down to. It
-     * is stamped as the capture is taken in, so it always names the capture whose work entered the backlog last, which
-     * is what [computeBacklogDeficitMs] must price against; a later stamping point (a draft start) would leave it
-     * naming the queue's head instead. Absent until this burst's first committed capture stamps one (delayed-shutter
-     * IPP captures never do), and scoped to the session because a deadline outliving its burst survives only as a past
-     * instant - which would price the next burst's backlog against no window at all.
+     * When the admitted backlog has to be gone, against [backlogEndTimeMs]'s estimate of when it will be - the pair
+     * [computeBacklogDeficitMs] prices. Fed by the pipeline at every capture it commits, so it tracks the newest one:
+     * the deadline of whatever entered the backlog last, which is the one the whole queue has to fit inside.
+     *
+     * Absent until this burst's first committed capture brings one (delayed-shutter IPP captures never do), and gone
+     * with the session, since a deadline outliving its burst survives only as a past instant - which would price the
+     * next burst's backlog against no window at all.
      */
-    private var latestCaptureDeadlineMs: Long? = null
+    private var backlogDeadlineMs: Long? = null
 
     val queuedDraftCount: Int get() = pendingDecisions.size
 
@@ -59,23 +60,34 @@ internal class CaptureAvailablePacingSession {
         get() = pendingDecisions.sumOf { it.snapshot.workloadSequencePredictedDurationMs }
 
     /**
-     * Adopts the starting draft's snapshot and rebases the clock onto it. The decision FIFO doubles as the admitted
-     * work queue rather than a second one: pop the admission this draft start consumes, then restart the clock from the
-     * draft starting now plus everything still queued behind it, one between-node overhead each. A null [snapshot]
-     * (JPEG passthrough) adds no starting work and leaves the previous snapshot standing.
+     * Pairs with [queuePacingDecision]: hands back the oldest queued decision, adopts [snapshot] as what the next one
+     * is priced with, and rebases the clock. All three at once because the decision FIFO doubles as the admitted work
+     * queue - a pop that skipped the rebase would leave the clock counting work that has already left the queue.
+     *
+     * A null [snapshot] is a draft with no predictable workloads (JPEG passthrough): it leaves the previous snapshot
+     * standing and brings no point work of its own, though it still occupies the pipeline for one overhead.
      */
-    fun updatePacingSnapshot(
+    fun dequeuePacingDecision(
         snapshot: CaptureAvailablePacingSnapshot?,
     ): CaptureAvailablePacingDecision? {
         if (snapshot != null) {
             pacingSnapshot = snapshot
         }
         val gatingDecision = pendingDecisions.removeFirstOrNull()
-        val startingPredictedMs = snapshot?.workloadSequencePredictedDurationMs ?: 0.0
-        val draftOverheadMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
-        val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
-        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
+        rebaseBacklogClock(snapshot?.workloadSequencePredictedDurationMs ?: 0.0)
         return gatingDecision
+    }
+
+    /**
+     * Restarts the clock from now: the draft leaving the queue, plus everything still queued behind it, each priced at
+     * its point work plus one between-node overhead. Restarting on every dequeue is what keeps the prediction error the
+     * clock accumulates while queueing from compounding across a burst.
+     */
+    private fun rebaseBacklogClock(startingWorkloadPredictedDurationMs: Double) {
+        val draftOverheadDurationMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
+        val startingDraftWorkMs = startingWorkloadPredictedDurationMs + draftOverheadDurationMs
+        val queuedDraftWorkMs = queuedPredictedWorkMs + draftOverheadDurationMs * pendingDecisions.size
+        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingDraftWorkMs + queuedDraftWorkMs).toLong()
     }
 
     /** Raises [sizeBucket]'s max toward one completed draft's real duration; non-positive means no observation. */
@@ -87,9 +99,9 @@ internal class CaptureAvailablePacingSession {
             maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
     }
 
-    /** Records the deadline stamped at a committed capture's onShutter; the newest committed capture's stands. */
-    fun updateCaptureDeadlineMs(deadlineUptimeMs: Long) {
-        latestCaptureDeadlineMs = deadlineUptimeMs
+    /** Takes in a committed capture's timeout deadline; the newest one the pipeline brings stands. */
+    fun updateBacklogDeadlineMs(deadlineUptimeMs: Long) {
+        backlogDeadlineMs = deadlineUptimeMs
     }
 
     /**
@@ -100,25 +112,9 @@ internal class CaptureAvailablePacingSession {
         pendingDecisions.addLast(decision)
         val snapshot = decision.snapshot
         val draftWorkMs = snapshot.workloadSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
-        backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
+        backlogEndTimeMs =
+            maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
     }
-
-    /**
-     * Duration to set aside for a draft of [sizeBucket]: this burst's measured max, minus the work a demotion took out
-     * of this draft, floored by the model's whole-draft prediction.
-     *
-     * The max was measured on undemoted drafts, so a reduced draft must not be charged for work it no longer runs. The
-     * floor is what a burst's first capture prices with, and it keeps the reserve at one whole draft's occupancy - the
-     * same thing the backlog clock charges per queued draft - rather than at the node point sum.
-     */
-    fun reserveDraftSequenceDurationMs(
-        sizeBucket: SizeBucket,
-        demotedWorkloadPredictedDurationMs: Double,
-        draftSequencePredictedDurationMs: Double,
-    ): Double = maxOf(
-        maxDraftSequenceDurationMs(sizeBucket) - demotedWorkloadPredictedDurationMs,
-        draftSequencePredictedDurationMs,
-    )
 
     /**
      * Measured max duration to price [sizeBucket] by. Reading the draft's own size keeps a heavy other-size draft (a
@@ -126,7 +122,7 @@ internal class CaptureAvailablePacingSession {
      * one that was - conservative while cold, exact once its own size has run, and never above a duration this
      * pipeline really produced.
      */
-    private fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
+    fun getMaxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
         maxDraftSequenceDurationMsBySize[sizeBucket]
             ?: maxDraftSequenceDurationMsBySize.values.maxOrNull()
             ?: 0L
@@ -135,12 +131,13 @@ internal class CaptureAvailablePacingSession {
     fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
 
     /**
-     * How much of that capture's window is still ahead at [nowUptimeMs] - what the paced draft has to finish inside.
-     * The window length is the clamp, not a term: an unstamped capture is priced as if its window just opened and a
-     * past deadline leaves nothing, so a missing or late stamp can only cost pacing pressure, never invent a delay.
+     * How much of the [backlogDeadlineMs] window is still ahead of [nowUptimeMs] - what the paced draft has to finish
+     * inside. One timeout window is the clamp, not a term: with no deadline yet the window is priced as if it just
+     * opened, and a past one leaves nothing, so a missing or late deadline can only cost pacing pressure, never invent
+     * a delay.
      */
     fun timeToDeadlineMsAt(nowUptimeMs: Long): Long {
-        val deadlineUptimeMs = latestCaptureDeadlineMs ?: return MakerFeature.CAPTURE_TIMEOUT_MS
+        val deadlineUptimeMs = backlogDeadlineMs ?: return MakerFeature.CAPTURE_TIMEOUT_MS
         return (deadlineUptimeMs - nowUptimeMs).coerceIn(0L, MakerFeature.CAPTURE_TIMEOUT_MS)
     }
 
