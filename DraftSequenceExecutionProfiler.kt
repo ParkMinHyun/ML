@@ -45,7 +45,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * Initializes draft-node-chain profiling and, before any node executes, starts this draft sequence on the pacer -
      * consuming the admission that gated this capture and refreshing what the next callback prices against.
      *
-     * The key passed is the full planned suffix, even before Bokeh's second input arrives; the pacer re-projects it
+     * The key passed is the full configured chain, even before Bokeh's second input arrives; the pacer re-projects it
      * onto the burst's demoted shape. Encoding-only captures pace the RESERVED Encoding sequence, and JPEG passthrough
      * passes null so its admission is still consumed and the FIFO stays balanced.
      */
@@ -54,11 +54,11 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         draftSequenceNodeList = accessor.configuredNodeList
         draftSequenceStartTimeMs = SystemClock.uptimeMillis()
 
-        val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
-            resolveWorkloadKey(plannedNode, requireReadyToRun = false)
+        val configuredWorkloadKeys = draftSequenceNodeList.mapNotNull { node ->
+            resolveWorkloadKey(node, requireReadyToRun = false)
         }
         val gatingPacingDecision = captureAvailablePacer.startDraftSequence(
-            plannedWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
+            configuredWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
             readBudgetMs(),
         )
         metricsRecorder.onDraftStart(
@@ -194,11 +194,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
-        val index = draftSequenceNodeList.indexOfFirst { plannedNode -> plannedNode === node }
+        val index = draftSequenceNodeList.indexOfFirst { it === node }
         return if (index >= 0) {
-            draftSequenceNodeList.drop(index).mapNotNull { plannedNode ->
-                resolveWorkloadKey(plannedNode, requireReadyToRun = false)
-            }
+            draftSequenceNodeList.drop(index).mapNotNull { resolveWorkloadKey(it, requireReadyToRun = false) }
         } else {
             listOf(workloadKey)
         }

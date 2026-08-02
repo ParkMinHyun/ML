@@ -108,8 +108,8 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "draft_sequence_budget_ms")
     val draftSequenceBudgetMs: Long,
 
-    @ColumnInfo(name = "draft_sequence_predicted_duration_ms")
-    val draftSequencePredictedDurationMs: Double,
+    @ColumnInfo(name = "workload_sequence_predicted_duration_ms")
+    val workloadSequencePredictedDurationMs: Double,
 
     @ColumnInfo(name = "draft_sequence_overhead_duration_ms")
     val draftSequenceOverheadDurationMs: Double,

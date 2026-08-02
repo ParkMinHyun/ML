@@ -1437,8 +1437,8 @@ class CaptureMetricsExcelExporter(
             },
             Column("beforeDraftSequenceKey") { it.row.pacingReplay?.before?.draftSequenceKey },
             Column("beforeDraftSequenceBudgetMs") { it.row.pacingReplay?.before?.draftSequenceBudgetMs },
-            Column("beforeDraftSequencePredictedDurationMs") {
-                it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
+            Column("beforeWorkloadSequencePredictedDurationMs") {
+                it.row.pacingReplay?.before?.workloadSequencePredictedDurationMs
             },
             Column("beforeDraftSequenceOverheadDurationMs") {
                 it.row.pacingReplay?.before?.draftSequenceOverheadDurationMs
@@ -1488,7 +1488,7 @@ class CaptureMetricsExcelExporter(
             // sum) - the shortfall the overhead term exists to close. Positive = a point-only clock runs fast here,
             // which is the backlog under-pricing that compounds with queue depth into a timeout.
             Column("draftOccupancyUnderpriceMs") {
-                val predMs = it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
+                val predMs = it.row.pacingReplay?.before?.workloadSequencePredictedDurationMs
                 val draftSequenceDurationMs = it.row.draftSequenceDurationMs
                 if (predMs != null && draftSequenceDurationMs != null) draftSequenceDurationMs - predMs else null
             },

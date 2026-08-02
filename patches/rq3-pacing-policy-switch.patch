@@ -199,12 +199,12 @@ index 0000000..1d98bb4
 +    }
 +}
 diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index 0414e9f..d05f83e 100644
+index 1bf5681..a21af21 100644
 --- a/CaptureAvailablePacer.kt
 +++ b/CaptureAvailablePacer.kt
 @@ -18,9 +18,10 @@ fun interface CaptureAvailablePacingDecider {
-  * session maxima, and one FIFO pairs each admission with the next draft start. Planned sequence keys are re-projected
-  * onto the session's demoted shape by [DraftSequenceAdmissionPolicy]; the APM side sees only the decider interface.
+  * session maxima, and one FIFO pairs each admission with the next draft start. The sequence key a draft start hands in
+  * is re-projected onto the burst's demoted shape by [DraftSequenceAdmissionPolicy]; the APM side sees only the decider.
   */
 -class CaptureAvailablePacer(
 +class CaptureAvailablePacer @JvmOverloads constructor(
@@ -261,18 +261,18 @@ index 0414e9f..d05f83e 100644
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
              timeToDeadlineMs = timeToDeadlineMs,
-@@ -82,7 +84,9 @@ class CaptureAvailablePacer(
-     fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
+@@ -85,7 +87,9 @@ class CaptureAvailablePacer(
+     ): CaptureAvailablePacingDecision? {
          val session = captureAvailablePacingSession ?: return null
-         if (plannedSequenceKey == null) {
+         if (workloadSequenceKey == null) {
 -            return session.updatePacingSnapshot(null)
 +            val startUptimeMs = SystemClock.uptimeMillis()
 +            return session.updatePacingSnapshot(null, startUptimeMs)
 +                .also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
          }
-         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
-         val draftSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey)
-@@ -100,6 +104,10 @@ class CaptureAvailablePacer(
+         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(workloadSequenceKey)
+         val draftSequenceReservedDurationMs = session.reserveDraftSequenceDurationMs(
+@@ -94,6 +98,10 @@ class CaptureAvailablePacer(
              predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
          )
  
@@ -282,10 +282,10 @@ index 0414e9f..d05f83e 100644
 +        val startUptimeMs = SystemClock.uptimeMillis()
          return session.updatePacingSnapshot(
              CaptureAvailablePacingSnapshot(
-                 draftSequenceBudgetMs = budgetMs,
-@@ -108,13 +116,15 @@ class CaptureAvailablePacer(
-                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
+@@ -102,13 +110,15 @@ class CaptureAvailablePacer(
+                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
+                 workloadSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey),
              ),
 -        )
 +            startUptimeMs,
@@ -295,12 +295,12 @@ index 0414e9f..d05f83e 100644
      /** Pairs with [startDraftSequence]: records the completed draft's real duration against its own size. */
      @Synchronized
      fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
-         captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftSequenceDurationMs)
+         captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(sizeBucket, draftSequenceDurationMs)
 +        delayPolicy.onDraftMeasured(sizeBucket, draftSequenceDurationMs)
      }
  
      /**
-@@ -143,6 +153,16 @@ class CaptureAvailablePacer(
+@@ -137,6 +147,16 @@ class CaptureAvailablePacer(
      @Synchronized
      fun clear() {
          captureAvailablePacingSession = null
@@ -317,7 +317,7 @@ index 0414e9f..d05f83e 100644
      }
  
      /** The burst session, opened if this callback is the burst's first. Called by [decideDelay] and nowhere else. */
-@@ -153,9 +173,9 @@ class CaptureAvailablePacer(
+@@ -147,9 +167,9 @@ class CaptureAvailablePacer(
  }
  
  /**
@@ -331,7 +331,7 @@ index 0414e9f..d05f83e 100644
  internal fun computeLevelDeficitMs(
      draftSequenceBudgetMs: Long,
 diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
-index 10c3230..b6f8ed1 100644
+index d03f5ff..c78205b 100644
 --- a/CaptureAvailablePacingSession.kt
 +++ b/CaptureAvailablePacingSession.kt
 @@ -66,6 +66,7 @@ internal class CaptureAvailablePacingSession {
@@ -343,7 +343,7 @@ index 10c3230..b6f8ed1 100644
          if (snapshot != null) {
              pacingSnapshot = snapshot
 @@ -74,7 +75,7 @@ internal class CaptureAvailablePacingSession {
-         val startingPredictedMs = snapshot?.draftSequencePredictedDurationMs ?: 0.0
+         val startingPredictedMs = snapshot?.workloadSequencePredictedDurationMs ?: 0.0
          val draftOverheadMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
          val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
 -        backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
@@ -352,7 +352,7 @@ index 10c3230..b6f8ed1 100644
      }
  
 diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
-index e71c387..7922bf3 100644
+index d56e445..3f50283 100644
 --- a/CaptureMetricsExcelExporter.kt
 +++ b/CaptureMetricsExcelExporter.kt
 @@ -66,6 +66,7 @@ class CaptureMetricsExcelExporter(
@@ -995,7 +995,7 @@ index 785bcc7..c02dcf3 100644
          json.dump(payload, handle, indent=2, default=float)
          handle.write("\n")
 diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
-index cfac3cd..b728de7 100644
+index 4317ccf..4cc32f3 100644
 --- a/external/apm/policy/CaptureAvailableApmPolicy.java
 +++ b/external/apm/policy/CaptureAvailableApmPolicy.java
 @@ -153,7 +153,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {

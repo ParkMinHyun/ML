@@ -56,7 +56,7 @@ internal class CaptureAvailablePacingSession {
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
-        get() = pendingDecisions.sumOf { it.snapshot.draftSequencePredictedDurationMs }
+        get() = pendingDecisions.sumOf { it.snapshot.workloadSequencePredictedDurationMs }
 
     /**
      * Adopts the starting draft's snapshot and rebases the clock onto it. The decision FIFO doubles as the admitted
@@ -71,15 +71,15 @@ internal class CaptureAvailablePacingSession {
             pacingSnapshot = snapshot
         }
         val gatingDecision = pendingDecisions.removeFirstOrNull()
-        val startingPredictedMs = snapshot?.draftSequencePredictedDurationMs ?: 0.0
+        val startingPredictedMs = snapshot?.workloadSequencePredictedDurationMs ?: 0.0
         val draftOverheadMs = pacingSnapshot?.draftSequenceOverheadDurationMs ?: 0.0
         val pendingDraftWorkMs = queuedPredictedWorkMs + draftOverheadMs * (pendingDecisions.size + 1)
         backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingPredictedMs + pendingDraftWorkMs).toLong()
         return gatingDecision
     }
 
-    /** Records one completed draft's real duration against its own size; non-positive means no observation. */
-    fun updateDraftSequenceDuration(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+    /** Raises [sizeBucket]'s max toward one completed draft's real duration; non-positive means no observation. */
+    fun updateMaxDraftSequenceDurationMs(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
         if (draftSequenceDurationMs <= 0L) {
             return
         }
@@ -99,9 +99,26 @@ internal class CaptureAvailablePacingSession {
     fun queuePacingDecision(decision: CaptureAvailablePacingDecision) {
         pendingDecisions.addLast(decision)
         val snapshot = decision.snapshot
-        val draftWorkMs = snapshot.draftSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
+        val draftWorkMs = snapshot.workloadSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
         backlogEndTimeMs = maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
     }
+
+    /**
+     * Duration to set aside for a draft of [sizeBucket]: this burst's measured max, minus the work a demotion took out
+     * of this draft, floored by the model's whole-draft prediction.
+     *
+     * The max was measured on undemoted drafts, so a reduced draft must not be charged for work it no longer runs. The
+     * floor is what a burst's first capture prices with, and it keeps the reserve at one whole draft's occupancy - the
+     * same thing the backlog clock charges per queued draft - rather than at the node point sum.
+     */
+    fun reserveDraftSequenceDurationMs(
+        sizeBucket: SizeBucket,
+        demotedWorkloadPredictedDurationMs: Double,
+        draftSequencePredictedDurationMs: Double,
+    ): Double = maxOf(
+        maxDraftSequenceDurationMs(sizeBucket) - demotedWorkloadPredictedDurationMs,
+        draftSequencePredictedDurationMs,
+    )
 
     /**
      * Measured max duration to price [sizeBucket] by. Reading the draft's own size keeps a heavy other-size draft (a
@@ -109,7 +126,7 @@ internal class CaptureAvailablePacingSession {
      * one that was - conservative while cold, exact once its own size has run, and never above a duration this
      * pipeline really produced.
      */
-    fun getMaxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
+    private fun maxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
         maxDraftSequenceDurationMsBySize[sizeBucket]
             ?: maxDraftSequenceDurationMsBySize.values.maxOrNull()
             ?: 0L
@@ -119,9 +136,8 @@ internal class CaptureAvailablePacingSession {
 
     /**
      * How much of that capture's window is still ahead at [nowUptimeMs] - what the paced draft has to finish inside.
-     * The window
-     * length is the clamp, not a term: an unstamped capture is priced as if its window just opened and a past deadline
-     * leaves nothing, so a missing or late stamp can only cost pacing pressure, never invent a delay.
+     * The window length is the clamp, not a term: an unstamped capture is priced as if its window just opened and a
+     * past deadline leaves nothing, so a missing or late stamp can only cost pacing pressure, never invent a delay.
      */
     fun timeToDeadlineMsAt(nowUptimeMs: Long): Long {
         val deadlineUptimeMs = latestCaptureDeadlineMs ?: return MakerFeature.CAPTURE_TIMEOUT_MS

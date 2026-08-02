@@ -15,8 +15,8 @@ fun interface CaptureAvailablePacingDecider {
 
 /**
  * Paces captureAvailable callbacks for one burst: draft starts refresh the pacing snapshot, completed drafts update the
- * session maxima, and one FIFO pairs each admission with the next draft start. Planned sequence keys are re-projected
- * onto the session's demoted shape by [DraftSequenceAdmissionPolicy]; the APM side sees only the decider interface.
+ * session maxima, and one FIFO pairs each admission with the next draft start. The sequence key a draft start hands in
+ * is re-projected onto the burst's demoted shape by [DraftSequenceAdmissionPolicy]; the APM side sees only the decider.
  */
 class CaptureAvailablePacer(
     private val predictor: DraftSequenceExecutionPredictor,
@@ -79,34 +79,28 @@ class CaptureAvailablePacer(
      * so this draft runs unpaced and the next callback opens one.
      */
     @Synchronized
-    fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
+    fun startDraftSequence(
+        workloadSequenceKey: WorkloadSequenceKey?,
+        budgetMs: Long,
+    ): CaptureAvailablePacingDecision? {
         val session = captureAvailablePacingSession ?: return null
-        if (plannedSequenceKey == null) {
+        if (workloadSequenceKey == null) {
             return session.updatePacingSnapshot(null)
         }
-        val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
-        val draftSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey)
-        val demotedWorkloadMs = if (draftSequenceKey == plannedSequenceKey) {
-            0.0
-        } else {
-            (predictor.estimateWorkloadSequenceDurationMs(plannedSequenceKey) - draftSequencePredictedDurationMs)
-                .coerceAtLeast(0.0)
-        }
-        val currentSizeBucket = plannedSequenceKey.headWorkloadKey.sizeBucket
-        // Floored by the whole-draft estimate, not the node point sum: the reserve prices the same draft occupancy
-        // the backlog clock does, so a session with no observed max yet still reserves one whole draft's duration.
-        val draftSequenceReservedDurationMs = maxOf(
-            session.getMaxDraftSequenceDurationMs(currentSizeBucket).toDouble() - demotedWorkloadMs,
+        val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(workloadSequenceKey)
+        val draftSequenceReservedDurationMs = session.reserveDraftSequenceDurationMs(
+            workloadSequenceKey.headWorkloadKey.sizeBucket,
+            predictor.estimateDemotedWorkloadDurationMs(workloadSequenceKey, draftSequenceKey),
             predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
         )
 
         return session.updatePacingSnapshot(
             CaptureAvailablePacingSnapshot(
+                draftSequenceKey = draftSequenceKey.toReplayString(),
                 draftSequenceBudgetMs = budgetMs,
-                draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
                 draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
-                draftSequenceKey = draftSequenceKey.toReplayString(),
+                workloadSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey),
             ),
         )
     }
@@ -114,7 +108,7 @@ class CaptureAvailablePacer(
     /** Pairs with [startDraftSequence]: records the completed draft's real duration against its own size. */
     @Synchronized
     fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
-        captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftSequenceDurationMs)
+        captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(sizeBucket, draftSequenceDurationMs)
     }
 
     /**
@@ -184,7 +178,8 @@ internal fun computeBacklogDeficitMs(
 /** What one draft start hands the next captureAvailable decision to price with. */
 data class CaptureAvailablePacingSnapshot(
     val draftSequenceBudgetMs: Long,
-    val draftSequencePredictedDurationMs: Double,
+    /** Node processing alone - the point work the backlog clock advances by once per queued draft. */
+    val workloadSequencePredictedDurationMs: Double,
     /** Learned between-node overhead added once per queued draft to the backlog clock (clock = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
     /**

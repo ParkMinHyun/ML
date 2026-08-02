@@ -22,7 +22,7 @@ class DraftSequenceExecutionPredictor {
 
     private val workloadDurationTrend = WorkloadDurationTrend()
     private val workloadSequenceResidual = WorkloadSequenceResidual()
-    private val draftDurationOverhead = DraftDurationOverhead()
+    private val draftSequenceDurationOverhead = DraftSequenceDurationOverhead()
 
     @Synchronized
     fun decideAdmission(
@@ -125,7 +125,7 @@ class DraftSequenceExecutionPredictor {
     /** RESERVED workloads in the observed draft sequence, including a RESERVED head for encoding-only captures. */
     private fun selectReservedWorkloadKeys(workloadSequenceKey: WorkloadSequenceKey): List<WorkloadKey> {
         return workloadSequenceKey.workloadKeys
-            .filter { plannedWorkloadKey -> plannedWorkloadKey.policy == WorkloadPolicy.RESERVED }
+            .filter { it.policy == WorkloadPolicy.RESERVED }
     }
 
     /**
@@ -142,7 +142,7 @@ class DraftSequenceExecutionPredictor {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
         workloadSequenceResidual.observe(validWorkloadDurations, admissionDecisions)
         workloadDurationTrend.observe(validWorkloadDurations)
-        draftDurationOverhead.observe(validWorkloadDurations.values.sum(), draftSequenceDurationMs)
+        draftSequenceDurationOverhead.observe(validWorkloadDurations.values.sum(), draftSequenceDurationMs)
     }
 
     /**
@@ -158,7 +158,7 @@ class DraftSequenceExecutionPredictor {
 
     /** Learned time outside node processing, added once per draft - by the backlog clock per queued draft, too. */
     @Synchronized
-    fun estimateDraftSequenceOverheadDurationMs(): Double = draftDurationOverhead.estimateMs()
+    fun estimateDraftSequenceOverheadDurationMs(): Double = draftSequenceDurationOverhead.estimateMs()
 
     /**
      * Whole-draft occupancy: the two estimates above. Every caller pricing a real draft wants this one - adding the
@@ -166,13 +166,31 @@ class DraftSequenceExecutionPredictor {
      */
     @Synchronized
     fun estimateDraftSequenceDurationMs(workloadSequenceKey: WorkloadSequenceKey): Double =
-        estimateWorkloadSequenceDurationMs(workloadSequenceKey) + draftDurationOverhead.estimateMs()
+        estimateWorkloadSequenceDurationMs(workloadSequenceKey) + draftSequenceDurationOverhead.estimateMs()
+
+    /**
+     * Predicted work a demotion took out of [workloadSequenceKey], leaving [draftSequenceKey]. A pacing reserve built
+     * on durations measured before the demotion has to drop this much, or it charges the reduced draft for work it no
+     * longer runs. Both estimates are read under one lock, so a model update cannot land between them and make an
+     * undemoted draft look demoted.
+     */
+    @Synchronized
+    fun estimateDemotedWorkloadDurationMs(
+        workloadSequenceKey: WorkloadSequenceKey,
+        draftSequenceKey: WorkloadSequenceKey,
+    ): Double {
+        if (draftSequenceKey == workloadSequenceKey) {
+            return 0.0
+        }
+        return (estimateWorkloadSequenceDurationMs(workloadSequenceKey) -
+            estimateWorkloadSequenceDurationMs(draftSequenceKey)).coerceAtLeast(0.0)
+    }
 
     /**
      * Time outside node processing: inter-node gaps, deinit, scheduling. Recency-weighted mean, not median - the
      * distribution is right-skewed and a median under-prices it.
      */
-    private class DraftDurationOverhead {
+    private class DraftSequenceDurationOverhead {
         private val overheadScores = RecencyWeightedDistribution()
         private var learnedOverheadMs = 0.0
 

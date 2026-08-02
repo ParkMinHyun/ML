@@ -64,17 +64,17 @@ class DraftSequenceAdmissionPolicy {
     @Synchronized
     fun isDemoted(group: AdmissionGroup): Boolean = group in demotedGroups
 
-    /** The sequence key this session actually plans to run: the planned key minus the workloads whose group is demoted. */
+    /** What this burst will actually run: [workloadSequenceKey] minus the workloads whose group is demoted. */
     @Synchronized
-    fun resolveDraftSequenceKey(plannedSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
+    fun resolveDraftSequenceKey(workloadSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
         if (demotedGroups.isEmpty()) {
-            return plannedSequenceKey
+            return workloadSequenceKey
         }
 
         val portraitDemoted = AdmissionGroup.PORTRAIT in demotedGroups
         val decorationDemoted = AdmissionGroup.DECORATION in demotedGroups
-        val hasFrameWatermark = decorationDemoted && plannedSequenceKey.hasFrameWatermark()
-        val draftWorkloadKeys = plannedSequenceKey.workloadKeys.filterNot { workloadKey ->
+        val hasFrameWatermark = decorationDemoted && workloadSequenceKey.hasFrameWatermark()
+        val draftWorkloadKeys = workloadSequenceKey.workloadKeys.filterNot { workloadKey ->
             when (workloadKey) {
                 is WorkloadKey.Bokeh -> portraitDemoted
                 is WorkloadKey.Filter -> decorationDemoted
@@ -84,7 +84,7 @@ class DraftSequenceAdmissionPolicy {
             }
         }
         return if (draftWorkloadKeys.isEmpty()) {
-            plannedSequenceKey
+            workloadSequenceKey
         } else {
             WorkloadSequenceKey(draftWorkloadKeys)
         }
