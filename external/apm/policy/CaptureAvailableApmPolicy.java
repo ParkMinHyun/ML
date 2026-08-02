@@ -19,12 +19,12 @@
 package com.samsung.android.camera.core2.apm.policy;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 
 import com.samsung.android.camera.core2.apm.ApmDataRepositoryStore;
 import com.samsung.android.camera.core2.apm.ApmPolicy;
 import com.samsung.android.camera.core2.apm.repository.ApmDataProvider;
 import com.samsung.android.camera.core2.apm.repository.ApmResultDataSelector;
+import com.samsung.android.camera.core2.apm.repository.result.PacingResultData;
 import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
 import com.samsung.android.camera.core2.apm.util.SingleThreadDelayedScheduler;
 import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecision;
@@ -60,9 +60,16 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static final ApmResultDataSelector<ProcessingResultData, CaptureAvailableData> SELECTOR = resultData ->
             new CaptureAvailableData(
                     resultData.getDraftTimes(),
-                    resultData.getCaptureAvailableTime(),
-                    resultData.getPacingDecider()
+                    resultData.getCaptureAvailableTime()
             );
+
+    /**
+     * Reads the decider off its own result type. Asking it for a delay records an admission against the draft
+     * pipeline's backlog, so it is deliberately not reachable from the measurement selector above - a policy that only
+     * reads timings cannot call it and admit the same draft twice.
+     */
+    private static final ApmResultDataSelector<PacingResultData, CaptureAvailablePacingDecider> PACING_SELECTOR =
+            PacingResultData::getPacingDecider;
 
     private SingleThreadDelayedScheduler singleThreadDelayedScheduler;
 
@@ -78,7 +85,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
      * @param apmDataRepositoryStore Store for accessing APM data repositories.
      */
     public CaptureAvailableApmPolicy(@NonNull ApmDataRepositoryStore apmDataRepositoryStore) {
-        super(apmDataRepositoryStore, List.of(ProcessingResultData.class));
+        super(apmDataRepositoryStore, List.of(ProcessingResultData.class, PacingResultData.class));
     }
 
     /**
@@ -113,13 +120,18 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     protected boolean executeInternal(int sequenceId, @NonNull Runnable runnable) {
         long maxDraftTimeMs = 0L;
         long captureAvailableTimeMs = 0L;
-        CaptureAvailablePacingDecider pacingDecider = null;
-        final ApmDataProvider<ProcessingResultData> provider = getApmDataProvider(ProcessingResultData.class);
-        if (provider != null) {
-            final CaptureAvailableData captureAvailableData = provider.getSelectedApmResultData(sequenceId, SELECTOR);
+        final ApmDataProvider<ProcessingResultData> processingProvider = getApmDataProvider(ProcessingResultData.class);
+        if (processingProvider != null) {
+            final CaptureAvailableData captureAvailableData =
+                    processingProvider.getSelectedApmResultData(sequenceId, SELECTOR);
             maxDraftTimeMs = captureAvailableData.getMaxDraftTime();
             captureAvailableTimeMs = captureAvailableData.getCaptureAvailableTime();
-            pacingDecider = captureAvailableData.getPacingDecider();
+        }
+
+        CaptureAvailablePacingDecider pacingDecider = null;
+        final ApmDataProvider<PacingResultData> pacingProvider = getApmDataProvider(PacingResultData.class);
+        if (pacingProvider != null) {
+            pacingDecider = pacingProvider.getSelectedApmResultData(sequenceId, PACING_SELECTOR);
         }
 
         final CaptureAvailablePacingDecision pacingDecision =
@@ -211,13 +223,10 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
     private static class CaptureAvailableData {
         private final long maxDraftTime;
         private final long captureAvailableTime;
-        private final CaptureAvailablePacingDecider pacingDecider;
 
-        CaptureAvailableData(@NonNull List<Long> draftTimes, long captureAvailableTime,
-                             @Nullable CaptureAvailablePacingDecider pacingDecider) {
+        CaptureAvailableData(@NonNull List<Long> draftTimes, long captureAvailableTime) {
             this.maxDraftTime = draftTimes.stream().mapToLong(Long::longValue).max().orElse(0L);
             this.captureAvailableTime = captureAvailableTime;
-            this.pacingDecider = pacingDecider;
         }
 
         long getMaxDraftTime() {
@@ -226,11 +235,6 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
         long getCaptureAvailableTime() {
             return captureAvailableTime;
-        }
-
-        @Nullable
-        CaptureAvailablePacingDecider getPacingDecider() {
-            return pacingDecider;
         }
     }
 

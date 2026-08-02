@@ -22,7 +22,7 @@ private const val TAG = "DraftSequenceExecutionProfiler"
  * State is grouped by destination:
  * - [modelUpdate] buffers what the Predictor learns from (durations + decisions), drained exactly once.
  * - [metricsRecorder] is the sole writer of the [CaptureMetrics] observability store.
- * - [nodeChainLifecycle] owns the draft node chain's deinit timing.
+ * - [draftNodeChainLifecycle] owns the draft node chain's deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val isPendingRequest: Boolean,
@@ -36,13 +36,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private val modelUpdate = ModelUpdateBuffer()
     private val metricsRecorder = MetricsRecorder(captureMetrics, draftSequenceMetrics, isPendingRequest)
-    private val nodeChainLifecycle = DraftNodeChainLifecycle()
+    private val draftNodeChainLifecycle = DraftNodeChainLifecycle()
     private val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
 
     private var draftSequenceNodeList: List<Node> = emptyList()
-    private var pendingCompleteSession: DraftSequenceExecutionSession? = null
-    private var draftDeviceStateSnapshot: DeviceStateSnapshot? = null
-    private var draftStartUptimeMs = 0L
+    private var draftSequenceExecutionSession: DraftSequenceExecutionSession? = null
+    private var deviceStateSnapshot: DeviceStateSnapshot? = null
+    private var draftSequenceStartTimeMs = 0L
 
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
@@ -52,9 +52,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * admission record is still consumed - captureAvailable admission and draft-start observations stay balanced.
      */
     fun initialize(accessor: DraftNodeChainAccessor) {
-        nodeChainLifecycle.attach(accessor)
+        draftNodeChainLifecycle.attach(accessor)
         draftSequenceNodeList = accessor.configuredNodeList
-        draftStartUptimeMs = SystemClock.uptimeMillis()
+        draftSequenceStartTimeMs = SystemClock.uptimeMillis()
 
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
             resolveWorkloadKey(plannedNode, requireReadyToRun = false)
@@ -70,7 +70,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
         // Memory, thermal, and storage are observability inputs; only the timeout budget must stay fresh per node.
         // Sampling them once keeps DeviceStateReader's blocking dispatcher work off every node transition.
-        draftDeviceStateSnapshot = deviceStateReader.read()
+        deviceStateSnapshot = deviceStateReader.read()
     }
 
     /**
@@ -117,8 +117,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     private fun readPreExecutionMetrics(): PreExecutionMetrics {
-        val deviceState = draftDeviceStateSnapshot ?: deviceStateReader.read().also { snapshot ->
-            draftDeviceStateSnapshot = snapshot
+        val deviceState = deviceStateSnapshot ?: deviceStateReader.read().also { snapshot ->
+            deviceStateSnapshot = snapshot
         }
         return PreExecutionMetrics(
             budgetMs = readBudgetMs(),
@@ -155,7 +155,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                     shouldRun = prediction.admit,
                     watchdogTimeoutMs = watchdogDecision.timeoutMs,
                     onTimedOutTask = { worker ->
-                        nodeChainLifecycle.deferUntil(worker)
+                        draftNodeChainLifecycle.deferUntil(worker)
                         metricsRecorder.onWatchdogTimedOut(nodeExecutionMetrics)
                     },
                     onComplete = onComplete,
@@ -163,21 +163,21 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             }
             WorkloadPolicy.REQUIRED -> DraftSequenceExecutionSession.createForRequiredWorkload(onComplete)
             WorkloadPolicy.RESERVED -> DraftSequenceExecutionSession.createForReservedWorkload(
-                onCancel = { pendingCompleteSession = null },
+                onCancel = { draftSequenceExecutionSession = null },
                 onComplete = onComplete,
             ).also { session ->
-                pendingCompleteSession = session
+                draftSequenceExecutionSession = session
             }
         }
     }
 
     /** Completes RESERVED work, updates the learned duration/pacing models, and records whether it timed out. */
     fun completeDraftSequenceExecution(): Boolean {
-        pendingCompleteSession?.complete()
-        pendingCompleteSession = null
+        draftSequenceExecutionSession?.complete()
+        draftSequenceExecutionSession = null
 
-        val draftWallMs = if (draftStartUptimeMs > 0L) {
-            (SystemClock.uptimeMillis() - draftStartUptimeMs).coerceAtLeast(0L)
+        val draftWallMs = if (draftSequenceStartTimeMs > 0L) {
+            (SystemClock.uptimeMillis() - draftSequenceStartTimeMs).coerceAtLeast(0L)
         } else {
             0L
         }
@@ -195,8 +195,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     /** Cancels the pending RESERVED workload without discarding collected samples. */
     fun cancelDraftSequenceExecution() {
-        pendingCompleteSession?.cancel()
-        pendingCompleteSession = null
+        draftSequenceExecutionSession?.cancel()
+        draftSequenceExecutionSession = null
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
@@ -233,7 +233,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     fun deinitialize() {
-        nodeChainLifecycle.deinitializeOnce()
+        draftNodeChainLifecycle.deinitializeOnce()
     }
 }
 

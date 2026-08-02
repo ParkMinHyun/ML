@@ -24,9 +24,7 @@ import com.samsung.android.camera.core2.apm.ApmDataListener;
 import com.samsung.android.camera.core2.apm.data.ApmData;
 import com.samsung.android.camera.core2.apm.data.DraftTimeApmData;
 import com.samsung.android.camera.core2.apm.data.MultiPicCaptureTimeApmData;
-import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
 import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
-import com.samsung.android.camera.core2.ml.CaptureAvailablePacingDecider;
 import com.samsung.android.camera.core2.util.PLog;
 
 import java.util.ArrayDeque;
@@ -53,8 +51,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
     private final Object lock = new Object();
     private final Deque<Long> draftTimeDeque = new ArrayDeque<>();
     private final LinkedHashMap</*sequenceId*/Integer, /*time*/Long> canTimeMap = new LinkedHashMap<>();
-    // Re-published by the draft pipeline at every draft start, so clearing it on reset() self-heals next shot.
-    private CaptureAvailablePacingDecider pacingDecider;
 
     /**
      * <div class="camera_en">
@@ -93,13 +89,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
     public void registerApmDataListener(@NonNull BiConsumer<Class<? extends ApmData>, ApmDataListener> addListenerFunc) {
         addListenerFunc.accept(DraftTimeApmData.class, data -> addDraftTaskProcessingTime((DraftTimeApmData) data));
         addListenerFunc.accept(MultiPicCaptureTimeApmData.class, data -> addCaptureAvailableTime((MultiPicCaptureTimeApmData) data));
-        addListenerFunc.accept(PacingDeciderApmData.class, data -> setPacingDecider((PacingDeciderApmData) data));
-    }
-
-    private void setPacingDecider(@NonNull PacingDeciderApmData data) {
-        synchronized (lock) {
-            pacingDecider = data.getPacingDecider();
-        }
     }
 
     private void addDraftTaskProcessingTime(@NonNull DraftTimeApmData time) {
@@ -138,7 +127,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
         synchronized (lock) {
             draftTimeDeque.clear();
             canTimeMap.clear();
-            pacingDecider = null;
         }
         PLog.i(TAG, "ProcessingDataRepository cleared");
     }
@@ -159,11 +147,6 @@ public class ProcessingDataRepository extends ApmDataRepository<ProcessingResult
         public long getCaptureAvailableTime() {
             return Optional.ofNullable(canTimeMap.get(sequenceId))
                     .orElseGet(() -> Optional.ofNullable(canTimeMap.lastEntry()).map(Map.Entry::getValue).orElse(0L));
-        }
-
-        @Override
-        public CaptureAvailablePacingDecider getPacingDecider() {
-            return pacingDecider;
         }
 
         @Override

@@ -42,7 +42,7 @@ class CaptureAvailablePacer(
      * [CaptureAvailablePacingSession.createdUptimeMs] - the burst identity offline grouping reads - stamped by the
      * event that really opens the burst, and leaves a metrics read or a late completion unable to open one.
      */
-    private var session: CaptureAvailablePacingSession? = null
+    private var captureAvailablePacingSession: CaptureAvailablePacingSession? = null
 
     /**
      * Timeout deadline of the newest capture the pipeline has committed to the draft pipeline, and the only thing
@@ -50,9 +50,9 @@ class CaptureAvailablePacer(
      * names the capture whose work went into the admitted backlog last - which is what [computeBacklogDeficitMs] has
      * to price against, and why a later stamping point (a draft start) would leave it naming the queue's head instead.
      *
-     * Deliberately outside [session]: a deadline belongs to a capture, not to a burst, and the newest one stays the
-     * right answer across a drain. Absent until the first committed capture whose onShutter stamped one
-     * (delayed-shutter IPP captures never do).
+     * Deliberately outside [captureAvailablePacingSession]: a deadline belongs to a capture, not to a burst, and
+     * the newest one stays the right answer across a drain. Absent until the first committed capture whose onShutter
+     * stamped one (delayed-shutter IPP captures never do).
      */
     private var latestCaptureDeadlineMs: Long? = null
 
@@ -64,9 +64,9 @@ class CaptureAvailablePacer(
      * derived here rather than passed in: the pipeline stamps the deadline at onShutter, so how much remains is simply
      * how far that deadline still is from now.
      *
-     * Opens the burst session when none is open - see [session] for why this is the only place that does. The very
-     * first callback of a burst then finds no snapshot and answers "no delay", which is what leaves an idle pipeline
-     * unpaced.
+     * Opens the burst session when none is open - see [captureAvailablePacingSession] for why this is the only
+     * place that does. The very first callback of a burst then finds no snapshot and answers "no delay", which is
+     * what leaves an idle pipeline unpaced.
      */
     @Synchronized
     override fun decideDelay(): CaptureAvailablePacingDecision? {
@@ -111,7 +111,7 @@ class CaptureAvailablePacer(
      */
     @Synchronized
     fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
-        val session = session ?: return null
+        val session = captureAvailablePacingSession ?: return null
         if (plannedSequenceKey == null) {
             return session.updatePacingSnapshot(null)
         }
@@ -148,7 +148,7 @@ class CaptureAvailablePacer(
      */
     @Synchronized
     fun endDraftSequence(sizeBucket: SizeBucket, draftWallMs: Long) {
-        session?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
+        captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
     }
 
     /**
@@ -167,19 +167,20 @@ class CaptureAvailablePacer(
      * burst is open. Reading it can never open one - a metrics read must not decide where a burst begins.
      */
     @Synchronized
-    fun getCurrentSessionId(): Long? = session?.createdUptimeMs
+    fun getCurrentSessionId(): Long? = captureAvailablePacingSession?.createdUptimeMs
 
     /** Ends the burst session when the draft task queue drains; the next captureAvailable callback opens the next. */
     @Synchronized
     fun clear() {
-        session = null
+        captureAvailablePacingSession = null
     }
 
     /**
      * The burst session, opened if this is the burst's first callback. Called by [decideDelay] and nowhere else.
      */
     private fun openSession(): CaptureAvailablePacingSession =
-        session ?: CaptureAvailablePacingSession().also { session = it }
+        captureAvailablePacingSession
+            ?: CaptureAvailablePacingSession().also { captureAvailablePacingSession = it }
 
     /**
      * How much of the newest capture's timeout window is still ahead at [nowUptimeMs] - what the paced draft has to
@@ -231,7 +232,7 @@ internal fun computeBacklogDeficitMs(
 data class CaptureAvailablePacingSnapshot(
     val draftSequenceBudgetMs: Long,
     val draftSequencePredictedDurationMs: Double,
-    /** Learned between-node overhead added once per queued draft to the backlog clock (clock work = predicted + this). */
+    /** Learned between-node overhead added once per queued draft to the backlog clock (clock = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
     /**
      * Draft-sequence duration estimate both deficits set aside for the capture being paced. Not a model bound despite

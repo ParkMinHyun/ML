@@ -22,8 +22,10 @@ import androidx.annotation.NonNull;
 
 import com.samsung.android.camera.core2.apm.repository.ApmDataProvider;
 import com.samsung.android.camera.core2.apm.repository.ApmDataRepository;
+import com.samsung.android.camera.core2.apm.repository.PacingDataRepository;
 import com.samsung.android.camera.core2.apm.repository.ProcessingDataRepository;
 import com.samsung.android.camera.core2.apm.repository.result.ApmResultData;
+import com.samsung.android.camera.core2.apm.repository.result.PacingResultData;
 import com.samsung.android.camera.core2.apm.repository.result.ProcessingResultData;
 import com.samsung.android.camera.core2.util.PLog;
 
@@ -47,6 +49,7 @@ public class ApmDataRepositoryStore {
 
     public ApmDataRepositoryStore() {
         dataRepositories.put(ProcessingResultData.class, new ProcessingDataRepository());
+        dataRepositories.put(PacingResultData.class, new PacingDataRepository());
     }
 
     /**
