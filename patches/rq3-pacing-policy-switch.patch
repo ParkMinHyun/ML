@@ -1,7 +1,7 @@
 Replace the captureAvailable delay arithmetic with a swappable pacing policy, and
 add the three comparison arms for RQ3.
 
-Base commit: 074cfba, plus the uncommitted pacer/session refactor on top of it
+Base commit: 28960ac, plus the uncommitted pacing-window documentation commit
 
   NO_PACING    NoPacingDelayPolicy            - zero delay, same admission path
   OURS         DeadlineDeficitDelayPolicy     - the deployed budget/backlog deficit
@@ -199,10 +199,10 @@ index 0000000..1d98bb4
 +    }
 +}
 diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index 9961ed2..2b33d51 100644
+index ca4255a..f80ef03 100644
 --- a/CaptureAvailablePacer.kt
 +++ b/CaptureAvailablePacer.kt
-@@ -24,9 +24,10 @@ fun interface CaptureAvailablePacingDecider {
+@@ -26,9 +26,10 @@ fun interface CaptureAvailablePacingDecider {
   * Asks the [DraftSequenceAdmissionPolicy] which sequence key a planned one becomes in this session's plan.
   * The APM side consumes this only through [CaptureAvailablePacingDecider]; ownership stays with the draft pipeline.
   */
@@ -214,7 +214,7 @@ index 9961ed2..2b33d51 100644
  ) : CaptureAvailablePacingDecider {
  
      /**
-@@ -51,12 +52,12 @@ class CaptureAvailablePacer(
+@@ -57,12 +58,12 @@ class CaptureAvailablePacer(
      private var latestCaptureDeadlineMs: Long? = null
  
      /**
@@ -232,7 +232,7 @@ index 9961ed2..2b33d51 100644
       *
       * Opens the burst session when none is open - see [session] for why this is the only place that does. The very
       * first callback of a burst then finds no snapshot and answers "no delay", which is what leaves an idle pipeline
-@@ -69,22 +70,22 @@ class CaptureAvailablePacer(
+@@ -75,22 +76,22 @@ class CaptureAvailablePacer(
          val nowUptimeMs = SystemClock.uptimeMillis()
          val timeToDeadlineMs = computeTimeToDeadlineMs(nowUptimeMs)
          val backlogMs = session.backlogMsAt(nowUptimeMs)
@@ -267,7 +267,7 @@ index 9961ed2..2b33d51 100644
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
              timeToDeadlineMs = timeToDeadlineMs,
-@@ -107,7 +108,9 @@ class CaptureAvailablePacer(
+@@ -113,7 +114,9 @@ class CaptureAvailablePacer(
      fun startDraftSequence(plannedSequenceKey: WorkloadSequenceKey?, budgetMs: Long): CaptureAvailablePacingDecision? {
          val session = session ?: return null
          if (plannedSequenceKey == null) {
@@ -278,7 +278,7 @@ index 9961ed2..2b33d51 100644
          }
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
          val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
-@@ -125,6 +128,10 @@ class CaptureAvailablePacer(
+@@ -131,6 +134,10 @@ class CaptureAvailablePacer(
              predictor.estimateDraftSequenceWallMs(draftSequenceKey),
          )
  
@@ -289,7 +289,7 @@ index 9961ed2..2b33d51 100644
          return session.updatePacingSnapshot(
              CaptureAvailablePacingSnapshot(
                  draftSequenceBudgetMs = budgetMs,
-@@ -133,7 +140,8 @@ class CaptureAvailablePacer(
+@@ -139,7 +146,8 @@ class CaptureAvailablePacer(
                  draftSequencePacingDurationMs = draftSequencePacingDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
@@ -299,7 +299,7 @@ index 9961ed2..2b33d51 100644
      }
  
      /**
-@@ -143,6 +151,7 @@ class CaptureAvailablePacer(
+@@ -149,6 +157,7 @@ class CaptureAvailablePacer(
      @Synchronized
      fun endDraftSequence(sizeBucket: SizeBucket, draftWallMs: Long) {
          session?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
@@ -307,7 +307,7 @@ index 9961ed2..2b33d51 100644
      }
  
      /**
-@@ -167,6 +176,16 @@ class CaptureAvailablePacer(
+@@ -173,6 +182,16 @@ class CaptureAvailablePacer(
      @Synchronized
      fun clear() {
          session = null
@@ -324,7 +324,7 @@ index 9961ed2..2b33d51 100644
      }
  
      /**
-@@ -189,10 +208,10 @@ class CaptureAvailablePacer(
+@@ -195,10 +214,10 @@ class CaptureAvailablePacer(
  }
  
  /**
@@ -1017,7 +1017,7 @@ index 0e72879..22ee384 100644
  
              pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
 diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
-index ad17d4f..5025134 100644
+index 6701612..4a6fa0d 100644
 --- a/external/draftSaving/SavingDraftImageTaskManager.java
 +++ b/external/draftSaving/SavingDraftImageTaskManager.java
 @@ -9,6 +9,7 @@ import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;

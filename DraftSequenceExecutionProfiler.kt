@@ -44,13 +44,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private var draftDeviceStateSnapshot: DeviceStateSnapshot? = null
     private var draftStartUptimeMs = 0L
 
-    init {
-        // Hands the pacer this capture's timeout deadline as early as the pipeline knows it - one profiler is built
-        // when the capture is accepted, before its draft is queued, so before the callback that paces it is decided.
-        // Absent only when onShutter never stamped one (delayed-shutter IPP), and then the pacer charges nothing.
-        captureMetrics.timeoutTimestampMs?.let(captureAvailablePacer::setCaptureDeadlineMs)
-    }
-
     /**
      * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
      * Passes the full planned suffix (even before Bokeh's second input arrives); the pacer re-projects it onto the

@@ -11,7 +11,9 @@ import kotlin.math.ceil
  * double-admit against a stale backlog.
  *
  * Takes nothing: every timing the decision needs is pipeline-owned state the pacer already holds, measured where the
- * draft actually ran rather than around the whole draft task.
+ * draft actually ran rather than around the whole draft task. The callback does carry a capture id, but the deficits
+ * are anchored on the newest capture the pipeline has committed, not on whichever capture the callback belongs to -
+ * see [computeBacklogDeficitMs].
  */
 fun interface CaptureAvailablePacingDecider {
     fun decideDelay(): CaptureAvailablePacingDecision?
@@ -43,9 +45,13 @@ class CaptureAvailablePacer(
     private var session: CaptureAvailablePacingSession? = null
 
     /**
-     * Timeout deadline of the newest capture the pipeline has taken in, and the only thing [computeTimeToDeadlineMs]
-     * counts down to. Deliberately outside [session]: a deadline belongs to a capture, not to a burst, and the newest
-     * one stays the right answer across a drain. Absent until the first capture whose onShutter stamped one
+     * Timeout deadline of the newest capture the pipeline has committed to the draft pipeline, and the only thing
+     * [computeTimeToDeadlineMs] counts down to. The draft pipeline stamps it as it takes the capture in, so it always
+     * names the capture whose work went into the admitted backlog last - which is what [computeBacklogDeficitMs] has
+     * to price against, and why a later stamping point (a draft start) would leave it naming the queue's head instead.
+     *
+     * Deliberately outside [session]: a deadline belongs to a capture, not to a burst, and the newest one stays the
+     * right answer across a drain. Absent until the first committed capture whose onShutter stamped one
      * (delayed-shutter IPP captures never do).
      */
     private var latestCaptureDeadlineMs: Long? = null
@@ -200,12 +206,18 @@ internal fun computeLevelDeficitMs(
 ): Long = ceil(draftSequencePacingDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
 
 /**
- * How far past its deadline the paced draft is projected to finish: it waits out [backlogMs] of admitted work, then
- * runs for [draftSequencePacingDurationMs], against the [timeToDeadlineMs] it has left. Work minus time left, the same
- * shape [computeLevelDeficitMs] has - the two differ only in whose window they read and whether the queue counts.
+ * How far past its deadline the admitted work is projected to finish: the queue drains over [backlogMs], then one more
+ * draft runs for [draftSequencePacingDurationMs], against the [timeToDeadlineMs] left in the window it is priced in.
+ * Work minus time left, the same shape [computeLevelDeficitMs] has - the two differ only in whose window they read and
+ * whether the queue counts.
  *
- * The capture timeout length is deliberately absent: charging the elapsed part of the window and then subtracting the
- * whole window would cancel to exactly this, so the constant only belongs where the window is bounded, not here.
+ * The window is the newest committed capture's, not that of the capture this callback gates. That capture has not
+ * shuttered yet, so its deadline would be `now + delay + CAPTURE_TIMEOUT_MS` - the delay being solved for appears on
+ * both sides, and the deficit stops being computable. Anchoring on a deadline already stamped keeps it arithmetic, and
+ * the newest committed one is the deadline of the queue's last item, which is what the whole queue has to fit inside.
+ *
+ * The capture timeout length is deliberately absent here: charging the elapsed part of the window and then subtracting
+ * the whole window cancels to exactly this, so the constant only belongs where the window is bounded.
  */
 internal fun computeBacklogDeficitMs(
     backlogMs: Long,
