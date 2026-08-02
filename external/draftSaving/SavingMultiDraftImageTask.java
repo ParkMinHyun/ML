@@ -102,7 +102,7 @@ public class SavingMultiDraftImageTask extends SavingDraftImageTask {
                 if (FIRST_IMAGE_INDEX == originalBufferList.indexOf(buffer)) {
                     draftJpegNodeChainAccessor.createNodeChain(camCapability);
                     draftJpegNodeChainAccessor.configureNodeChain(buffer.getImageInfo(), camCapability, extraBundle, nodeChainConfiguration);
-                    draftSequenceExecutionProfiler.initializeDraftNodeChain(draftJpegNodeChainAccessor);
+                    draftSequenceExecutionProfiler.initialize(draftJpegNodeChainAccessor);
                 }
 
                 PLog.i(TAG, "[mhyun2.park] processDraftImageInternal - NodeChain process E - " + getConfiguredNodeNames());

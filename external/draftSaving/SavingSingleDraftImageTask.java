@@ -85,7 +85,7 @@ public class SavingSingleDraftImageTask extends SavingDraftImageTask {
 
             final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
             if (null != draftSequenceExecutionProfiler) {
-                draftSequenceExecutionProfiler.initializeDraftNodeChain(draftJpegNodeChainAccessor);
+                draftSequenceExecutionProfiler.initialize(draftJpegNodeChainAccessor);
             }
             final ImageBuffer resultBuffer = draftJpegNodeChainAccessor.getNodeChain().processFull(ImageBuffer.class, originalBuffer, extraBundle);
 

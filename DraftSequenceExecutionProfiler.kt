@@ -51,13 +51,13 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * Encoding sequence, and captures with no predictable workloads (JPEG passthrough) pass a null key so their
      * admission record is still consumed - captureAvailable admission and draft-start observations stay balanced.
      */
-    fun initializeDraftNodeChain(accessor: DraftNodeChainAccessor) {
-        nodeChainLifecycle.setAccessor(accessor)
+    fun initialize(accessor: DraftNodeChainAccessor) {
+        nodeChainLifecycle.attach(accessor)
         draftSequenceNodeList = accessor.configuredNodeList
         draftStartUptimeMs = SystemClock.uptimeMillis()
 
         val plannedWorkloadKeys = draftSequenceNodeList.mapNotNull { plannedNode ->
-            classifyWorkloadKey(plannedNode, requireReadyToRun = false)
+            resolveWorkloadKey(plannedNode, requireReadyToRun = false)
         }
         val gatingPacingDecision = captureAvailablePacer.startDraftSequence(
             plannedWorkloadKeys.takeIf { it.isNotEmpty() }?.let(::WorkloadSequenceKey),
@@ -84,8 +84,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
      * Watermark) always run but are not reserve-protected; RESERVED workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
-        val workloadKey = classifyWorkloadKey(node, requireReadyToRun = true) ?: return null
-        val workloadSequenceKey = WorkloadSequenceKey(collectPlannedWorkloadKeysFrom(node, workloadKey))
+        val workloadKey = resolveWorkloadKey(node, requireReadyToRun = true) ?: return null
+        val workloadSequenceKey = WorkloadSequenceKey(resolveWorkloadSequenceKey(node, workloadKey))
         val preExecutionMetrics = readPreExecutionMetrics()
         val nodeExecutionMetrics = metricsRecorder.onNodeExecutionStart(
             nodeName = node.javaClass.simpleName,
@@ -112,7 +112,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             workloadSequenceKey = workloadSequenceKey,
             preExecutionMetrics = preExecutionMetrics,
             nodeExecutionMetrics = nodeExecutionMetrics,
-            snapshot = snapshot,
+            prediction = prediction,
         )
     }
 
@@ -155,7 +155,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
                     shouldRun = prediction.admit,
                     watchdogTimeoutMs = watchdogDecision.timeoutMs,
                     onTimedOutTask = { worker ->
-                        nodeChainLifecycle.waitFor(worker)
+                        nodeChainLifecycle.deferUntil(worker)
                         metricsRecorder.onWatchdogTimedOut(nodeExecutionMetrics)
                     },
                     onComplete = onComplete,
@@ -199,18 +199,18 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         pendingCompleteSession = null
     }
 
-    private fun collectPlannedWorkloadKeysFrom(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
+    private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
         val index = draftSequenceNodeList.indexOfFirst { plannedNode -> plannedNode === node }
         return if (index >= 0) {
             draftSequenceNodeList.drop(index).mapNotNull { plannedNode ->
-                classifyWorkloadKey(plannedNode, requireReadyToRun = false)
+                resolveWorkloadKey(plannedNode, requireReadyToRun = false)
             }
         } else {
             listOf(workloadKey)
         }
     }
 
-    private fun classifyWorkloadKey(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
+    private fun resolveWorkloadKey(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
         return when (node) {
             is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }
@@ -232,8 +232,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         }
     }
 
-    fun deinitializeDraftNodeChain() {
-        nodeChainLifecycle.deinitializeWhenIdle()
+    fun deinitialize() {
+        nodeChainLifecycle.deinitializeOnce()
     }
 }
 
@@ -353,12 +353,12 @@ private class MetricsRecorder(
 }
 
 /**
- * Owns the draft node chain's deinit timing. Normally [deinitializeWhenIdle] deinitializes at once,
- * but a workload that timed out leaves its worker running on the chain; [waitFor] records that worker so
+ * Owns the draft node chain's deinit timing. Normally [deinitializeOnce] deinitializes at once,
+ * but a workload that timed out leaves its worker running on the chain; [deferUntil] records that worker so
  * deinit is deferred until it actually finishes. Deinit runs exactly once.
  *
- * Single-use, one instance per draft sequence. [waitFor] (process thread, during node execution)
- * always runs before [deinitializeWhenIdle] (process thread, at task end), so recording the worker is
+ * Single-use, one instance per draft sequence. [deferUntil] (process thread, during node execution)
+ * always runs before [deinitializeOnce] (process thread, at task end), so recording the worker is
  * enough - there is no request/worker ordering to reconcile.
  */
 private class DraftNodeChainLifecycle {
@@ -367,21 +367,21 @@ private class DraftNodeChainLifecycle {
     private var pendingWorker: CompletableFuture<*>? = null
     private var deinitialized = false
 
-    fun setAccessor(accessor: DraftNodeChainAccessor) {
+    fun attach(accessor: DraftNodeChainAccessor) {
         synchronized(lock) {
             this.accessor = accessor
         }
     }
 
     /** A timed-out workload's worker is still running on the chain; defer deinit until it finishes. */
-    fun waitFor(worker: CompletableFuture<*>) {
+    fun deferUntil(worker: CompletableFuture<*>) {
         synchronized(lock) {
             pendingWorker = worker
         }
     }
 
     /** Deinitializes the chain exactly once, after the pending timed-out worker (if any) finishes. */
-    fun deinitializeWhenIdle() {
+    fun deinitializeOnce() {
         val (accessor, worker) = synchronized(lock) {
             if (deinitialized) {
                 return
@@ -397,7 +397,7 @@ private class DraftNodeChainLifecycle {
             try {
                 accessor.deinitializeNodeChain()
             } catch (t: Throwable) {
-                CLog.e(TAG, "deinitializeDraftNodeChain error", t)
+                CLog.e(TAG, "deinitialize error", t)
             }
         }
         if (worker == null || worker.isDone) {

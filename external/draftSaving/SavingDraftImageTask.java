@@ -427,7 +427,7 @@ public abstract class SavingDraftImageTask implements Runnable {
     protected void deinitializeDraftNodeChain() {
         final DraftSequenceExecutionProfiler draftSequenceExecutionProfiler = extraBundle.get(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER);
         if (null != draftSequenceExecutionProfiler) {
-            draftSequenceExecutionProfiler.deinitializeDraftNodeChain();
+            draftSequenceExecutionProfiler.deinitialize();
         } else {
             draftJpegNodeChainAccessor.deinitializeNodeChain();
         }
