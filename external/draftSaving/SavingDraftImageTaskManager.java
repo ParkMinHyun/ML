@@ -133,10 +133,9 @@ public class SavingDraftImageTaskManager {
             // scheduling time so multi-draft captures do not build one dead profiler per intermediate request.
             final CaptureMetrics captureMetrics = savingDraftImageTask.extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
             ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
-            // Anchor the pacer's timeout window here, where the capture is committed to the draft pipeline: its work
-            // enters the admitted backlog at this point, so this is the newest deadline the backlog can be priced
-            // against. Absent only when onShutter never stamped one (delayed-shutter IPP), and then the previous
-            // committed capture's deadline stands.
+            // Anchor the pacer's timeout window where the capture is committed: its work enters the admitted backlog
+            // here, so this is the newest deadline the backlog can be priced against. Absent only for delayed-shutter
+            // IPP, and then the previous committed capture's deadline stands.
             final Long timeoutTimestampMs = captureMetrics.getTimeoutTimestampMs();
             if (timeoutTimestampMs != null) {
                 captureAvailablePacer.setCaptureDeadlineMs(timeoutTimestampMs);
@@ -146,9 +145,8 @@ public class SavingDraftImageTaskManager {
                             DynamicShotUtils.isPendingRequest(processRequest.getDsMode(), processRequest.getDsExtraInfo()),
                             captureMetrics, deviceStateReader,
                             captureAvailablePacer, draftSequenceExecutionPredictor, admissionPolicy));
-            // Publish the pacing decider with every draft start (idempotent - same reference): a publication dropped
-            // before APM start or wiped by a repository reset heals on the next shot, and no teardown detach is
-            // needed - a cleared pacer keeps answering "no delay" until the next pipeline's decider replaces it.
+            // Published on every draft start, idempotently: a publication dropped before APM start or wiped by a
+            // repository reset heals on the next shot, and a cleared pacer answers "no delay" until one replaces it.
             AdaptivePerformanceManager.getInstance().updateData(new PacingDeciderApmData(captureAvailablePacer));
 
             if (waitForSavingDraftImageTaskMapDrain) {
@@ -239,7 +237,10 @@ public class SavingDraftImageTaskManager {
                 waitForSavingDraftImageTaskMapDrain = false;
                 isWatchdogDrainInCurrentSession = false;
                 hasCaptureTimeoutInCurrentSession = false;
+                // The drained queue is the burst boundary: end both session states here so the demotions and the
+                // pacing state always describe the same burst.
                 admissionPolicy.clear();
+                captureAvailablePacer.clear();
             }
         }
     }

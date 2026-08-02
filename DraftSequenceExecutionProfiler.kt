@@ -16,13 +16,10 @@ import java.util.concurrent.CompletableFuture
 private const val TAG = "DraftSequenceExecutionProfiler"
 
 /**
- * Drives one draft sequence's node lifecycle: classifies each executing node into a [WorkloadKey], asks the
- * Predictor for an admission decision, and feeds the observed outcome back at capture end.
- *
- * State is grouped by destination:
- * - [modelUpdate] buffers what the Predictor learns from (durations + decisions), drained exactly once.
- * - [metricsRecorder] is the sole writer of the [CaptureMetrics] observability store.
- * - [draftNodeChainLifecycle] owns the draft node chain's deinit timing.
+ * Drives one draft sequence's node lifecycle: resolves each executing node to a [WorkloadKey], asks the Predictor to
+ * admit it, and feeds the observed outcome back at capture end. State is grouped by destination - [modelUpdate] buffers
+ * what the Predictor learns from, [metricsRecorder] is the sole writer of the [CaptureMetrics] store, and
+ * [draftNodeChainLifecycle] owns deinit timing.
  */
 class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val isPendingRequest: Boolean,
@@ -45,11 +42,12 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private var draftSequenceStartTimeMs = 0L
 
     /**
-     * Initializes draft-node-chain profiling and observes captureAvailable pacing once before any node executes.
-     * Passes the full planned suffix (even before Bokeh's second input arrives); the pacer re-projects it onto the
-     * session's demoted shape via the [DraftSequenceAdmissionPolicy]. Encoding-only captures pace the RESERVED
-     * Encoding sequence, and captures with no predictable workloads (JPEG passthrough) pass a null key so their
-     * admission record is still consumed - captureAvailable admission and draft-start observations stay balanced.
+     * Initializes draft-node-chain profiling and, before any node executes, starts this draft sequence on the pacer -
+     * consuming the admission that gated this capture and refreshing what the next callback prices against.
+     *
+     * The key passed is the full planned suffix, even before Bokeh's second input arrives; the pacer re-projects it
+     * onto the burst's demoted shape. Encoding-only captures pace the RESERVED Encoding sequence, and JPEG passthrough
+     * passes null so its admission is still consumed and the FIFO stays balanced.
      */
     fun initialize(accessor: DraftNodeChainAccessor) {
         draftNodeChainLifecycle.attach(accessor)
@@ -68,20 +66,16 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             pacerSessionId = captureAvailablePacer.getCurrentSessionId(),
         )
 
-        // Memory, thermal, and storage are observability inputs; only the timeout budget must stay fresh per node.
-        // Sampling them once keeps DeviceStateReader's blocking dispatcher work off every node transition.
+        // Observability inputs only - just the timeout budget must stay fresh per node. Sampling them once keeps
+        // DeviceStateReader's blocking dispatcher work off every node transition.
         deviceStateSnapshot = deviceStateReader.read()
     }
 
     /**
-     * Profiles one predictable node execution.
-     *
-     * OPTIONAL workloads are admitted by their remaining suffix UB, hardened by session-sticky demotion: the first
-     * in-session rejection of Bokeh, or of the Decoding-Filter-Overlay Watermark chain, forces rejection until the
-     * draft pipeline drains ([DraftSequenceAdmissionPolicy.clear]), so one burst never alternates effects between
-     * shots.
-     * JPEG-path Decoding is forced when required by Frame Watermark. REQUIRED workloads (DynamicFunction / Frame
-     * Watermark) always run but are not reserve-protected; RESERVED workload is the mandatory tail.
+     * Profiles one predictable node execution. OPTIONAL workloads are admitted by their remaining suffix upper bound,
+     * hardened by the sticky group demotion in [DraftSequenceAdmissionPolicy] so one burst never alternates effects
+     * between shots. REQUIRED work (DynamicFunction, Frame Watermark) always runs but is not reserve-protected; the
+     * RESERVED workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = resolveWorkloadKey(node, requireReadyToRun = true) ?: return null
@@ -184,7 +178,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftSequenceDurationMs)
         }
-        // Keep the session's size-scoped duration estimate aligned to this completed draft.
+        // Keep the session's size-scoped observed max aligned to this completed draft.
         captureAvailablePacer.endDraftSequence(sizeBucket, draftSequenceDurationMs)
 
         val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
@@ -238,9 +232,9 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 }
 
 /**
- * What one capture teaches the Predictor: actual workload durations plus the admission decisions that produced
- * them, buffered during node execution and drained exactly once at capture end. Cancelling the draft sequence
- * does not clear it - a later complete still drains the samples collected so far.
+ * What one capture teaches the Predictor: actual workload durations plus the decisions that produced them, buffered
+ * during node execution and drained exactly once at capture end. Cancelling does not clear it - a later complete still
+ * drains the samples collected so far.
  */
 private class ModelUpdateBuffer {
     private val lock = Any()
@@ -273,12 +267,11 @@ private class ModelUpdateBuffer {
 }
 
 /**
- * Sole writer of the [CaptureMetrics]/[DraftSequenceMetrics] observability store; nothing model-facing reads
- * from it. Kept in one place so retiring [CaptureMetrics] in favor of logs is a single-class change.
+ * Sole writer of the [CaptureMetrics]/[DraftSequenceMetrics] observability store, which nothing model-facing reads -
+ * kept in one place so retiring it in favour of logs is a single-class change.
  *
- * Writers arrive from three threads - node execution (process), workload completion (worker), and the watchdog -
- * so every mutation is guarded by the [draftSequenceMetrics] monitor to give the export reader a single
- * happens-before edge over both the lists and the scalar flags.
+ * Writers arrive from three threads (node execution, workload completion, watchdog), so every mutation takes the
+ * [draftSequenceMetrics] monitor to give the export reader one happens-before edge over the lists and the flags alike.
  */
 private class MetricsRecorder(
     captureMetrics: CaptureMetrics,
@@ -353,13 +346,10 @@ private class MetricsRecorder(
 }
 
 /**
- * Owns the draft node chain's deinit timing. Normally [deinitializeOnce] deinitializes at once,
- * but a workload that timed out leaves its worker running on the chain; [deferUntil] records that worker so
- * deinit is deferred until it actually finishes. Deinit runs exactly once.
- *
- * Single-use, one instance per draft sequence. [deferUntil] (process thread, during node execution)
- * always runs before [deinitializeOnce] (process thread, at task end), so recording the worker is
- * enough - there is no request/worker ordering to reconcile.
+ * Owns the draft node chain's deinit timing, exactly once per draft sequence. [deinitializeOnce] normally deinitializes
+ * straight away, but a timed-out workload leaves its worker running on the chain, so [deferUntil] records that worker
+ * and deinit waits for it. Both run on the process thread, [deferUntil] always first, so there is no ordering to
+ * reconcile beyond recording the worker.
  */
 private class DraftNodeChainLifecycle {
     private val lock = Any()

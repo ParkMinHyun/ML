@@ -8,17 +8,15 @@ import kotlin.math.roundToLong
 private const val TAG = "DraftSequenceExecutionPredictor"
 
 /**
- * Sequence-aware, phase-aware, adaptive upper bound.
+ * Sequence-aware duration model with an adaptive upper bound.
  *
- * Point prediction is the sum of per-workload baselines multiplied by one shared thermal-condition factor. The safety
- * margin is a multiplicative residual calibrated from positive residual ratios captured before model updates; exact
- * decision-sequence residuals win, with global residuals as the cold-sequence fallback.
+ * Point prediction is the sum of per-workload baselines times one shared thermal-condition factor. The safety margin is
+ * a multiplicative residual calibrated from positive residual ratios captured before model updates, keyed on the exact
+ * decision sequence with a global fallback for cold ones.
  *
- * Besides admission, [estimateWorkloadSequenceDurationMs] snapshots the model for [CaptureAvailablePacer], which owns
- * captureAvailable pacing and only consumes these estimates.
- *
- * Owned by the draft-saving task manager and shared by the profilers it creates across captures, so the model
- * lives exactly as long as the draft pipeline it learned from.
+ * The upper bound is for admission only - [CaptureAvailablePacer] reads the estimate family and never the bound. Owned
+ * by the draft-saving task manager and shared by every profiler it creates, so the model lives exactly as long as the
+ * draft pipeline it learned from.
  */
 class DraftSequenceExecutionPredictor {
 
@@ -35,9 +33,8 @@ class DraftSequenceExecutionPredictor {
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         val workloadSequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         val workloadSequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
-        // Only OPTIONAL work is gated, and only by the learned sequence upper bound: budget deficits are observed
-        // separately and consumed by [CaptureAvailablePacer] as the captureAvailable pacing delay. Since the other
-        // policies always admit, a rejection here is by definition an OPTIONAL one.
+        // Only OPTIONAL work is gated, and only by the learned upper bound - budget deficits are the pacer's business.
+        // The other policies always admit, so a rejection here is by definition an OPTIONAL one.
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
             WorkloadPolicy.OPTIONAL -> admitsOptionalWorkload(
                 workloadSequencePredictedMs,
@@ -71,9 +68,8 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         workloadPredictedMs: Map<WorkloadKey, Double>,
     ): Double {
-        // Walk tail -> head. Monotonic inclusion: each suffix is bounded by at least its own residual-inflated bound
-        // and at least its head estimate plus the already-corrected tail, so nested-sequence bounds never invert.
-        // (Since exp(C) >= 1, the tail step's max() already returns that bound - the last workload needs no case.)
+        // Walk tail -> head, each suffix bounded by both its own residual-inflated bound and its head estimate plus the
+        // corrected tail, so nested-sequence bounds never invert. exp(C) >= 1, so the tail step needs no special case.
         val workloadKeys = workloadSequenceKey.workloadKeys
         var correctedUpperBoundMs = 0.0
         var suffixPredictedMs = 0.0
@@ -100,10 +96,9 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Watchdog budget for the OPTIONAL workload at the head of [workloadSequenceKey]: the time left after reserving
-     * the sequence's mandatory RESERVED work. REQUIRED workloads are measured but not reserved for.
-     * [WatchdogTimeoutDecision.decision] is null when the sequence has no mandatory reserve - the whole budget is
-     * granted and there is nothing to calibrate.
+     * Watchdog budget for the OPTIONAL workload at the head of [workloadSequenceKey]: what is left after reserving the
+     * sequence's RESERVED tail (REQUIRED work is measured but not reserved for). With no tail to reserve, the whole
+     * budget is granted and [WatchdogTimeoutDecision.decision] is null - nothing to calibrate.
      */
     @Synchronized
     fun predictWatchdogTimeout(
@@ -134,9 +129,9 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Learns every duration trend this capture can teach: per-workload baselines, the sequence residual margin, and
-     * the whole-draft time outside node processing. [draftSequenceDurationMs] is the completed draft's real
-     * duration; non-positive means it was not measured and the overhead trend keeps its history.
+     * Learns every trend this capture can teach: per-workload baselines, the sequence residual margin, and the time
+     * outside node processing. A non-positive [draftSequenceDurationMs] was not measured, so the overhead trend keeps
+     * its history.
      */
     @Synchronized
     fun learnFromCapture(
@@ -151,9 +146,9 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Point estimate for [workloadSequenceKey] - the one input [CaptureAvailablePacer] paces captureAvailable
-     * callbacks with. No upper bound is offered: pacing bounds a capture by observed draft wall time, not by this
-     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequenceReservedDurationMs).
+     * Point estimate for [workloadSequenceKey]: node processing alone, which is what the backlog clock prices a queued
+     * draft by. No upper bound is offered - pacing reserves by the burst's observed durations, not by this model, and
+     * exposing one only invites re-coupling the two.
      */
     @Synchronized
     fun estimateWorkloadSequenceDurationMs(workloadSequenceKey: WorkloadSequenceKey): Double {
@@ -161,23 +156,21 @@ class DraftSequenceExecutionPredictor {
         return sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
     }
 
-    /** Learned wall time outside node processing, priced once per whole draft. Exposed for pacing metrics. */
+    /** Learned time outside node processing, added once per draft - by the backlog clock per queued draft, too. */
     @Synchronized
     fun estimateDraftSequenceOverheadDurationMs(): Double = draftDurationOverhead.estimateMs()
 
     /**
-     * Whole-draft occupancy estimate: [estimateWorkloadSequenceDurationMs] plus
-     * [estimateDraftSequenceOverheadDurationMs]. Every caller pricing a real draft wants this one - the node point sum
-     * alone omits the pipeline time between nodes, so a caller that reaches for the point sum and adds the overhead
-     * itself is one edit away from forgetting to.
+     * Whole-draft occupancy: the two estimates above. Every caller pricing a real draft wants this one - adding the
+     * overhead at the call site is one edit away from forgetting to.
      */
     @Synchronized
     fun estimateDraftSequenceDurationMs(workloadSequenceKey: WorkloadSequenceKey): Double =
         estimateWorkloadSequenceDurationMs(workloadSequenceKey) + draftDurationOverhead.estimateMs()
 
     /**
-     * Whole-draft time outside node processing: inter-node gaps, deinit, and scheduling. The recency-weighted mean
-     * prices each queued draft's real pipeline occupancy; a median would under-price its right-skewed distribution.
+     * Time outside node processing: inter-node gaps, deinit, scheduling. Recency-weighted mean, not median - the
+     * distribution is right-skewed and a median under-prices it.
      */
     private class DraftDurationOverhead {
         private val overheadScores = RecencyWeightedDistribution()
@@ -200,9 +193,9 @@ class DraftSequenceExecutionPredictor {
      * Per-workload duration trend as a multiplicative decomposition:
      * duration(size) ≈ baseline(size) × shared condition.
      *
-     * The per-size baseline is condition-stripped and structurally stable. The shared condition is the recency-
-     * weighted median of recent duration/baseline ratios, robust to one stalled draft while carrying sustained
-     * thermal throttling across workload families and sizes.
+     * The per-size baseline is condition-stripped and structurally stable; the shared condition is the recency-weighted
+     * median of recent duration/baseline ratios, robust to one stalled draft while carrying sustained thermal
+     * throttling across workload families and sizes.
      */
     private class WorkloadDurationTrend {
         private val baselineByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
@@ -236,10 +229,9 @@ class DraftSequenceExecutionPredictor {
         }
 
         /**
-         * A size with no baseline yet: scale the slowest same-family sibling by the megapixel ratio, so a cold size
-         * is priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero
-         * when the family has never run at any size - the only case this model cannot price. Runs until this size
-         * is observed once, after which [estimateDurationMs] returns its own baseline and never comes back here.
+         * A size with no baseline yet: scale the slowest same-family sibling by the megapixel ratio, so a cold size is
+         * priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero only
+         * when the family has never run at any size. Unreachable once this size has been observed once.
          */
         private fun estimateColdDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
             var siblingBaselineMs = 0.0
@@ -258,9 +250,9 @@ class DraftSequenceExecutionPredictor {
         }
 
         /**
-         * Running mean of duration with the capture's shared condition divided out. Every sample weighs 1/n, the
-         * deliberate opposite of the recency-weighted condition it is paired with: the baseline converges to a stable
-         * per-size anchor instead of chasing a transient, so a size not shot for a while keeps its true structure.
+         * Running mean of duration with the capture's shared condition divided out. Equal 1/n weights, the deliberate
+         * opposite of the recency-weighted condition it pairs with: the baseline converges to a stable per-size anchor
+         * instead of chasing a transient, so a size not shot for a while keeps its structure.
          */
         private class EqualWeightedMean {
             private var sampleCount: Int = 0
@@ -279,8 +271,8 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Sequence-specific upper-bound residual distributions with a global cold-sequence fallback: a sequence shot
-     * often enough to have its own residual history is bounded by it, everything else by the pooled one.
+     * Upper-bound residuals per sequence, pooled globally as the cold-sequence fallback: a sequence with its own
+     * residual history is bounded by it, everything else by the pool.
      */
     private class WorkloadSequenceResidual {
         private val residualsBySequence = mutableMapOf<WorkloadSequenceKey, RecencyWeightedDistribution>()
@@ -320,8 +312,8 @@ class DraftSequenceExecutionPredictor {
         }
 
         /**
-         * Containment-scoped actual: each workload contributes max(decision-time prediction, actual), so one overrun
-         * is retained even when another workload happened to run fast. Incomplete sequences cannot be scored.
+         * Each workload contributes max(decision-time prediction, actual), so one overrun survives another workload
+         * happening to run fast. Null for an incomplete sequence, which cannot be scored.
          */
         private fun sumFlooredActualMs(
             decision: AdmissionDecision,
@@ -351,10 +343,9 @@ class DraftSequenceExecutionPredictor {
 
     companion object {
         /**
-         * The OPTIONAL gate itself, stateless so a decision can be re-derived from a persisted prediction alone.
-         * Offline replay calls this exact function to answer "what would today's model admit", the same way it
-         * replays through a real [DraftSequenceAdmissionPolicy]; a copy of this rule would let the two drift and
-         * report a gate change as no change.
+         * The OPTIONAL gate itself, stateless so a decision can be re-derived from a persisted prediction alone:
+         * offline replay calls this exact function, and a second copy of the rule would drift and report a gate change
+         * as no change.
          */
         internal fun admitsOptionalWorkload(
             workloadSequencePredictedMs: Double,
@@ -367,16 +358,15 @@ class DraftSequenceExecutionPredictor {
 }
 
 /**
- * One admission decision. [executionPrediction] is the persisted decision record (replay-ready); the remaining
- * fields are decision-time calibration inputs that [DraftSequenceExecutionPredictor.learnFromCapture] consumes once
- * at capture end. They stay outside [ExecutionPrediction] on purpose: a typed key and a per-workload map do not
- * belong in the metrics store.
+ * One admission decision: [executionPrediction] is the persisted, replay-ready record, and the rest are decision-time
+ * calibration inputs [DraftSequenceExecutionPredictor.learnFromCapture] consumes at capture end. They stay out of
+ * [ExecutionPrediction] because a typed key and a per-workload map do not belong in the metrics store.
  */
 data class AdmissionDecision(
     val executionPrediction: ExecutionPrediction,
     /** Sequence this decision was made for; capture-end score samples are keyed by it. */
     val workloadSequenceKey: WorkloadSequenceKey,
-    /** Per-workload decision-time prediction, used to clamp workload underruns so one workload's spike is not diluted. */
+    /** Per-workload decision-time prediction, clamping workload underruns so one workload's spike is not diluted. */
     val workloadPredictedMs: Map<WorkloadKey, Double>,
 )
 

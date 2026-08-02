@@ -14,9 +14,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 private const val TAG = "DraftSequenceExecutionSession"
 
 /**
- * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution]. It owns admission skip,
- * optional worker timeout, delayed completion, and metric completion. Which of those behaviors a session
- * gets is defined by the per-[WorkloadPolicy] factories in the companion.
+ * Handle returned by [DraftSequenceExecutionProfiler.profileNodeExecution]: admission skip, optional worker timeout,
+ * deferred completion, and measurement. Which of those a session gets is set by the [WorkloadPolicy] factories below.
  */
 class DraftSequenceExecutionSession private constructor(
     private val shouldRun: Boolean = true,
@@ -72,8 +71,8 @@ class DraftSequenceExecutionSession private constructor(
         try {
             return future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (e: TimeoutException) {
-            // The worker keeps running detached: release its late result, and hand its future to the
-            // node chain so it defers deinit until the worker actually finishes.
+            // The worker keeps running detached: release its late result, and hand its future to the node chain so
+            // deinit waits for it.
             result.thenAccept(::releaseTimedOutResult)
             onTimedOutTask(result)
             throw e
