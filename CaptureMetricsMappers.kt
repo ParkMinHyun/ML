@@ -19,7 +19,7 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
         draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
         draftSequencePredictedDurationMs = snapshot.draftSequencePredictedDurationMs,
         draftSequenceOverheadDurationMs = snapshot.draftSequenceOverheadDurationMs,
-        draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs,
+        draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs,
         draftSequenceKey = snapshot.draftSequenceKey,
     )
 }
@@ -64,7 +64,7 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         draftSequenceBudgetMs = draftSequenceBudgetMs,
         draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
         draftSequenceOverheadDurationMs = draftSequenceOverheadDurationMs,
-        draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+        draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
         draftSequenceKey = draftSequenceKey,
     )
 }
@@ -223,7 +223,7 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         draftSequenceBudgetMs = draftSequenceBudgetMs,
         draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
         draftSequenceOverheadDurationMs = draftSequenceOverheadDurationMs,
-        draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+        draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
         draftSequenceKey = draftSequenceKey,
     )
 }

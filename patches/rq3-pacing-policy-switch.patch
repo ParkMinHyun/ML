@@ -33,7 +33,7 @@ backlog clock so that column stays comparable across arms.
 
 diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
 new file mode 100644
-index 0000000..01bb460
+index 0000000..42fe714
 --- /dev/null
 +++ b/CaptureAvailableDelayPolicy.kt
 @@ -0,0 +1,105 @@
@@ -65,7 +65,7 @@ index 0000000..01bb460
 +    ) = Unit
 +
 +    /** A draft left the single-worker pipeline with a measured wall time. */
-+    fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) = Unit
++    fun onDraftMeasured(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) = Unit
 +
 +    /** The burst session ended. Pipeline-lifetime calibration may deliberately survive this. */
 +    fun clearSession() = Unit
@@ -81,7 +81,7 @@ index 0000000..01bb460
 +data class CaptureAvailableDelayPolicyInput(
 +    val decisionUptimeMs: Long,
 +    val draftSequenceBudgetMs: Long,
-+    val draftSequencePacingDurationMs: Double,
++    val draftSequenceReservedDurationMs: Double,
 +    val backlogMs: Long,
 +    val queuedDraftCount: Int,
 +    val timeToDeadlineMs: Long,
@@ -128,12 +128,12 @@ index 0000000..01bb460
 +    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
 +        val levelDeficitMs = computeLevelDeficitMs(
 +            draftSequenceBudgetMs = input.draftSequenceBudgetMs,
-+            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++            draftSequenceReservedDurationMs = input.draftSequenceReservedDurationMs,
 +        )
 +        val backlogDeficitMs = computeBacklogDeficitMs(
 +            backlogMs = input.backlogMs,
 +            timeToDeadlineMs = input.timeToDeadlineMs,
-+            draftSequencePacingDurationMs = input.draftSequencePacingDurationMs,
++            draftSequenceReservedDurationMs = input.draftSequenceReservedDurationMs,
 +        )
 +        return CaptureAvailableDelayPolicyDecision(
 +            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
@@ -199,7 +199,7 @@ index 0000000..1d98bb4
 +    }
 +}
 diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index f6c0197..6d2ac7b 100644
+index 5385f30..0059832 100644
 --- a/CaptureAvailablePacer.kt
 +++ b/CaptureAvailablePacer.kt
 @@ -26,9 +26,10 @@ fun interface CaptureAvailablePacingDecider {
@@ -236,20 +236,20 @@ index f6c0197..6d2ac7b 100644
          val nowUptimeMs = SystemClock.uptimeMillis()
          val timeToDeadlineMs = computeTimeToDeadlineMs(nowUptimeMs)
          val backlogMs = session.backlogMsAt(nowUptimeMs)
--        val draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs
+-        val draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs
 -        val levelDeficitMs = computeLevelDeficitMs(
 -            draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
--            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+-            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
 -        )
 -        val backlogDeficitMs = computeBacklogDeficitMs(
 -            backlogMs = backlogMs,
 -            timeToDeadlineMs = timeToDeadlineMs,
--            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+-            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
 +        val policyDecision = delayPolicy.decide(
 +            CaptureAvailableDelayPolicyInput(
 +                decisionUptimeMs = nowUptimeMs,
 +                draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
-+                draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs,
++                draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs,
 +                backlogMs = backlogMs,
 +                queuedDraftCount = session.queuedDraftCount,
 +                timeToDeadlineMs = timeToDeadlineMs,
@@ -277,9 +277,9 @@ index f6c0197..6d2ac7b 100644
 +                .also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
          }
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
-         val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
+         val draftSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey)
 @@ -131,6 +134,10 @@ class CaptureAvailablePacer(
-             predictor.estimateDraftSequenceWallMs(draftSequenceKey),
+             predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
          )
  
 +        // Read after the snapshot work, where the session used to read it: one "now" now serves both the clock
@@ -290,7 +290,7 @@ index f6c0197..6d2ac7b 100644
              CaptureAvailablePacingSnapshot(
                  draftSequenceBudgetMs = budgetMs,
 @@ -139,7 +146,8 @@ class CaptureAvailablePacer(
-                 draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
                  draftSequenceKey = draftSequenceKey.toReplayString(),
              ),
 -        )
@@ -301,9 +301,9 @@ index f6c0197..6d2ac7b 100644
      /**
 @@ -149,6 +157,7 @@ class CaptureAvailablePacer(
      @Synchronized
-     fun endDraftSequence(sizeBucket: SizeBucket, draftWallMs: Long) {
-         captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
-+        delayPolicy.onDraftMeasured(sizeBucket, draftWallMs)
+     fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+         captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftSequenceDurationMs)
++        delayPolicy.onDraftMeasured(sizeBucket, draftSequenceDurationMs)
      }
  
      /**
@@ -361,7 +361,7 @@ index c9caac7..ae14059 100644
      }
  
 diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
-index a70b0e6..8b3ad90 100644
+index e71c387..7922bf3 100644
 --- a/CaptureMetricsExcelExporter.kt
 +++ b/CaptureMetricsExcelExporter.kt
 @@ -66,6 +66,7 @@ class CaptureMetricsExcelExporter(
@@ -437,7 +437,7 @@ index a70b0e6..8b3ad90 100644
                  note = "columns for judging a future draft-wall-time-based clock. draftOccupancyUnderpriceMs " +
 diff --git a/ControlledDelayPacingPolicy.kt b/ControlledDelayPacingPolicy.kt
 new file mode 100644
-index 0000000..5059991
+index 0000000..5730705
 --- /dev/null
 +++ b/ControlledDelayPacingPolicy.kt
 @@ -0,0 +1,196 @@
@@ -571,14 +571,14 @@ index 0000000..5059991
 +        }
 +    }
 +
-+    override fun onDraftMeasured(sizeBucket: SizeBucket, draftWallMs: Long) {
-+        if (draftWallMs <= 0L) {
++    override fun onDraftMeasured(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
++        if (draftSequenceDurationMs <= 0L) {
 +            return
 +        }
 +        serviceTimeMs = if (serviceTimeMs <= 0.0) {
-+            draftWallMs.toDouble()
++            draftSequenceDurationMs.toDouble()
 +        } else {
-+            serviceTimeMs * (1.0 - config.serviceTimeAlpha) + draftWallMs * config.serviceTimeAlpha
++            serviceTimeMs * (1.0 - config.serviceTimeAlpha) + draftSequenceDurationMs * config.serviceTimeAlpha
 +        }
 +    }
 +
@@ -1004,7 +1004,7 @@ index 785bcc7..c02dcf3 100644
          json.dump(payload, handle, indent=2, default=float)
          handle.write("\n")
 diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
-index deb603b..ba4d712 100644
+index cfac3cd..b728de7 100644
 --- a/external/apm/policy/CaptureAvailableApmPolicy.java
 +++ b/external/apm/policy/CaptureAvailableApmPolicy.java
 @@ -153,7 +153,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {

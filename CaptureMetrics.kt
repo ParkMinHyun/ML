@@ -74,8 +74,8 @@ data class CaptureAvailablePacingMetrics(
     val draftSequencePredictedDurationMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
-    /** Draft-sequence duration both pacing deficits use; see [CaptureAvailablePacingSnapshot]. */
-    val draftSequencePacingDurationMs: Double,
+    /** Draft-sequence duration both deficits set aside for this capture; see [CaptureAvailablePacingSnapshot]. */
+    val draftSequenceReservedDurationMs: Double,
     val draftSequenceKey: String,
 )
 

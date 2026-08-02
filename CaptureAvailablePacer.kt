@@ -75,15 +75,15 @@ class CaptureAvailablePacer(
         val nowUptimeMs = SystemClock.uptimeMillis()
         val timeToDeadlineMs = computeTimeToDeadlineMs(nowUptimeMs)
         val backlogMs = session.backlogMsAt(nowUptimeMs)
-        val draftSequencePacingDurationMs = snapshot.draftSequencePacingDurationMs
+        val draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs
         val levelDeficitMs = computeLevelDeficitMs(
             draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
-            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
         )
         val backlogDeficitMs = computeBacklogDeficitMs(
             backlogMs = backlogMs,
             timeToDeadlineMs = timeToDeadlineMs,
-            draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
         )
 
         val decision = CaptureAvailablePacingDecision(
@@ -116,27 +116,27 @@ class CaptureAvailablePacer(
             return session.updatePacingSnapshot(null)
         }
         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(plannedSequenceKey)
-        val draftSequencePredictedDurationMs = predictor.estimateDraftSequenceMs(draftSequenceKey)
+        val draftSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey)
         val demotedWorkloadMs = if (draftSequenceKey == plannedSequenceKey) {
             0.0
         } else {
-            (predictor.estimateDraftSequenceMs(plannedSequenceKey) - draftSequencePredictedDurationMs)
+            (predictor.estimateWorkloadSequenceDurationMs(plannedSequenceKey) - draftSequencePredictedDurationMs)
                 .coerceAtLeast(0.0)
         }
         val currentSizeBucket = plannedSequenceKey.headWorkloadKey.sizeBucket
         // Floored by the whole-draft estimate, not the node point sum: the reserve prices the same draft occupancy
         // the backlog clock does, so a session with no observed max yet cannot reserve less than one draft's wall.
-        val draftSequencePacingDurationMs = maxOf(
+        val draftSequenceReservedDurationMs = maxOf(
             session.getMaxDraftSequenceDurationMs(currentSizeBucket).toDouble() - demotedWorkloadMs,
-            predictor.estimateDraftSequenceWallMs(draftSequenceKey),
+            predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
         )
 
         return session.updatePacingSnapshot(
             CaptureAvailablePacingSnapshot(
                 draftSequenceBudgetMs = budgetMs,
                 draftSequencePredictedDurationMs = draftSequencePredictedDurationMs,
-                draftSequenceOverheadDurationMs = predictor.estimateDraftOverheadMs(),
-                draftSequencePacingDurationMs = draftSequencePacingDurationMs,
+                draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
+                draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
                 draftSequenceKey = draftSequenceKey.toReplayString(),
             ),
         )
@@ -147,8 +147,8 @@ class CaptureAvailablePacer(
      * teaches the predictor's overhead trend, but that is model learning and the draft pipeline feeds it there directly.
      */
     @Synchronized
-    fun endDraftSequence(sizeBucket: SizeBucket, draftWallMs: Long) {
-        captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftWallMs)
+    fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+        captureAvailablePacingSession?.updateDraftSequenceDuration(sizeBucket, draftSequenceDurationMs)
     }
 
     /**
@@ -203,12 +203,12 @@ class CaptureAvailablePacer(
  */
 internal fun computeLevelDeficitMs(
     draftSequenceBudgetMs: Long,
-    draftSequencePacingDurationMs: Double,
-): Long = ceil(draftSequencePacingDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
+    draftSequenceReservedDurationMs: Double,
+): Long = ceil(draftSequenceReservedDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
 
 /**
  * How far past its deadline the admitted work is projected to finish: the queue drains over [backlogMs], then one more
- * draft runs for [draftSequencePacingDurationMs], against the [timeToDeadlineMs] left in the window it is priced in.
+ * draft runs for [draftSequenceReservedDurationMs], against the [timeToDeadlineMs] left in the window it is priced in.
  * Work minus time left, the same shape [computeLevelDeficitMs] has - the two differ only in whose window they read and
  * whether the queue counts.
  *
@@ -223,9 +223,9 @@ internal fun computeLevelDeficitMs(
 internal fun computeBacklogDeficitMs(
     backlogMs: Long,
     timeToDeadlineMs: Long,
-    draftSequencePacingDurationMs: Double,
+    draftSequenceReservedDurationMs: Double,
 ): Long = ceil(
-    backlogMs + draftSequencePacingDurationMs - timeToDeadlineMs,
+    backlogMs + draftSequenceReservedDurationMs - timeToDeadlineMs,
 ).toLong().coerceAtLeast(0L)
 
 /** What one draft start hands the next captureAvailable decision to price with. */
@@ -235,11 +235,11 @@ data class CaptureAvailablePacingSnapshot(
     /** Learned between-node overhead added once per queued draft to the backlog clock (clock = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
     /**
-     * Draft-sequence duration estimate both deficits set aside for the capture being paced. Not a model bound despite
-     * sitting beside one: it is the session's observed max draft wall time re-projected onto this draft sequence,
-     * floored by the point prediction (all a session's first capture has).
+     * Draft-sequence duration both deficits set aside for the capture being paced. Not a model bound despite sitting
+     * beside one: it is the session's observed max draft-sequence duration re-projected onto this draft sequence,
+     * floored by the model estimate (all a session's first capture has).
      */
-    val draftSequencePacingDurationMs: Double,
+    val draftSequenceReservedDurationMs: Double,
     val draftSequenceKey: String,
 )
 

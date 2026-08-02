@@ -114,8 +114,8 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "draft_sequence_overhead_duration_ms")
     val draftSequenceOverheadDurationMs: Double,
 
-    @ColumnInfo(name = "draft_sequence_pacing_duration_ms")
-    val draftSequencePacingDurationMs: Double,
+    @ColumnInfo(name = "draft_sequence_reserved_duration_ms")
+    val draftSequenceReservedDurationMs: Double,
 
     @ColumnInfo(name = "draft_sequence_key")
     val draftSequenceKey: String,

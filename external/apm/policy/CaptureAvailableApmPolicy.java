@@ -159,7 +159,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
             pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
                     + ", draftSequencePredictedDuration=" + pacingSnapshot.getDraftSequencePredictedDurationMs() + "ms"
                     + ", draftSequenceOverheadDuration=" + pacingSnapshot.getDraftSequenceOverheadDurationMs() + "ms"
-                    + ", draftSequencePacingDuration=" + pacingSnapshot.getDraftSequencePacingDurationMs() + "ms"
+                    + ", draftSequenceReservedDuration=" + pacingSnapshot.getDraftSequenceReservedDurationMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
                     + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
                     + ", draftSequenceKey=" + pacingSnapshot.getDraftSequenceKey();

@@ -142,13 +142,13 @@ class CaptureMetricsExcelExporter(
             }
             if (endMs <= decisionMs && endMs > freshestEndMs) {
                 freshestEndMs = endMs
-                freshestWallMs = other.draftWallMs
+                freshestWallMs = other.draftSequenceDurationMs
             }
             val samePacerSession = other.metrics.draftSequenceMetrics?.pacerSessionId == memberPacerSession
             if (endMs > decisionMs || !samePacerSession) {
                 continue
             }
-            val wallMs = other.draftWallMs ?: continue
+            val wallMs = other.draftSequenceDurationMs ?: continue
             if (observedMaxMs == null || wallMs > observedMaxMs) {
                 observedMaxMs = wallMs
             }
@@ -486,8 +486,8 @@ class CaptureMetricsExcelExporter(
                 val workloadKey = row.replayWorkloadKey() ?: continue
 
                 val modelAdmit = DraftSequenceExecutionPredictor.admitsOptionalWorkload(
-                    sequencePredictedMs = prediction.sequencePredictedDurationMs,
-                    sequenceUpperBoundMs = prediction.sequencePredictedUpperBoundMs,
+                    workloadSequencePredictedMs = prediction.sequencePredictedDurationMs,
+                    workloadSequenceUpperBoundMs = prediction.sequencePredictedUpperBoundMs,
                     budgetMs = row.node.preExecutionMetrics.budgetMs,
                 )
                 val hasFrameWatermark = prediction.workloadSequenceKey?.contains(WATERMARK_TYPE_FRAME) == true
@@ -644,7 +644,7 @@ class CaptureMetricsExcelExporter(
             get() = metrics.draftSequenceMetrics?.draftEndUptimeMs
 
         /** Whole-draft wall time; the offline counterpart of the pacer's observed draft timing input. */
-        val draftWallMs: Long?
+        val draftSequenceDurationMs: Long?
             get() {
                 val startMs = draftStartUptimeMs ?: return null
                 val endMs = draftEndUptimeMs ?: return null
@@ -659,7 +659,7 @@ class CaptureMetricsExcelExporter(
                 return deadlineMs - endMs
             }
 
-        val draftSequenceDurationMs: Long?
+        val workloadSequenceDurationMs: Long?
             get() = nodeRows.sumOf { row -> row.node.postExecutionMetrics.durationMs }
                 .takeIf { durationMs -> durationMs > 0L }
 
@@ -798,7 +798,7 @@ class CaptureMetricsExcelExporter(
     ) {
         val captureTimeoutMs: Long = MakerFeature.CAPTURE_TIMEOUT_MS
         private val backlogBaseWithoutShutterToDecisionMs =
-            before.backlogMs + before.draftSequencePacingDurationMs - captureTimeoutMs
+            before.backlogMs + before.draftSequenceReservedDurationMs - captureTimeoutMs
 
         val inferredShutterToDecisionMs: Long? = if (before.backlogDeficitMs > 0L) {
             (before.backlogDeficitMs - ceil(backlogBaseWithoutShutterToDecisionMs).toLong()).coerceAtLeast(0L)
@@ -816,7 +816,7 @@ class CaptureMetricsExcelExporter(
             recordedShutterToDecisionMs ?: inferredShutterToDecisionMs
         val shutterToDecisionMinMs: Long = knownShutterToDecisionMs ?: 0L
         val shutterToDecisionMaxMs: Long = knownShutterToDecisionMs ?: floor(
-            (captureTimeoutMs - before.backlogMs - before.draftSequencePacingDurationMs).coerceAtLeast(0.0),
+            (captureTimeoutMs - before.backlogMs - before.draftSequenceReservedDurationMs).coerceAtLeast(0.0),
         ).toLong()
         val shutterToDecisionInference: String = when {
             recordedShutterToDecisionMs != null -> PACING_SHUTTER_TO_DECISION_RECORDED
@@ -826,18 +826,18 @@ class CaptureMetricsExcelExporter(
 
         val afterLevelDeficitMs: Long = computeLevelDeficitMs(
             draftSequenceBudgetMs = before.draftSequenceBudgetMs,
-            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
+            draftSequenceReservedDurationMs = before.draftSequenceReservedDurationMs,
         )
         // Least spent leaves the most window, which is the smallest deficit - so the bounds cross over here.
         val afterBacklogDeficitMinMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
             timeToDeadlineMs = captureTimeoutMs - shutterToDecisionMinMs,
-            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
+            draftSequenceReservedDurationMs = before.draftSequenceReservedDurationMs,
         )
         val afterBacklogDeficitMaxMs: Long = computeBacklogDeficitMs(
             backlogMs = before.backlogMs,
             timeToDeadlineMs = captureTimeoutMs - shutterToDecisionMaxMs,
-            draftSequencePacingDurationMs = before.draftSequencePacingDurationMs,
+            draftSequenceReservedDurationMs = before.draftSequenceReservedDurationMs,
         )
         val afterBacklogDeficitMs: Long? = afterBacklogDeficitMinMs.takeIf { minimum ->
             minimum == afterBacklogDeficitMaxMs
@@ -1338,7 +1338,7 @@ class CaptureMetricsExcelExporter(
             },
             Column("draftStartUptimeMs") { it.capture.draftStartUptimeMs },
             Column("draftEndUptimeMs") { it.capture.draftEndUptimeMs },
-            Column("draftWallMs") { it.capture.draftWallMs },
+            Column("draftSequenceDurationMs") { it.capture.draftSequenceDurationMs },
             Column("shotOverheatLevel") {
                 it.capture.nodeRows.firstOrNull()?.node?.preExecutionMetrics?.thermalSnapshot?.overheatLevel
             },
@@ -1392,10 +1392,10 @@ class CaptureMetricsExcelExporter(
             Column("firstNodeStartUptimeMs") { it.row.firstNodeStartUptimeMs },
             Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
             Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
-            Column("draftWallMs") { it.row.draftWallMs },
+            Column("draftSequenceDurationMs") { it.row.draftSequenceDurationMs },
             // Deadline minus draft end - the pacing outcome each counterfactual delay is scored against.
             Column("timeoutMarginMs") { it.row.timeoutMarginMs },
-            Column("beforeDraftSequenceDurationMs") { it.row.draftSequenceDurationMs },
+            Column("workloadSequenceDurationMs") { it.row.workloadSequenceDurationMs },
             Column("beforeCaptureTimedOut") { it.row.hasTimeoutFailure },
             Column("beforeCaptureWatchdogFailed") { it.row.hasWatchdogFailure },
             Column("firstNodeWorkloadKey") { it.row.nodeRows.firstOrNull()?.node?.workloadKey },
@@ -1443,8 +1443,8 @@ class CaptureMetricsExcelExporter(
             Column("beforeDraftSequenceOverheadDurationMs") {
                 it.row.pacingReplay?.before?.draftSequenceOverheadDurationMs
             },
-            Column("beforeDraftSequencePacingDurationMs") {
-                it.row.pacingReplay?.before?.draftSequencePacingDurationMs
+            Column("beforeDraftSequenceReservedDurationMs") {
+                it.row.pacingReplay?.before?.draftSequenceReservedDurationMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
@@ -1461,25 +1461,25 @@ class CaptureMetricsExcelExporter(
             Column("beforeAppliedDelayMs") { it.row.pacingReplay?.before?.appliedDelayMs },
             // Ceiling calibration: recorded per-capture ceiling minus this draft's wall time
             // (positive = ceiling too high = over-pacing pressure, negative = ceiling undershot the draft).
-            Column("draftSequencePacingErrorMs") {
-                val ceilingMs = it.row.pacingReplay?.before?.draftSequencePacingDurationMs
-                val draftWallMs = it.row.draftWallMs
-                if (ceilingMs != null && draftWallMs != null) ceilingMs - draftWallMs else null
+            Column("draftSequenceReserveErrorMs") {
+                val ceilingMs = it.row.pacingReplay?.before?.draftSequenceReservedDurationMs
+                val draftSequenceDurationMs = it.row.draftSequenceDurationMs
+                if (ceilingMs != null && draftSequenceDurationMs != null) ceilingMs - draftSequenceDurationMs else null
             },
             // This draft's real between-node overhead (wall minus node processing) - what the clock's learned
             // overhead term is calibrated against. Compare to beforeSessionPlannedDraftOverheadMs.
             Column("overheadActualMs") {
-                val draftWallMs = it.row.draftWallMs
-                val nodeMs = it.row.draftSequenceDurationMs
-                if (draftWallMs != null && nodeMs != null) draftWallMs - nodeMs else null
+                val draftSequenceDurationMs = it.row.draftSequenceDurationMs
+                val nodeMs = it.row.workloadSequenceDurationMs
+                if (draftSequenceDurationMs != null && nodeMs != null) draftSequenceDurationMs - nodeMs else null
             },
             // Learned overhead the clock added minus what this draft actually needed (positive = learned ran high).
             Column("overheadLearnedMinusActualMs") {
                 val learnedMs = it.row.pacingReplay?.before?.draftSequenceOverheadDurationMs
-                val draftWallMs = it.row.draftWallMs
-                val nodeMs = it.row.draftSequenceDurationMs
-                if (learnedMs != null && draftWallMs != null && nodeMs != null) {
-                    learnedMs - (draftWallMs - nodeMs)
+                val draftSequenceDurationMs = it.row.draftSequenceDurationMs
+                val nodeMs = it.row.workloadSequenceDurationMs
+                if (learnedMs != null && draftSequenceDurationMs != null && nodeMs != null) {
+                    learnedMs - (draftSequenceDurationMs - nodeMs)
                 } else {
                     null
                 }
@@ -1489,8 +1489,8 @@ class CaptureMetricsExcelExporter(
             // which is the backlog under-pricing that compounds with queue depth into a timeout.
             Column("draftOccupancyUnderpriceMs") {
                 val predMs = it.row.pacingReplay?.before?.draftSequencePredictedDurationMs
-                val draftWallMs = it.row.draftWallMs
-                if (predMs != null && draftWallMs != null) draftWallMs - predMs else null
+                val draftSequenceDurationMs = it.row.draftSequenceDurationMs
+                if (predMs != null && draftSequenceDurationMs != null) draftSequenceDurationMs - predMs else null
             },
             // ---- Draft-wall-time-base viability probes (see ReplayNotes "Wall-base pacing") ----
             // Drafts in flight when this capture was paced: the occupancy a wall-based clock must price but cannot yet
@@ -1501,7 +1501,7 @@ class CaptureMetricsExcelExporter(
             // This draft's actual wall minus that freshest observable wall: the completion-lag error a "use the latest
             // observed wall" clock would carry. Large positive during a throttle ramp = the observable wall is stale.
             Column("freshestWallLagErrorMs") {
-                val actualMs = it.row.draftWallMs
+                val actualMs = it.row.draftSequenceDurationMs
                 val freshestMs = it.wallBase.freshestCompletedDraftWallMs
                 if (actualMs != null && freshestMs != null) actualMs - freshestMs else null
             },
@@ -1524,7 +1524,7 @@ class CaptureMetricsExcelExporter(
             // How much the all-size fallback would inflate this size's ceiling (cross-size contamination): a heavy
             // MP24 draft raising an MP12 capture's reserve. Only charged while this size is cold, so a non-zero value
             // is an upper bound on the inflation, not proof of it. Clamped at 0 when this size's own max is the larger.
-            Column("draftSequencePacingCrossSizeContaminationMs") {
+            Column("draftSequenceReserveCrossSizeContaminationMs") {
                 val obsMaxMs = it.wallBase.observedMaxDraftMs
                 val sizeScopedMs = it.wallBase.sizeScopedObservedMaxDraftMs
                 if (obsMaxMs != null && sizeScopedMs != null) (obsMaxMs - sizeScopedMs).coerceAtLeast(0L) else null
@@ -1626,7 +1626,7 @@ class CaptureMetricsExcelExporter(
                     "observable yet) and freshestWallLagErrorMs (this draft's wall minus the freshest one a wall-EWMA " +
                     "could see) - large during a throttle ramp means an observed-wall clock is stale exactly when it " +
                     "matters. realQueueWaitMs is the pipeline's real time-to-free to score any clock against " +
-                    "(compare to beforeBacklogMs + beforeShutterToDecisionMs). draftSequencePacingCrossSizeContaminationMs " +
+                    "(compare to beforeBacklogMs + beforeShutterToDecisionMs). draftSequenceReserveCrossSizeContaminationMs " +
                     "(observedMaxDraftMs minus sizeScopedObservedMaxDraftMs) bounds how much a heavier other-size " +
                     "draft can inflate this capture's ceiling - the mixed-size over-pacing channel left after the " +
                     "point prediction is made size-aware; the pacer charges it only while this size is still cold. " +
@@ -1652,7 +1652,7 @@ class CaptureMetricsExcelExporter(
             Column("resultImageFileName") { it.row.metrics.resultImageFileName },
             Column("shotToShotTimeMs") { it.row.metrics.shotToShotTimeMs },
             Column("draftSequenceNodeCount") { it.row.nodeRows.size.takeIf { nodeCount -> nodeCount > 0 } },
-            Column("draftSequenceDurationMs") {
+            Column("workloadSequenceDurationMs") {
                 it.row.nodeRows.sumOf { nodeRow -> nodeRow.node.postExecutionMetrics.durationMs }
                     .takeIf { durationMs -> durationMs > 0L }
             },
@@ -1683,7 +1683,7 @@ class CaptureMetricsExcelExporter(
             Column("timeoutDeadlineUptimeMs") { it.row.metrics.timeoutTimestampMs },
             Column("draftStartUptimeMs") { it.row.draftStartUptimeMs },
             Column("draftEndUptimeMs") { it.row.draftEndUptimeMs },
-            Column("draftWallMs") { it.row.draftWallMs },
+            Column("draftSequenceDurationMs") { it.row.draftSequenceDurationMs },
             Column("timeoutMarginMs") { it.row.timeoutMarginMs },
             Column("pacerSessionId") { it.row.metrics.draftSequenceMetrics?.pacerSessionId },
             Column("") { "" },

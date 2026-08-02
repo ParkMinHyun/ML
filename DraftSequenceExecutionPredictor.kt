@@ -14,7 +14,7 @@ private const val TAG = "DraftSequenceExecutionPredictor"
  * margin is a multiplicative residual calibrated from positive residual ratios captured before model updates; exact
  * decision-sequence residuals win, with global residuals as the cold-sequence fallback.
  *
- * Besides admission, [estimateDraftSequenceMs] snapshots the model for [CaptureAvailablePacer], which owns
+ * Besides admission, [estimateWorkloadSequenceDurationMs] snapshots the model for [CaptureAvailablePacer], which owns
  * captureAvailable pacing and only consumes these estimates.
  *
  * Owned by the draft-saving task manager and shared by the profilers it creates across captures, so the model
@@ -33,24 +33,33 @@ class DraftSequenceExecutionPredictor {
     ): AdmissionDecision {
         // Memoized per decision: cold-workload estimates scan sibling baselines, and the suffix walk reuses the result.
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
-        val sequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
-        val sequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
+        val workloadSequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
+        val workloadSequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
         // Only OPTIONAL work is gated, and only by the learned sequence upper bound: budget deficits are observed
         // separately and consumed by [CaptureAvailablePacer] as the captureAvailable pacing delay. Since the other
         // policies always admit, a rejection here is by definition an OPTIONAL one.
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
-            WorkloadPolicy.OPTIONAL ->
-                admitsOptionalWorkload(sequencePredictedMs, sequenceUpperBoundMs, preExecutionMetrics.budgetMs)
+            WorkloadPolicy.OPTIONAL -> admitsOptionalWorkload(
+                workloadSequencePredictedMs,
+                workloadSequenceUpperBoundMs,
+                preExecutionMetrics.budgetMs,
+            )
             WorkloadPolicy.REQUIRED, WorkloadPolicy.RESERVED -> true
         }
         if (!admit) {
-            CLog.w(TAG, "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d", sequencePredictedMs, sequenceUpperBoundMs, preExecutionMetrics.budgetMs)
+            CLog.w(
+                TAG,
+                "[mhyun2.park] reject admission by upper bound - predictedMs=%f, upperBoundMs=%f, budgetMs=%d",
+                workloadSequencePredictedMs,
+                workloadSequenceUpperBoundMs,
+                preExecutionMetrics.budgetMs,
+            )
         }
         return AdmissionDecision(
             executionPrediction = ExecutionPrediction(
                 admit = admit,
-                sequencePredictedDurationMs = sequencePredictedMs,
-                sequencePredictedUpperBoundMs = sequenceUpperBoundMs,
+                sequencePredictedDurationMs = workloadSequencePredictedMs,
+                sequencePredictedUpperBoundMs = workloadSequenceUpperBoundMs,
                 workloadSequenceKey = workloadSequenceKey.toReplayString(),
             ),
             workloadSequenceKey = workloadSequenceKey,
@@ -126,44 +135,45 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * Learns every duration trend this capture can teach: per-workload baselines, the sequence residual margin, and
-     * the whole-draft time outside node processing. [draftWallMs] is the completed draft's real wall; non-positive
-     * means it was not measured and the overhead trend keeps its history.
+     * the whole-draft time outside node processing. [draftSequenceDurationMs] is the completed draft's real
+     * duration; non-positive means it was not measured and the overhead trend keeps its history.
      */
     @Synchronized
     fun learnFromCapture(
         workloadDurations: Map<WorkloadKey, Long>,
         admissionDecisions: Collection<AdmissionDecision>,
-        draftWallMs: Long,
+        draftSequenceDurationMs: Long,
     ) {
         val validWorkloadDurations = workloadDurations.filterValues { it > 0L }
         workloadSequenceResidual.observe(validWorkloadDurations, admissionDecisions)
         workloadDurationTrend.observe(validWorkloadDurations)
-        draftDurationOverhead.observe(validWorkloadDurations.values.sum(), draftWallMs)
+        draftDurationOverhead.observe(validWorkloadDurations.values.sum(), draftSequenceDurationMs)
     }
 
     /**
      * Point estimate for [workloadSequenceKey] - the one input [CaptureAvailablePacer] paces captureAvailable
      * callbacks with. No upper bound is offered: pacing bounds a capture by observed draft wall time, not by this
-     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequencePacingDurationMs).
+     * model, so exposing one only invites re-coupling the two (see the pacer's draftSequenceReservedDurationMs).
      */
     @Synchronized
-    fun estimateDraftSequenceMs(workloadSequenceKey: WorkloadSequenceKey): Double {
+    fun estimateWorkloadSequenceDurationMs(workloadSequenceKey: WorkloadSequenceKey): Double {
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         return sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
     }
 
     /** Learned wall time outside node processing, priced once per whole draft. Exposed for pacing metrics. */
     @Synchronized
-    fun estimateDraftOverheadMs(): Double = draftDurationOverhead.estimateMs()
+    fun estimateDraftSequenceOverheadDurationMs(): Double = draftDurationOverhead.estimateMs()
 
     /**
-     * Whole-draft occupancy estimate: [estimateDraftSequenceMs] plus [estimateDraftOverheadMs]. Every caller pricing
-     * a real draft wants this one - the node point sum alone omits the pipeline time between nodes, so a caller that
-     * reaches for the point sum and adds the overhead itself is one edit away from forgetting to.
+     * Whole-draft occupancy estimate: [estimateWorkloadSequenceDurationMs] plus
+     * [estimateDraftSequenceOverheadDurationMs]. Every caller pricing a real draft wants this one - the node point sum
+     * alone omits the pipeline time between nodes, so a caller that reaches for the point sum and adds the overhead
+     * itself is one edit away from forgetting to.
      */
     @Synchronized
-    fun estimateDraftSequenceWallMs(workloadSequenceKey: WorkloadSequenceKey): Double =
-        estimateDraftSequenceMs(workloadSequenceKey) + draftDurationOverhead.estimateMs()
+    fun estimateDraftSequenceDurationMs(workloadSequenceKey: WorkloadSequenceKey): Double =
+        estimateWorkloadSequenceDurationMs(workloadSequenceKey) + draftDurationOverhead.estimateMs()
 
     /**
      * Whole-draft time outside node processing: inter-node gaps, deinit, and scheduling. The recency-weighted mean
@@ -175,13 +185,13 @@ class DraftSequenceExecutionPredictor {
 
         fun estimateMs(): Double = learnedOverheadMs
 
-        fun observe(nodeProcessingMs: Long, draftWallMs: Long) {
-            if (draftWallMs <= 0L || nodeProcessingMs <= 0L) {
+        fun observe(nodeProcessingMs: Long, draftSequenceDurationMs: Long) {
+            if (draftSequenceDurationMs <= 0L || nodeProcessingMs <= 0L) {
                 return
             }
 
             overheadScores.decay()
-            overheadScores.add((draftWallMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            overheadScores.add((draftSequenceDurationMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
             learnedOverheadMs = overheadScores.mean()
         }
     }
@@ -347,11 +357,11 @@ class DraftSequenceExecutionPredictor {
          * report a gate change as no change.
          */
         internal fun admitsOptionalWorkload(
-            sequencePredictedMs: Double,
-            sequenceUpperBoundMs: Double,
+            workloadSequencePredictedMs: Double,
+            workloadSequenceUpperBoundMs: Double,
             budgetMs: Long,
         ): Boolean {
-            return sequencePredictedMs <= 0.0 || sequenceUpperBoundMs <= budgetMs
+            return workloadSequencePredictedMs <= 0.0 || workloadSequenceUpperBoundMs <= budgetMs
         }
     }
 }
