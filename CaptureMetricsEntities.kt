@@ -90,9 +90,6 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "level_deficit_ms")
     val levelDeficitMs: Long,
 
-    @ColumnInfo(name = "backlog_deficit_ms")
-    val backlogDeficitMs: Long,
-
     @ColumnInfo(name = "backlog_ms")
     val backlogMs: Long,
 
@@ -103,7 +100,7 @@ data class CaptureAvailablePacingMetricsEntity(
     val queuedPredictedWorkMs: Double,
 
     @ColumnInfo(name = "time_to_deadline_ms")
-    val timeToDeadlineMs: Long?,
+    val timeToDeadlineMs: Long,
 
     @ColumnInfo(name = "draft_sequence_budget_ms")
     val draftSequenceBudgetMs: Long,

@@ -10,8 +10,10 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
     return CaptureAvailablePacingMetrics(
         decisionUptimeMs = decisionUptimeMs,
         appliedDelayMs = delayMs,
-        levelDeficitMs = levelDeficitMs,
-        backlogDeficitMs = backlogDeficitMs,
+        levelDeficitMs = computeLevelDeficitMs(
+            draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
+            draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs,
+        ),
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,
@@ -56,7 +58,6 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
         decisionUptimeMs = decisionUptimeMs,
         appliedDelayMs = appliedDelayMs,
         levelDeficitMs = levelDeficitMs,
-        backlogDeficitMs = backlogDeficitMs,
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,
@@ -215,7 +216,6 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
         decisionUptimeMs = decisionUptimeMs,
         appliedDelayMs = appliedDelayMs,
         levelDeficitMs = levelDeficitMs,
-        backlogDeficitMs = backlogDeficitMs,
         backlogMs = backlogMs,
         queuedDraftCount = queuedDraftCount,
         queuedPredictedWorkMs = queuedPredictedWorkMs,

@@ -133,13 +133,9 @@ public class SavingDraftImageTaskManager {
             // scheduling time so multi-draft captures do not build one dead profiler per intermediate request.
             final CaptureMetrics captureMetrics = savingDraftImageTask.extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
             ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
-            // Anchor the pacer's timeout window where the capture is committed: its work enters the admitted backlog
-            // here, so this is the newest deadline the backlog can be priced against. Absent only for delayed-shutter
-            // IPP, and then the previous committed capture's deadline stands.
-            final Long timeoutTimestampMs = captureMetrics.getTimeoutTimestampMs();
-            if (timeoutTimestampMs != null) {
-                captureAvailablePacer.setCaptureDeadlineMs(timeoutTimestampMs);
-            }
+            // Keep the session's single backlog deadline on the newest capture accepted by the Draft pipeline.
+            // decideDelay opens the session earlier in this path; the non-null getter also covers delayed timestamps.
+            captureAvailablePacer.setCaptureDeadlineMs(captureMetrics.getTimeoutTimestampMsOrDefault());
             savingDraftImageTask.extraBundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER,
                     new DraftSequenceExecutionProfiler(
                             DynamicShotUtils.isPendingRequest(processRequest.getDsMode(), processRequest.getDsExtraInfo()),

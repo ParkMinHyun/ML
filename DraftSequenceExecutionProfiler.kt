@@ -2,7 +2,6 @@ package com.samsung.android.camera.core2.ml
 
 import android.os.SystemClock
 import com.samsung.android.camera.core2.container.CodecConfiguration
-import com.samsung.android.camera.core2.maker.MakerFeature
 import com.samsung.android.camera.core2.node.DynamicFunctionNode
 import com.samsung.android.camera.core2.node.Node
 import com.samsung.android.camera.core2.node.dualBokeh.samsung.SecDualBokehNodeBase
@@ -124,8 +123,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private fun readBudgetMs(): Long {
         val nowMs = SystemClock.uptimeMillis()
-        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs ?: (nowMs + MakerFeature.CAPTURE_TIMEOUT_MS)
-        return timeoutTimestampMs - nowMs
+        return captureMetrics.timeoutTimestampMsOrDefault - nowMs
     }
 
     private fun createExecutionSession(
@@ -178,11 +176,10 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftSequenceDurationMs)
         }
-        // Keep the session's size-scoped observed max aligned to this completed draft.
+        // Feed the observed duration into the context used by subsequent two-Draft pacing decisions.
         captureAvailablePacer.endDraftSequence(sizeBucket, draftSequenceDurationMs)
 
-        val timeoutTimestampMs = captureMetrics.timeoutTimestampMs
-        val isTimeout = timeoutTimestampMs != null && timeoutTimestampMs < SystemClock.uptimeMillis()
+        val isTimeout = captureMetrics.timeoutTimestampMsOrDefault < SystemClock.uptimeMillis()
         metricsRecorder.onCaptureEnd(isTimeout)
         return isTimeout
     }
@@ -191,6 +188,7 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     fun cancelDraftSequenceExecution() {
         draftSequenceExecutionSession?.cancel()
         draftSequenceExecutionSession = null
+        captureAvailablePacer.cancelDraftSequence(sizeBucket)
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {

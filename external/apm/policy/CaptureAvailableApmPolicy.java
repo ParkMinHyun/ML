@@ -36,17 +36,15 @@ import java.util.List;
 
 /**
  * <div class="camera_en">
- * Policy that paces captureAvailable callbacks by learned deficits only: the delay is the larger of the observed
- * budget deficit and the admitted-backlog deficit against the capture timeout. An empty draft pipeline is never
- * delayed, so burst responsiveness is preserved until the timeout allowance is genuinely spent; no tuned constant
- * or threshold is involved.
+ * Policy that paces captureAvailable callbacks with half of a two-Draft prospective backlog deficit. The two reserves
+ * cover the Draft starting after the decision and the future Draft admitted by the paced callback; Admission owns the
+ * remaining half so quality demotion can still absorb pressure. The current level deficit remains diagnostic.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
- * 학습된 부족분만으로 captureAvailable 콜백을 pacing합니다. 관측 budget 부족분과 admission backlog 부족분
- * (capture timeout 대비) 중 큰 값을 지연으로 사용합니다. draft 파이프라인이 비어 있으면 지연하지 않아
- * 연속 촬영 반응성이 유지되며, 튜닝 상수나 임계값을 쓰지 않습니다.
- * mandatory reserve 상한은 로그 심각도 분류에만 사용합니다.
+ * decision 이후 시작하는 Draft와 pacing callback이 허용할 미래 Draft의 reserve를 합산한 prospective
+ * backlog deficit 중 절반만 captureAvailable 지연으로 처리합니다. 나머지 절반은 Admission이 담당하며,
+ * 현재 level deficit은 진단값으로만 유지합니다.
  * </div>
  */
 public class CaptureAvailableApmPolicy extends ApmPolicy {
@@ -148,12 +146,10 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
 
             appliedDelayMs = pacingDecision.getDelayMs();
 
-            if (appliedDelayMs > pacingDecision.getLevelDeficitMs()) {
-                reason = "pace admitted draft backlog by " + appliedDelayMs + "ms";
-            } else if (appliedDelayMs > 0L) {
-                reason = "pace draft sequence by " + appliedDelayMs + "ms";
+            if (appliedDelayMs > 0L) {
+                reason = "pace shared two-draft backlog deficit by " + appliedDelayMs + "ms";
             } else {
-                reason = "budget is enough";
+                reason = "shared two-draft backlog deficit is empty";
             }
 
             pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
@@ -161,7 +157,6 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
                     + ", draftSequenceOverheadDuration=" + pacingSnapshot.getDraftSequenceOverheadDurationMs() + "ms"
                     + ", draftSequenceReservedDuration=" + pacingSnapshot.getDraftSequenceReservedDurationMs() + "ms"
                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
-                    + ", levelDeficit=" + pacingDecision.getLevelDeficitMs() + "ms"
                     + ", draftSequenceKey=" + pacingSnapshot.getDraftSequenceKey();
         }
 

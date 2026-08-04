@@ -25,12 +25,11 @@ class DraftSequenceAdmissionPolicy {
         if (isDemotedWorkload(workloadKey, hasFrameWatermark)) {
             return false
         }
-        // Overlay Watermark is the DECORATION chain's OPTIONAL tail: rejecting it drops itself, not the whole group.
-        if (modelAdmit || workloadKey is WorkloadKey.Watermark) {
-            return modelAdmit
+
+        if (!modelAdmit) {
+            AdmissionGroup.of(workloadKey)?.let { demotedGroups += it }
         }
-        AdmissionGroup.of(workloadKey)?.let { demotedGroups += it }
-        return false
+        return modelAdmit
     }
 
     /** What this burst will actually run: [workloadSequenceKey] minus the workloads whose group is demoted. */

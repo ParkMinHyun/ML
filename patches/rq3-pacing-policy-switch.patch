@@ -1,10 +1,16 @@
 Replace the captureAvailable delay arithmetic with a swappable pacing policy, and
 add the three comparison arms for RQ3.
 
-Base commit: 860464b, plus the deadline-ownership change committed alongside this patch
+Rebased onto the current Camera workspace, including session-local latest-deadline ownership,
+the two-Draft shared-deficit policy, and CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs.
+
+Apply the device patch from the Camera repository root:
+
+  git apply --check --exclude='data/*' Core2/patches/rq3-pacing-policy-switch.patch
+  git apply --exclude='data/*' Core2/patches/rq3-pacing-policy-switch.patch
 
   NO_PACING    NoPacingDelayPolicy            - zero delay, same admission path
-  OURS         DeadlineDeficitDelayPolicy     - the deployed budget/backlog deficit
+  OURS         DeadlineDeficitDelayPolicy     - deployed latest-deadline shared deficit
   THERMAL_LUT  ThermalHeadroomLutDelayPolicy  - open-loop on ADPF thermal headroom
   CODEL        ControlledDelayPacingPolicy    - RFC 8289 on measured queue wait
 
@@ -20,23 +26,24 @@ Device build:
   CaptureAvailablePacingSession.kt             takes the draft-start uptime from the pacer
   DeviceStateReader.kt                         publishes the last valid thermal headroom
   CaptureMetricsExcelExporter.kt               pacingPolicy column on the RQ3 sheets
-  external/.../CaptureAvailableApmPolicy.java  log wording
-  external/.../SavingDraftImageTaskManager.java  builds the pacer from the factory
+  CaptureAvailableApmPolicy.java                log wording
+  SavingDraftImageTaskManager.java              builds the pacer from the factory
 
-Analysis only, not part of the device build - drop these hunks when porting:
+Analysis-only hunks remain at the end for the paper data workspace. They are excluded
+by the Camera apply command above:
   data/lut_calibration.py                 new  cost-matched Thermal LUT calibration
   data/rq3_aggregate.py                        four arms; skips uncollected ones
 
-OURS is unchanged arithmetic: it calls the same compute*DeficitMs functions on the
-same inputs, and every policy still reports the pacer's own
-backlog clock so that column stays comparable across arms.
+OURS keeps the same arithmetic: it calls the same compute*DeficitMs functions on the
+same inputs, and every policy still reports the pacer backlog clock so that column
+stays comparable across arms.
 
-diff --git a/CaptureAvailableDelayPolicy.kt b/CaptureAvailableDelayPolicy.kt
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicy.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicy.kt
 new file mode 100644
-index 0000000..42fe714
+index 0000000000000000000000000000000000000000..42fe714dc70f650d94b2d0a6da5f05fb2c06c1d9
 --- /dev/null
-+++ b/CaptureAvailableDelayPolicy.kt
-@@ -0,0 +1,105 @@
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicy.kt
+@@ -0,0 +1,83 @@
 +package com.samsung.android.camera.core2.ml
 +
 +/**
@@ -80,29 +87,16 @@ index 0000000..42fe714
 + */
 +data class CaptureAvailableDelayPolicyInput(
 +    val decisionUptimeMs: Long,
-+    val draftSequenceBudgetMs: Long,
 +    val draftSequenceReservedDurationMs: Double,
 +    val backlogMs: Long,
 +    val queuedDraftCount: Int,
 +    val timeToDeadlineMs: Long,
 +)
 +
-+/**
-+ * One policy's answer. [delayMs] is what the callback actually waits.
-+ *
-+ * The two deficit fields exist because the persisted metrics and the APM log already carry them; a policy that does
-+ * not decompose its delay that way reports the components it does have and leaves the rest at zero. They are
-+ * diagnostics, never re-combined into the applied delay.
-+ */
-+data class CaptureAvailableDelayPolicyDecision @JvmOverloads constructor(
-+    val delayMs: Long,
-+    val levelDeficitMs: Long = 0L,
-+    val backlogDeficitMs: Long = 0L,
-+) {
++/** One policy's final callback delay. */
++data class CaptureAvailableDelayPolicyDecision(val delayMs: Long) {
 +    init {
 +        require(delayMs >= 0L) { "delayMs must be non-negative but was $delayMs" }
-+        require(levelDeficitMs >= 0L) { "levelDeficitMs must be non-negative but was $levelDeficitMs" }
-+        require(backlogDeficitMs >= 0L) { "backlogDeficitMs must be non-negative but was $backlogDeficitMs" }
 +    }
 +}
 +
@@ -116,37 +110,28 @@ index 0000000..42fe714
 +}
 +
 +/**
-+ * The deployed policy: the larger of this capture's draft-budget deficit and the admitted-backlog deficit against
-+ * the Capture Timeout. It is deadline-aware (it charges the window this capture has already spent) and
-+ * workload-aware (it prices the draft sequence it is about to admit), which is exactly what the two baselines drop.
++ * The deployed policy: pacing's half of the prospective deficit formed by the admitted backlog and two Draft reserves
++ * against the latest committed capture's timeout window. It is deadline-aware and workload-aware, while leaving the
++ * Admission free to react independently; those are exactly the signals and coordination the baselines drop.
 + *
-+ * The arithmetic itself stays in [computeLevelDeficitMs] and [computeBacklogDeficitMs] so offline replay keeps
-+ * calling the same functions the device ran.
++ * The arithmetic stays in [computePacingDelayMs] so offline replay calls the same function the device ran.
 + */
 +object DeadlineDeficitDelayPolicy : CaptureAvailableDelayPolicy {
 +
 +    override fun decide(input: CaptureAvailableDelayPolicyInput): CaptureAvailableDelayPolicyDecision {
-+        val levelDeficitMs = computeLevelDeficitMs(
-+            draftSequenceBudgetMs = input.draftSequenceBudgetMs,
-+            draftSequenceReservedDurationMs = input.draftSequenceReservedDurationMs,
-+        )
-+        val backlogDeficitMs = computeBacklogDeficitMs(
++        val pacingDelayMs = computePacingDelayMs(
 +            backlogMs = input.backlogMs,
 +            timeToDeadlineMs = input.timeToDeadlineMs,
 +            draftSequenceReservedDurationMs = input.draftSequenceReservedDurationMs,
 +        )
-+        return CaptureAvailableDelayPolicyDecision(
-+            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
-+            levelDeficitMs = levelDeficitMs,
-+            backlogDeficitMs = backlogDeficitMs,
-+        )
++        return CaptureAvailableDelayPolicyDecision(delayMs = pacingDelayMs)
 +    }
 +}
-diff --git a/CaptureAvailableDelayPolicyFactory.kt b/CaptureAvailableDelayPolicyFactory.kt
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicyFactory.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicyFactory.kt
 new file mode 100644
-index 0000000..1d98bb4
+index 0000000000000000000000000000000000000000..1d98bb49529bd2834aed9ea6be28b787538d9a3a
 --- /dev/null
-+++ b/CaptureAvailableDelayPolicyFactory.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailableDelayPolicyFactory.kt
 @@ -0,0 +1,50 @@
 +package com.samsung.android.camera.core2.ml
 +
@@ -198,11 +183,11 @@ index 0000000..1d98bb4
 +        CODEL,
 +    }
 +}
-diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
-index f00c074..0601656 100644
---- a/CaptureAvailablePacer.kt
-+++ b/CaptureAvailablePacer.kt
-@@ -18,9 +18,10 @@ fun interface CaptureAvailablePacingDecider {
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacer.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacer.kt
+index 69c99639a9bbd2a24b2239e57193191dc0876c59..069d876cf949f907c1e062459a70e1a10f6330d7 100644
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacer.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacer.kt
+@@ -20,9 +20,10 @@ fun interface CaptureAvailablePacingDecider {
   * session maxima, and one FIFO pairs each admission with the next draft start. The sequence key a draft start hands in
   * is re-projected onto the burst's demoted shape by [DraftSequenceAdmissionPolicy]; the APM side sees only the decider.
   */
@@ -214,35 +199,31 @@ index f00c074..0601656 100644
  ) : CaptureAvailablePacingDecider {
  
      /**
-@@ -35,8 +36,9 @@ class CaptureAvailablePacer(
+@@ -36,9 +37,9 @@ class CaptureAvailablePacer(
      private var captureAvailablePacingSession: CaptureAvailablePacingSession? = null
  
      /**
--     * The larger of the draft-budget deficit and the admitted-backlog timeout deficit, queued as the admission record
--     * the next draft start consumes. Opens the burst session when none is open; that first callback then finds no
+-     * Half of the two-Draft prospective timeout deficit, queued as the admission record the next draft start consumes.
+-     * One reserve represents the Draft that starts after this decision and the other the future Draft whose capture is
+-     * released by pacing. Admission owns the remaining half, so the current-capture level deficit stays diagnostic.
 +     * Whatever the [delayPolicy] says this callback waits, queued as the admission record the next draft start
-+     * consumes. The session's timeout window and admitted-backlog clock are still read and reported here, so both stay
-+     * comparable across policies - only whether they are charged is the policy's. Opens the burst session when none is open; that first callback then finds no
-      * snapshot and answers "no delay", which is what leaves an idle pipeline unpaced.
++     * consumes. The session's latest timeout window and admitted-backlog clock are still read and reported here, so
++     * both stay comparable across policies; only whether they are charged is the policy's.
       */
      @Synchronized
-@@ -46,22 +48,22 @@ class CaptureAvailablePacer(
+     override fun decideDelay(): CaptureAvailablePacingDecision? {
+@@ -47,16 +48,19 @@ class CaptureAvailablePacer(
          val nowUptimeMs = SystemClock.uptimeMillis()
          val timeToDeadlineMs = session.timeToDeadlineMsAt(nowUptimeMs)
          val backlogMs = session.backlogMsAt(nowUptimeMs)
 -        val draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs
--        val levelDeficitMs = computeLevelDeficitMs(
--            draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
--            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
--        )
--        val backlogDeficitMs = computeBacklogDeficitMs(
+-        val pacingDelayMs = computePacingDelayMs(
 -            backlogMs = backlogMs,
 -            timeToDeadlineMs = timeToDeadlineMs,
 -            draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
 +        val policyDecision = delayPolicy.decide(
 +            CaptureAvailableDelayPolicyInput(
 +                decisionUptimeMs = nowUptimeMs,
-+                draftSequenceBudgetMs = snapshot.draftSequenceBudgetMs,
 +                draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs,
 +                backlogMs = backlogMs,
 +                queuedDraftCount = session.queuedDraftCount,
@@ -251,17 +232,13 @@ index f00c074..0601656 100644
          )
  
          val decision = CaptureAvailablePacingDecision(
--            delayMs = maxOf(levelDeficitMs, backlogDeficitMs),
+-            delayMs = pacingDelayMs,
 +            delayMs = policyDecision.delayMs,
              backlogMs = backlogMs,
--            levelDeficitMs = levelDeficitMs,
--            backlogDeficitMs = backlogDeficitMs,
-+            levelDeficitMs = policyDecision.levelDeficitMs,
-+            backlogDeficitMs = policyDecision.backlogDeficitMs,
              queuedDraftCount = session.queuedDraftCount,
              queuedPredictedWorkMs = session.queuedPredictedWorkMs,
              timeToDeadlineMs = timeToDeadlineMs,
-@@ -85,7 +87,9 @@ class CaptureAvailablePacer(
+@@ -86,7 +87,9 @@ class CaptureAvailablePacer(
      ): CaptureAvailablePacingDecision? {
          val session = captureAvailablePacingSession ?: return null
          if (workloadSequenceKey == null) {
@@ -272,7 +249,7 @@ index f00c074..0601656 100644
          }
          val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(workloadSequenceKey)
          // The burst's measured max was measured on undemoted drafts, so drop what demotion took out of this one, and
-@@ -100,6 +104,10 @@ class CaptureAvailablePacer(
+@@ -101,6 +104,10 @@ class CaptureAvailablePacer(
              predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
          )
  
@@ -283,7 +260,7 @@ index f00c074..0601656 100644
          return session.dequeuePacingDecision(
              CaptureAvailablePacingSnapshot(
                  draftSequenceKey = draftSequenceKey.toReplayString(),
-@@ -108,13 +116,15 @@ class CaptureAvailablePacer(
+@@ -109,13 +116,15 @@ class CaptureAvailablePacer(
                  draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
                  workloadSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey),
              ),
@@ -292,15 +269,15 @@ index f00c074..0601656 100644
 +        ).also { gatingDecision -> notifyDraftStarted(session, startUptimeMs, gatingDecision) }
      }
  
-     /** Pairs with [startDraftSequence]: records the completed draft's real duration against its own size. */
+     /** Pairs with [startDraftSequence] and records the result for subsequent pacing decisions. */
      @Synchronized
      fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
          captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(sizeBucket, draftSequenceDurationMs)
 +        delayPolicy.onDraftMeasured(sizeBucket, draftSequenceDurationMs)
      }
  
-     /**
-@@ -143,6 +153,16 @@ class CaptureAvailablePacer(
+     /** Completes a cancelled FIFO draft without feeding a non-observation into the size-scoped maximum. */
+@@ -149,6 +158,16 @@ class CaptureAvailablePacer(
      @Synchronized
      fun clear() {
          captureAvailablePacingSession = null
@@ -316,25 +293,12 @@ index f00c074..0601656 100644
 +        delayPolicy.onDraftStarted(startUptimeMs, gatingDecision, session.queuedDraftCount)
      }
  
-     /** The burst session, opened if this callback is the burst's first. Called by [decideDelay] and nowhere else. */
-@@ -153,9 +173,9 @@ class CaptureAvailablePacer(
- }
- 
- /**
-- * The two deficits, stateless so a decision can be re-derived from persisted pacing inputs alone: offline replay calls
-- * these exact functions, and a second copy of the arithmetic would drift and report a pacing change as no change. Their
-- * plain max is written out at both call sites - a wrapper around `maxOf` is not arithmetic that can drift.
-+ * [DeadlineDeficitDelayPolicy]'s two deficits, stateless so a decision can be re-derived from persisted pacing inputs
-+ * alone: that policy and offline replay call these exact functions, and a second copy of the arithmetic would drift and
-+ * report a pacing change as no change. Their plain max is written out at both call sites.
-  */
- internal fun computeLevelDeficitMs(
-     draftSequenceBudgetMs: Long,
-diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
-index d40ba2b..3ca0fc6 100644
---- a/CaptureAvailablePacingSession.kt
-+++ b/CaptureAvailablePacingSession.kt
-@@ -69,12 +69,13 @@ internal class CaptureAvailablePacingSession {
+     /** Returns the burst session, opening it for the first pacing callback. */
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacingSession.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacingSession.kt
+index 665998aa76875b38f5b5e38f7f1df9485e1fafd2..bfb2b13e300da059c5a47337385a39b20cbd22e8 100644
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacingSession.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureAvailablePacingSession.kt
+@@ -76,12 +76,13 @@ internal class CaptureAvailablePacingSession {
       */
      fun dequeuePacingDecision(
          snapshot: CaptureAvailablePacingSnapshot?,
@@ -349,7 +313,7 @@ index d40ba2b..3ca0fc6 100644
          return gatingDecision
      }
  
-@@ -83,11 +84,11 @@ internal class CaptureAvailablePacingSession {
+@@ -90,11 +91,11 @@ internal class CaptureAvailablePacingSession {
       * its point work plus one between-node overhead. Restarting on every dequeue is what keeps the prediction error the
       * clock accumulates while queueing from compounding across a burst.
       */
@@ -362,28 +326,27 @@ index d40ba2b..3ca0fc6 100644
 +        backlogEndTimeMs = startUptimeMs + ceil(startingDraftWorkMs + queuedDraftWorkMs).toLong()
      }
  
-     /** Raises [sizeBucket]'s max toward one completed draft's real duration; non-positive means no observation. */
-diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
-index d56e445..3f50283 100644
---- a/CaptureMetricsExcelExporter.kt
-+++ b/CaptureMetricsExcelExporter.kt
+     /**
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureMetricsExcelExporter.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureMetricsExcelExporter.kt
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureMetricsExcelExporter.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/CaptureMetricsExcelExporter.kt
 @@ -66,6 +66,7 @@ class CaptureMetricsExcelExporter(
-     /** Per-shot RQ3 row. The delay recorded on shot i gates the transition to shot i+1. */
+     /** Per-shot RQ3 row. The pacing decision persisted on shot i is the decision consumed before shot i starts. */
      private class Rq3CaptureRow(
          val deviceModel: String,
 +        val pacingPolicy: String,
          val capture: CaptureRow,
          val runId: Int,
          val runShotIndex: Int,
-@@ -87,6 +88,7 @@ class CaptureMetricsExcelExporter(
+@@ -90,6 +91,7 @@ class CaptureMetricsExcelExporter(
      /** One row per ppSequenceId-reset-delimited experiment run for direct RQ3 table aggregation. */
      private class Rq3RunSummary(
          val deviceModel: String,
 +        val pacingPolicy: String,
          val runId: Int,
          val shotCount: Int,
-         val startingOverheatLevel: Int?,
-@@ -204,6 +206,8 @@ class CaptureMetricsExcelExporter(
+         val analyzedShotCount: Int,
+@@ -372,6 +374,8 @@ class CaptureMetricsExcelExporter(
      private fun buildRq3Export(captures: List<CaptureRow>): Rq3Export {
          val captureRows = mutableListOf<Rq3CaptureRow>()
          val summaries = mutableListOf<Rq3RunSummary>()
@@ -392,7 +355,7 @@ index d56e445..3f50283 100644
  
          groupRq3ExperimentRuns(captures).forEachIndexed { runIndex, run ->
              val runId = runIndex + 1
-@@ -244,6 +248,7 @@ class CaptureMetricsExcelExporter(
+@@ -444,6 +448,7 @@ class CaptureMetricsExcelExporter(
                  runRows.add(
                      Rq3CaptureRow(
                          deviceModel = Build.MODEL,
@@ -400,15 +363,15 @@ index d56e445..3f50283 100644
                          capture = capture,
                          runId = runId,
                          runShotIndex = shotIndex,
-@@ -276,6 +281,7 @@ class CaptureMetricsExcelExporter(
+@@ -498,6 +503,7 @@ class CaptureMetricsExcelExporter(
              summaries.add(
                  Rq3RunSummary(
                      deviceModel = Build.MODEL,
 +                    pacingPolicy = pacingPolicy,
                      runId = runId,
                      shotCount = run.size,
-                     startingOverheatLevel = startingOverheatLevel,
-@@ -1284,6 +1290,7 @@ class CaptureMetricsExcelExporter(
+                     analyzedShotCount = analyzedRows.size,
+@@ -2464,6 +2470,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3PacingColumns(): List<Column<Rq3CaptureRow>> = listOf(
              Column("deviceModel") { it.deviceModel },
@@ -416,33 +379,33 @@ index d56e445..3f50283 100644
              Column("runId") { it.runId },
              Column("runShotIndex") { it.runShotIndex },
              Column("runShotCount") { it.runShotCount },
-@@ -1352,6 +1359,7 @@ class CaptureMetricsExcelExporter(
+@@ -2545,6 +2552,7 @@ class CaptureMetricsExcelExporter(
  
          private fun buildRq3SummaryColumns(): List<Column<Rq3RunSummary>> = listOf(
              Column("deviceModel") { it.deviceModel },
 +            Column("pacingPolicy") { it.pacingPolicy },
              Column("runId") { it.runId },
              Column("shotCount") { it.shotCount },
-             Column("isComplete30ShotRun") { it.shotCount == RQ3_TARGET_SHOT_COUNT },
-@@ -1617,6 +1625,13 @@ class CaptureMetricsExcelExporter(
-                 note = "RQ3Summary reports P50 and P95 over positive transition delays using Excel PERCENTILE.INC " +
-                     "interpolation. deviceModel is the runtime Build.MODEL value.",
+             Column("analyzedShotCount") { it.analyzedShotCount },
+@@ -2908,6 +2916,13 @@ class CaptureMetricsExcelExporter(
+                     "prove that both arms executed the same work.",
              ),
-+            ReplayNote(
+             ReplayNote(
 +                topic = "RQ3 pacing policy",
 +                note = "pacingPolicy is CaptureAvailableDelayPolicyFactory's active arm in the build that exported " +
 +                    "the workbook, not a per-row record of the arm each row ran under. It is only trustworthy if " +
 +                    "the metrics database is cleared between arms; a workbook holding rows from two arms will " +
 +                    "label them all with the exporting build's arm.",
 +            ),
-             ReplayNote(
++            ReplayNote(
                  topic = "Wall-base pacing",
                  note = "columns for judging a future draft-wall-time-based clock. draftOccupancyUnderpriceMs " +
-diff --git a/ControlledDelayPacingPolicy.kt b/ControlledDelayPacingPolicy.kt
+                     "(draftWall - point sum) is how much the current point clock under-prices a draft; " +
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/ControlledDelayPacingPolicy.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/ControlledDelayPacingPolicy.kt
 new file mode 100644
-index 0000000..5730705
+index 0000000000000000000000000000000000000000..573070558cb1da8fc72539fe1616cb65f148d9b5
 --- /dev/null
-+++ b/ControlledDelayPacingPolicy.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/ControlledDelayPacingPolicy.kt
 @@ -0,0 +1,196 @@
 +package com.samsung.android.camera.core2.ml
 +
@@ -543,7 +506,7 @@ index 0000000..5730705
 +            lastCount = count
 +        }
 +
-+        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs, backlogDeficitMs = delayMs)
++        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs)
 +    }
 +
 +    /**
@@ -640,10 +603,10 @@ index 0000000..5730705
 +        private const val REENTRY_INTERVALS = 16L
 +    }
 +}
-diff --git a/DeviceStateReader.kt b/DeviceStateReader.kt
-index a9103bf..75d8725 100644
---- a/DeviceStateReader.kt
-+++ b/DeviceStateReader.kt
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/DeviceStateReader.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/DeviceStateReader.kt
+index a9103bfec2db2ecb8a85be0431e211cb4ccb3513..75d87257883cf69e249b811c167c1ebf21f5bae7 100644
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/ml/DeviceStateReader.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/DeviceStateReader.kt
 @@ -20,6 +20,19 @@ class DeviceStateReader(
      private val overheatLevelSupplier: Supplier<Int>,
  ) {
@@ -674,11 +637,11 @@ index a9103bf..75d8725 100644
  
          return ThermalSnapshot(
              overheatLevel = overheatLevelSupplier.get(),
-diff --git a/ThermalHeadroomLutDelayPolicy.kt b/ThermalHeadroomLutDelayPolicy.kt
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/ml/ThermalHeadroomLutDelayPolicy.kt b/Core2/src/main/java/com/samsung/android/camera/core2/ml/ThermalHeadroomLutDelayPolicy.kt
 new file mode 100644
-index 0000000..8c882a6
+index 0000000000000000000000000000000000000000..8c882a699d7db3cd1c86639385b3fa2c0f60e76c
 --- /dev/null
-+++ b/ThermalHeadroomLutDelayPolicy.kt
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/ml/ThermalHeadroomLutDelayPolicy.kt
 @@ -0,0 +1,122 @@
 +package com.samsung.android.camera.core2.ml
 +
@@ -718,7 +681,7 @@ index 0000000..8c882a6
 +            return CaptureAvailableDelayPolicyDecision(delayMs = 0L)
 +        }
 +        val delayMs = config.delayMs(thermalHeadroomSupplier())
-+        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs, levelDeficitMs = delayMs)
++        return CaptureAvailableDelayPolicyDecision(delayMs = delayMs)
 +    }
 +
 +    /**
@@ -802,6 +765,50 @@ index 0000000..8c882a6
 +        }
 +    }
 +}
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/apm/policy/CaptureAvailableApmPolicy.java b/Core2/src/main/java/com/samsung/android/camera/core2/apm/policy/CaptureAvailableApmPolicy.java
+index 4317ccf04702637138800c5879b44bd444c3a7a0..4cc32f3725738b1580f3550d9f2a844f1f24465a 100644
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/apm/policy/CaptureAvailableApmPolicy.java
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/apm/policy/CaptureAvailableApmPolicy.java
+@@ -149,5 +149,5 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
+             if (appliedDelayMs > 0L) {
+-                reason = "pace shared two-draft backlog deficit by " + appliedDelayMs + "ms";
++                reason = "pace draft sequence by " + appliedDelayMs + "ms";
+             } else {
+-                reason = "shared two-draft backlog deficit is empty";
++                reason = "the selected pacing policy asked for no delay";
+             }
+diff --git a/Core2/src/main/java/com/samsung/android/camera/core2/processor/draftSaving/SavingDraftImageTaskManager.java b/Core2/src/main/java/com/samsung/android/camera/core2/processor/draftSaving/SavingDraftImageTaskManager.java
+index 4c2fc663cbebd8b5daca97b635f42e72645175e0..1dd2ac33907d2588437cfb4e66d562ce70d06310 100644
+--- a/Core2/src/main/java/com/samsung/android/camera/core2/processor/draftSaving/SavingDraftImageTaskManager.java
++++ b/Core2/src/main/java/com/samsung/android/camera/core2/processor/draftSaving/SavingDraftImageTaskManager.java
+@@ -9,6 +9,7 @@ import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;
+ import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
+ import com.samsung.android.camera.core2.container.ExtraBundle;
+ import com.samsung.android.camera.core2.container.SavingInfoContainer;
++import com.samsung.android.camera.core2.ml.CaptureAvailableDelayPolicyFactory;
+ import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
+ import com.samsung.android.camera.core2.ml.CaptureMetrics;
+ import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
+@@ -46,7 +47,8 @@ public class SavingDraftImageTaskManager {
+     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
+     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
+     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
+-    private final CaptureAvailablePacer captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
++    // The pacing policy is the RQ3 experiment switch; it needs deviceStateReader, so it is built in the constructor.
++    private final CaptureAvailablePacer captureAvailablePacer;
+     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
+     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
+     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
+@@ -69,4 +71,9 @@ public class SavingDraftImageTaskManager {
+     public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
+         this.context = context;
+         this.deviceStateReader = deviceStateReader;
++        this.captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy,
++                CaptureAvailableDelayPolicyFactory.create(deviceStateReader));
++        // Logged once per pipeline so a collected logcat states which pacing arm produced the run.
++        PLog.i(TAG, "[mhyun2.park] captureAvailable delay policy: %s",
++                CaptureAvailableDelayPolicyFactory.activePolicyName());
+     }
 diff --git a/data/lut_calibration.py b/data/lut_calibration.py
 new file mode 100644
 index 0000000..7dbffc1
@@ -1006,50 +1013,3 @@ index 785bcc7..c02dcf3 100644
      with open(os.path.join(PAPER_RQ3_DIR, "rq3_metrics.json"), "w", encoding="utf-8") as handle:
          json.dump(payload, handle, indent=2, default=float)
          handle.write("\n")
-diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
-index 4317ccf..4cc32f3 100644
---- a/external/apm/policy/CaptureAvailableApmPolicy.java
-+++ b/external/apm/policy/CaptureAvailableApmPolicy.java
-@@ -153,7 +153,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
-             } else if (appliedDelayMs > 0L) {
-                 reason = "pace draft sequence by " + appliedDelayMs + "ms";
-             } else {
--                reason = "budget is enough";
-+                reason = "the selected pacing policy asked for no delay";
-             }
- 
-             pacingDetails += ", draftSequenceBudget=" + pacingSnapshot.getDraftSequenceBudgetMs() + "ms"
-diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
-index 65696a1..ae6cfd4 100644
---- a/external/draftSaving/SavingDraftImageTaskManager.java
-+++ b/external/draftSaving/SavingDraftImageTaskManager.java
-@@ -9,6 +9,7 @@ import com.samsung.android.camera.core2.apm.AdaptivePerformanceManager;
- import com.samsung.android.camera.core2.apm.data.PacingDeciderApmData;
- import com.samsung.android.camera.core2.container.ExtraBundle;
- import com.samsung.android.camera.core2.container.SavingInfoContainer;
-+import com.samsung.android.camera.core2.ml.CaptureAvailableDelayPolicyFactory;
- import com.samsung.android.camera.core2.ml.CaptureAvailablePacer;
- import com.samsung.android.camera.core2.ml.CaptureMetrics;
- import com.samsung.android.camera.core2.ml.CaptureMetricsRepository;
-@@ -46,7 +47,8 @@ public class SavingDraftImageTaskManager {
-     // demotions, and publishes its pacer as the pacing decider through the APM data pipeline at every draft start.
-     private final DraftSequenceExecutionPredictor draftSequenceExecutionPredictor = new DraftSequenceExecutionPredictor();
-     private final DraftSequenceAdmissionPolicy admissionPolicy = new DraftSequenceAdmissionPolicy();
--    private final CaptureAvailablePacer captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy);
-+    // The pacing policy is the RQ3 experiment switch; it needs deviceStateReader, so it is built in the constructor.
-+    private final CaptureAvailablePacer captureAvailablePacer;
-     private final Map</*ppSequenceId*/Integer, SavingDraftImageTask> savingDraftImageTaskMap = new ConcurrentHashMap<>();
-     private final Set</*ppSequenceId*/Integer> reservedSkipSaveDraftImageIdSet = new HashSet<>();
-     private final ScheduledExecutorService savingDraftImageThreadPool = Executors.newSingleThreadScheduledExecutor();
-@@ -69,6 +71,11 @@ public class SavingDraftImageTaskManager {
-     public SavingDraftImageTaskManager(@NonNull Context context, @NonNull DeviceStateReader deviceStateReader) {
-         this.context = context;
-         this.deviceStateReader = deviceStateReader;
-+        this.captureAvailablePacer = new CaptureAvailablePacer(draftSequenceExecutionPredictor, admissionPolicy,
-+                CaptureAvailableDelayPolicyFactory.create(deviceStateReader));
-+        // Logged once per pipeline so a collected logcat states which pacing arm produced the run.
-+        PLog.i(TAG, "[mhyun2.park] captureAvailable delay policy: %s",
-+                CaptureAvailableDelayPolicyFactory.activePolicyName());
-     }
- 
-     /**

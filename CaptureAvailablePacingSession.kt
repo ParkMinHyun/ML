@@ -33,23 +33,17 @@ internal class CaptureAvailablePacingSession {
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
      * capture's point prediction plus the learned between-node overhead. The point sum alone omits the inter-node and
-     * deinit time and that shortfall compounds with queue depth into a timeout, while summing k whole-draft reserves
-     * would price a queue at k times the burst's worst case, which no run reaches. The margin comes instead from
-     * the one reserve [CaptureAvailablePacer.decideDelay] adds for the capture being paced, and underruns cannot
-     * accumulate because every draft start rebases this clock onto the real one.
+     * deinit time and that shortfall compounds with queue depth into a timeout. The decision adds a two-Draft reserve
+     * horizon and leaves half of its deficit to Admission; prediction errors cannot accumulate indefinitely because
+     * every draft start rebases this clock onto the real one.
      *
      * An absolute uptime, unlike the durations around it: [backlogMsAt] turns it into "how much is left".
      */
     private var backlogEndTimeMs = 0L
 
     /**
-     * When the admitted backlog has to be gone, against [backlogEndTimeMs]'s estimate of when it will be - the pair
-     * [computeBacklogDeficitMs] prices. Fed by the pipeline at every capture it commits, so it tracks the newest one:
-     * the deadline of whatever entered the backlog last, which is the one the whole queue has to fit inside.
-     *
-     * Absent until this burst's first committed capture brings one (delayed-shutter IPP captures never do), and gone
-     * with the session, since a deadline outliving its burst survives only as a past instant - which would price the
-     * next burst's backlog against no window at all.
+     * Deadline of the newest capture committed to the Draft pipeline. It is deliberately one session-local value:
+     * each later capture replaces it, and dropping the session drops the deadline with the backlog it described.
      */
     private var backlogDeadlineMs: Long? = null
 
@@ -58,6 +52,18 @@ internal class CaptureAvailablePacingSession {
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
     val queuedPredictedWorkMs: Double
         get() = pendingDecisions.sumOf { it.snapshot.workloadSequencePredictedDurationMs }
+
+    /**
+     * Queues one decided callback and advances the clock past the draft it admits. Read back off the decision, so the
+     * clock can only advance by the delay and work that decision was actually built on.
+     */
+    fun queuePacingDecision(decision: CaptureAvailablePacingDecision) {
+        pendingDecisions.addLast(decision)
+        val snapshot = decision.snapshot
+        val draftWorkMs = snapshot.workloadSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
+        backlogEndTimeMs =
+            maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
+    }
 
     /**
      * Pairs with [queuePacingDecision]: hands back the oldest queued decision, adopts [snapshot] as what the next one
@@ -90,30 +96,20 @@ internal class CaptureAvailablePacingSession {
         backlogEndTimeMs = SystemClock.uptimeMillis() + ceil(startingDraftWorkMs + queuedDraftWorkMs).toLong()
     }
 
-    /** Raises [sizeBucket]'s max toward one completed draft's real duration; non-positive means no observation. */
+    /**
+     * Updates the duration context used by subsequent pacing decisions. A zero duration represents cancellation and
+     * therefore does not become an observed maximum.
+     */
     fun updateMaxDraftSequenceDurationMs(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
-        if (draftSequenceDurationMs <= 0L) {
-            return
+        if (draftSequenceDurationMs > 0L) {
+            maxDraftSequenceDurationMsBySize[sizeBucket] =
+                maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
         }
-        maxDraftSequenceDurationMsBySize[sizeBucket] =
-            maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
     }
 
-    /** Takes in a committed capture's timeout deadline; the newest one the pipeline brings stands. */
+    /** Replaces the backlog deadline with the newest committed capture's timeout timestamp. */
     fun updateBacklogDeadlineMs(deadlineUptimeMs: Long) {
         backlogDeadlineMs = deadlineUptimeMs
-    }
-
-    /**
-     * Queues one decided callback and advances the clock past the draft it admits. Read back off the decision, so the
-     * clock can only advance by the delay and work that decision was actually built on.
-     */
-    fun queuePacingDecision(decision: CaptureAvailablePacingDecision) {
-        pendingDecisions.addLast(decision)
-        val snapshot = decision.snapshot
-        val draftWorkMs = snapshot.workloadSequencePredictedDurationMs + snapshot.draftSequenceOverheadDurationMs
-        backlogEndTimeMs =
-            maxOf(decision.decisionUptimeMs + decision.delayMs, backlogEndTimeMs) + ceil(draftWorkMs).toLong()
     }
 
     /**
@@ -130,15 +126,9 @@ internal class CaptureAvailablePacingSession {
     /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
     fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
 
-    /**
-     * How much of the [backlogDeadlineMs] window is still ahead of [nowUptimeMs] - what the paced draft has to finish
-     * inside. One timeout window is the clamp, not a term: with no deadline yet the window is priced as if it just
-     * opened, and a past one leaves nothing, so a missing or late deadline can only cost pacing pressure, never invent
-     * a delay.
-     */
+    /** Remaining part of the latest committed capture's timeout window, or a fresh window before one is available. */
     fun timeToDeadlineMsAt(nowUptimeMs: Long): Long {
         val deadlineUptimeMs = backlogDeadlineMs ?: return MakerFeature.CAPTURE_TIMEOUT_MS
         return (deadlineUptimeMs - nowUptimeMs).coerceIn(0L, MakerFeature.CAPTURE_TIMEOUT_MS)
     }
-
 }

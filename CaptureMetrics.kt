@@ -2,6 +2,7 @@ package com.samsung.android.camera.core2.ml
 
 import android.os.SystemClock
 import android.util.Size
+import com.samsung.android.camera.core2.maker.MakerFeature
 
 data class CaptureMetrics @JvmOverloads constructor(
     val ppSequenceId: Int,
@@ -16,6 +17,10 @@ data class CaptureMetrics @JvmOverloads constructor(
     var shotToShotTimeMs: Long? = null,
 ) {
     val creationTimestampMs: Long = SystemClock.uptimeMillis()
+
+    /** Returns the stamped timeout or a fresh full timeout window when this capture has no shutter timestamp. */
+    val timeoutTimestampMsOrDefault: Long
+        get() = timeoutTimestampMs ?: (SystemClock.uptimeMillis() + MakerFeature.CAPTURE_TIMEOUT_MS)
 }
 
 data class DraftSequenceMetrics @JvmOverloads constructor(
@@ -61,20 +66,16 @@ data class CaptureAvailablePacingMetrics(
     val decisionUptimeMs: Long,
     val appliedDelayMs: Long,
     val levelDeficitMs: Long,
-    val backlogDeficitMs: Long,
     val backlogMs: Long,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
-    /**
-     * Timeout window left when the callback was paced - what the backlog deficit measured the queued work against.
-     * Null on rows persisted before it was recorded; offline replay then infers or brackets it.
-     */
-    val timeToDeadlineMs: Long?,
+    /** Remaining window on the latest committed capture deadline that the two-Draft pacing decision used. */
+    val timeToDeadlineMs: Long,
     val draftSequenceBudgetMs: Long,
     val workloadSequencePredictedDurationMs: Double,
     /** Learned between-node overhead the backlog clock added per queued draft (clock work = predicted + this). */
     val draftSequenceOverheadDurationMs: Double,
-    /** Draft-sequence duration both deficits set aside for this capture; see [CaptureAvailablePacingSnapshot]. */
+    /** Draft-sequence duration the pacing window reserves; see [CaptureAvailablePacingSnapshot]. */
     val draftSequenceReservedDurationMs: Double,
     val draftSequenceKey: String,
 )
