@@ -8,8 +8,9 @@ internal const val PACING_WINDOW_DRAFT_COUNT = 2.0
 /**
  * The one call CaptureAvailableApmPolicy makes into the draft pipeline. A single method on purpose: reading the backlog
  * against "now", pricing the delay, and recording the admission must happen under one lock, or concurrent callbacks
- * double-admit against a stale backlog. Takes nothing: the open session holds the latest committed backlog deadline,
- * and the decision shares a two-Draft prospective deficit with Admission.
+ * double-admit against a stale backlog. Takes nothing: the open session holds the latest committed backlog deadline.
+ * The decision prices a two-Draft prospective horizon and deliberately applies half of its projected deficit; it
+ * passes no numeric deficit share to node-time Admission.
  */
 fun interface CaptureAvailablePacingDecider {
     fun decideDelay(): CaptureAvailablePacingDecision?
@@ -36,9 +37,12 @@ class CaptureAvailablePacer(
     private var captureAvailablePacingSession: CaptureAvailablePacingSession? = null
 
     /**
-     * Half of the two-Draft prospective timeout deficit, queued as the admission record the next draft start consumes.
+     * Half of the two-Draft prospective timeout deficit, queued as the callback record the next draft start consumes.
      * One reserve represents the Draft that starts after this decision and the other the future Draft whose capture is
-     * released by pacing. Admission owns the remaining half, so the current-capture level deficit stays diagnostic.
+     * released by pacing. Applying half is an intuitive coordination heuristic, not an exact fixed-point result: no
+     * half-deficit value is passed to Admission. Pacing relies on node-time Admission to shed optional work if
+     * residual pressure leaves its suffix upper bound above the live budget, while the current-capture level deficit
+     * stays diagnostic.
      */
     @Synchronized
     override fun decideDelay(): CaptureAvailablePacingDecision? {
@@ -161,9 +165,10 @@ internal fun computeLevelDeficitMs(
 ): Long = ceil(draftSequenceReservedDurationMs - draftSequenceBudgetMs.coerceAtLeast(0L)).toLong().coerceAtLeast(0L)
 
 /**
- * Pacing's half of the projected deficit across two Draft reserves: the Draft that starts after this decision and the
- * future Draft admitted by the delayed callback. Admission is intentionally left the other half, preventing pacing
- * from suppressing every quality demotion as pressure rises.
+ * Pacing deliberately applies half of the projected deficit across two Draft reserves: the Draft that starts after
+ * this decision and the future Draft admitted by the delayed callback. This is an intuitive coordination heuristic,
+ * not an exact fixed-point derivation, and no half-deficit value is transferred to Admission. Pacing relies on
+ * Admission's later ordinary node-time budget test to shed optional work if residual pressure remains.
  */
 internal fun computePacingDelayMs(
     backlogMs: Long,

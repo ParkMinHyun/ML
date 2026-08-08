@@ -34,8 +34,10 @@ internal class CaptureAvailablePacingSession {
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
      * capture's point prediction plus the learned between-node overhead. The point sum alone omits the inter-node and
      * deinit time and that shortfall compounds with queue depth into a timeout. The decision adds a two-Draft reserve
-     * horizon and leaves half of its deficit to Admission; prediction errors cannot accumulate indefinitely because
-     * every draft start rebases this clock onto the real one.
+     * horizon and deliberately applies half of its projected deficit as the pacing action. No numeric half is passed
+     * to Admission; this heuristic relies on its later node-time budget test to shed optional work under residual
+     * pressure.
+     * Prediction errors cannot accumulate indefinitely because every draft start rebases this clock onto the real one.
      *
      * An absolute uptime, unlike the durations around it: [backlogMsAt] turns it into "how much is left".
      */

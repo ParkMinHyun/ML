@@ -36,15 +36,20 @@ import java.util.List;
 
 /**
  * <div class="camera_en">
- * Policy that paces captureAvailable callbacks with half of a two-Draft prospective backlog deficit. The two reserves
- * cover the Draft starting after the decision and the future Draft admitted by the paced callback; Admission owns the
- * remaining half so quality demotion can still absorb pressure. The current level deficit remains diagnostic.
+ * Policy that paces captureAvailable callbacks over a two-Draft prospective backlog horizon. The two reserves cover
+ * the Draft starting after the decision and the future Draft admitted by the paced callback. Pacing deliberately
+ * applies half of the projected deficit as its arrival-control action; this is an intuitive coordination heuristic,
+ * not an exact fixed-point result, and no half-deficit value is passed to Admission. Pacing relies on node-time
+ * Admission to shed optional work when residual pressure leaves its suffix upper bound above the live budget. The
+ * current level deficit remains diagnostic.
  * </div>
  *
  * <div class="camera_kr" style="display:none;">
  * decision 이후 시작하는 Draft와 pacing callback이 허용할 미래 Draft의 reserve를 합산한 prospective
- * backlog deficit 중 절반만 captureAvailable 지연으로 처리합니다. 나머지 절반은 Admission이 담당하며,
- * 현재 level deficit은 진단값으로만 유지합니다.
+ * backlog horizon을 사용하고, projected deficit의 절반을 직관적인 coordination heuristic으로 적용합니다. 이는 exact
+ * fixed-point 결과가 아니며 half-deficit 값을 Admission에 전달하지 않습니다. Pacing은 node-time Admission이 잔여
+ * 압력으로 suffix upper bound가 live budget을 넘을 때 optional workload를 독립적으로 생략합니다. 현재
+ * level deficit은 진단값으로만 유지합니다.
  * </div>
  */
 public class CaptureAvailableApmPolicy extends ApmPolicy {
