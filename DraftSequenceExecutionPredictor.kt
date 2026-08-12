@@ -10,9 +10,9 @@ private const val TAG = "DraftSequenceExecutionPredictor"
 /**
  * Sequence-aware duration model with an adaptive upper bound.
  *
- * Point prediction is the sum of per-workload baselines times one shared thermal-condition factor. The safety margin is
- * a multiplicative residual calibrated from positive residual ratios captured before model updates, keyed on the exact
- * decision sequence with a global fallback for cold ones.
+ * Point prediction is the sum of per-workload base durations times one shared thermal-condition factor. The safety
+ * margin is a multiplicative residual calibrated from positive residual ratios captured before model updates, keyed on
+ * the exact decision sequence with a global fallback for cold ones.
  *
  * The upper bound is for admission only - [CaptureAvailablePacer] reads the estimate family and never the bound. Owned
  * by the draft-saving task manager and shared by every profiler it creates, so the model lives exactly as long as the
@@ -29,7 +29,7 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        // Memoized per decision: cold-workload estimates scan sibling baselines, and the suffix walk reuses the result.
+        // Memoized per decision: cold-workload estimates scan sibling base durations, and the suffix walk reuses it.
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         val workloadSequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
         val workloadSequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
@@ -129,9 +129,9 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Learns every trend this capture can teach: per-workload baselines, the sequence residual margin, and the time
-     * outside node processing. A non-positive [draftSequenceDurationMs] was not measured, so the overhead trend keeps
-     * its history.
+     * Learns every trend this capture can teach: per-workload base durations, the sequence residual margin, and the
+     * time outside node processing. A non-positive [draftSequenceDurationMs] was not measured, so the overhead trend
+     * keeps its history.
      */
     @Synchronized
     fun learnFromCapture(
@@ -191,7 +191,7 @@ class DraftSequenceExecutionPredictor {
      * distribution is right-skewed and a median under-prices it.
      */
     private class DraftSequenceDurationOverhead {
-        private val overheadScores = RecencyWeightedDistribution()
+        private val overheadDurationsMs = RecencyWeightedDistribution()
         private var learnedOverheadMs = 0.0
 
         fun estimateMs(): Double = learnedOverheadMs
@@ -201,62 +201,64 @@ class DraftSequenceExecutionPredictor {
                 return
             }
 
-            overheadScores.decay()
-            overheadScores.add((draftSequenceDurationMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
-            learnedOverheadMs = overheadScores.mean()
+            overheadDurationsMs.decay()
+            overheadDurationsMs.add((draftSequenceDurationMs - nodeProcessingMs).coerceAtLeast(0L).toDouble())
+            learnedOverheadMs = overheadDurationsMs.mean()
         }
     }
 
     /**
      * Per-workload duration trend as a multiplicative decomposition:
-     * duration(size) ≈ baseline(size) × shared condition.
+     * duration(size) ≈ base(size) × shared condition.
      *
-     * The per-size baseline is condition-stripped and structurally stable; the shared condition is the recency-weighted
-     * median of recent duration/baseline ratios, robust to one stalled draft while carrying sustained thermal
-     * throttling across workload families and sizes.
+     * The per-size base duration is condition-stripped and structurally stable; the shared condition is the
+     * recency-weighted median of recent duration/base ratios, robust to one stalled draft while carrying sustained
+     * thermal throttling across workload families and sizes.
      */
     private class WorkloadDurationTrend {
-        private val baselineByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
-        private val conditionScores = RecencyWeightedDistribution()
+        private val baseDurationByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
+        private val conditionFactors = RecencyWeightedDistribution()
         private var learnedConditionFactor = 1.0
 
         /** Reads one condition snapshot and estimates every workload without recomputing its weighted median. */
         fun estimateDurationMsByWorkload(workloadKeys: List<WorkloadKey>): Map<WorkloadKey, Double> {
-            val conditionSnapshot = learnedConditionFactor
-            return workloadKeys.associateWith { workloadKey -> estimateDurationMs(workloadKey, conditionSnapshot) }
+            val conditionFactorSnapshot = learnedConditionFactor
+            return workloadKeys.associateWith { estimateDurationMs(it, conditionFactorSnapshot) }
         }
 
         fun observe(workloadDurations: Map<WorkloadKey, Long>) {
             // Both halves read the PRE-update condition so they cannot feed back within one capture.
-            val conditionSnapshot = learnedConditionFactor
-            conditionScores.decay()
+            val conditionFactorSnapshot = learnedConditionFactor
+            conditionFactors.decay()
             workloadDurations.forEach { (workloadKey, durationMs) ->
                 val observedMs = durationMs.toDouble()
-                val baselineSnapshot = baselineByWorkload[workloadKey]?.meanMs()
-                if (baselineSnapshot != null && baselineSnapshot > 0.0) {
-                    conditionScores.add(observedMs / baselineSnapshot)
+                val baseDurationSnapshotMs = baseDurationByWorkload[workloadKey]?.meanMs()
+                if (baseDurationSnapshotMs != null && baseDurationSnapshotMs > 0.0) {
+                    conditionFactors.add(observedMs / baseDurationSnapshotMs)
                 }
-                baselineByWorkload.getOrPut(workloadKey) { EqualWeightedMean() }.observe(observedMs / conditionSnapshot)
+                baseDurationByWorkload.getOrPut(workloadKey) { EqualWeightedMean() }
+                    .observe(observedMs / conditionFactorSnapshot)
             }
-            learnedConditionFactor = conditionScores.median().takeIf { it > 0.0 } ?: 1.0
+            learnedConditionFactor = conditionFactors.median().takeIf { it > 0.0 } ?: 1.0
         }
 
         private fun estimateDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
-            baselineByWorkload[workloadKey]?.let { return it.meanMs() * conditionFactor }
+            baseDurationByWorkload[workloadKey]?.let { return it.meanMs() * conditionFactor }
             return estimateColdDurationMs(workloadKey, conditionFactor)
         }
 
         /**
-         * A size with no baseline yet: scale the slowest same-family sibling by the megapixel ratio, so a cold size is
-         * priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero only
-         * when the family has never run at any size. Unreachable once this size has been observed once.
+         * A size with no base duration yet: scale the slowest same-family sibling by the megapixel ratio, so a cold
+         * size is priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero
+         * only when the family has never run at any size. Unreachable once this size has been observed once.
          */
         private fun estimateColdDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
-            var siblingBaselineMs = 0.0
+            var siblingBaseDurationMs = 0.0
             var siblingMegaPixels = 0
-            for ((candidateKey, candidateBaseline) in baselineByWorkload) {
-                if (candidateKey.isWorkloadFamily(workloadKey) && candidateBaseline.meanMs() > siblingBaselineMs) {
-                    siblingBaselineMs = candidateBaseline.meanMs()
+            for ((candidateKey, candidateBaseDuration) in baseDurationByWorkload) {
+                val candidateMs = candidateBaseDuration.meanMs()
+                if (candidateKey.isWorkloadFamily(workloadKey) && candidateMs > siblingBaseDurationMs) {
+                    siblingBaseDurationMs = candidateMs
                     siblingMegaPixels = candidateKey.sizeBucket.megaPixels
                 }
             }
@@ -264,13 +266,13 @@ class DraftSequenceExecutionPredictor {
                 return 0.0
             }
             val megaPixelRatio = workloadKey.sizeBucket.megaPixels.toDouble() / siblingMegaPixels.toDouble()
-            return siblingBaselineMs * megaPixelRatio * conditionFactor
+            return siblingBaseDurationMs * megaPixelRatio * conditionFactor
         }
 
         /**
          * Running mean of duration with the capture's shared condition divided out. Equal 1/n weights, the deliberate
-         * opposite of the recency-weighted condition it pairs with: the baseline converges to a stable per-size anchor
-         * instead of chasing a transient, so a size not shot for a while keeps its structure.
+         * opposite of the recency-weighted condition it pairs with: the base duration converges to a stable per-size
+         * anchor instead of chasing a transient, so a size not shot for a while keeps its structure.
          */
         private class EqualWeightedMean {
             private var sampleCount: Int = 0
@@ -278,12 +280,12 @@ class DraftSequenceExecutionPredictor {
 
             fun meanMs(): Double = mean
 
-            fun observe(baselineSampleMs: Double) {
-                if (baselineSampleMs <= 0.0) {
+            fun observe(baseDurationSampleMs: Double) {
+                if (baseDurationSampleMs <= 0.0) {
                     return
                 }
                 sampleCount++
-                mean += (baselineSampleMs - mean) / sampleCount
+                mean += (baseDurationSampleMs - mean) / sampleCount
             }
         }
     }
