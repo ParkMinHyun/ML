@@ -29,10 +29,11 @@ class DraftSequenceExecutionPredictor {
         workloadSequenceKey: WorkloadSequenceKey,
         preExecutionMetrics: PreExecutionMetrics,
     ): AdmissionDecision {
-        // Memoized per decision: cold-workload estimates scan sibling base durations, and the suffix walk reuses it.
+        // Memoized per decision: cold-workload estimates scan sibling base durations, and capture-end calibration
+        // reads the same per-workload predictions back.
         val workloadPredictedMs = workloadDurationTrend.estimateDurationMsByWorkload(workloadSequenceKey.workloadKeys)
         val workloadSequencePredictedMs = sumPredictedMs(workloadSequenceKey, workloadPredictedMs)
-        val workloadSequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadPredictedMs)
+        val workloadSequenceUpperBoundMs = estimateUpperBoundMs(workloadSequenceKey, workloadSequencePredictedMs)
         // Only OPTIONAL work is gated, and only by the learned upper bound - budget deficits are the pacer's business.
         // The other policies always admit, so a rejection here is by definition an OPTIONAL one.
         val admit = when (workloadSequenceKey.headWorkloadKey.policy) {
@@ -64,28 +65,20 @@ class DraftSequenceExecutionPredictor {
         )
     }
 
+    /**
+     * The sequence's point sum inflated by the residual margin learned for that exact sequence: a multiplicative
+     * log-residual, so the bound scales with the prediction instead of adding a fixed pad. A sequence predicted at
+     * zero has nothing to inflate.
+     */
     private fun estimateUpperBoundMs(
         workloadSequenceKey: WorkloadSequenceKey,
-        workloadPredictedMs: Map<WorkloadKey, Double>,
+        workloadSequencePredictedMs: Double,
     ): Double {
-        // Walk tail -> head, each suffix bounded by both its own residual-inflated bound and its head estimate plus the
-        // corrected tail, so nested-sequence bounds never invert. exp(C) >= 1, so the tail step needs no special case.
-        val workloadKeys = workloadSequenceKey.workloadKeys
-        var correctedUpperBoundMs = 0.0
-        var suffixPredictedMs = 0.0
-        for (index in workloadKeys.indices.reversed()) {
-            val headPredictedMs = workloadPredictedMs.getValue(workloadKeys[index])
-            suffixPredictedMs += headPredictedMs
-            // This suffix's own bound: its point sum inflated by the residual margin learned for that exact suffix.
-            val suffixKey = WorkloadSequenceKey(workloadKeys.subList(index, workloadKeys.size))
-            val suffixUpperBoundMs = if (suffixPredictedMs <= 0.0) {
-                0.0
-            } else {
-                suffixPredictedMs * exp(workloadSequenceResidual.estimateScore(suffixKey))
-            }
-            correctedUpperBoundMs = maxOf(suffixUpperBoundMs, headPredictedMs + correctedUpperBoundMs)
+        return if (workloadSequencePredictedMs <= 0.0) {
+            0.0
+        } else {
+            workloadSequencePredictedMs * exp(workloadSequenceResidual.estimateScore(workloadSequenceKey))
         }
-        return correctedUpperBoundMs
     }
 
     private fun sumPredictedMs(
