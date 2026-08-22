@@ -141,7 +141,7 @@ class CaptureAvailablePacer(
 
     /**
      * Ends the burst session when the draft task queue drains, and again at pipeline close. Paired with
-     * [DraftSequenceAdmissionPolicy.clear] on the same drain, so the demoted shape a reserve is projected onto and the
+     * [DraftSequenceAdmissionPolicy.reset] on the same drain, so the demoted shape a reserve is projected onto and the
      * maxima it is projected from always describe one burst.
      */
     @Synchronized

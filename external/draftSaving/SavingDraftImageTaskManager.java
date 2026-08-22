@@ -197,7 +197,7 @@ public class SavingDraftImageTaskManager {
         shutDownThreadPool();
         savingDraftImageTaskMap.clear();
         captureAvailablePacer.clear();
-        admissionPolicy.clear();
+        admissionPolicy.reset();
         reservedSkipSaveDraftImageIdSet.clear();
         waitForSavingDraftImageTaskMapDrain = false;
         isWatchdogDrainInCurrentSession = false;
@@ -235,7 +235,7 @@ public class SavingDraftImageTaskManager {
                 hasCaptureTimeoutInCurrentSession = false;
                 // The drained queue is the burst boundary: end both session states here so the demotions and the
                 // pacing state always describe the same burst.
-                admissionPolicy.clear();
+                admissionPolicy.reset();
                 captureAvailablePacer.clear();
             }
         }
