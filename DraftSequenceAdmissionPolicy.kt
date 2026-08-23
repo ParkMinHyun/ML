@@ -14,8 +14,8 @@ import com.samsung.android.camera.watermark.Watermark.WatermarkType
  */
 class DraftSequenceAdmissionPolicy {
 
-    /** Groups this burst still runs; a skip removes one, and [reset] refills the set rather than emptying it. */
-    private val effectGroups = AdmissionGroup.entries.toMutableSet()
+    /** Effect groups this burst has decided on, and whether a skip has since taken one out. */
+    private val effectGroups = mutableMapOf<AdmissionGroup, EffectGroupState>()
 
     /** Atomically applies a model decision, hardening it with the sticky group-demotion state. */
     @Synchronized
@@ -27,8 +27,15 @@ class DraftSequenceAdmissionPolicy {
             return false
         }
 
-        if (!modelAdmit) {
-            AdmissionGroup.of(workloadKey)?.let { effectGroups -= it }
+        AdmissionGroup.of(workloadKey)?.let { effectGroup ->
+            if (modelAdmit) {
+                // A group is entered by the first workload of it this burst decides on, so a burst without Bokeh
+                // never carries PORTRAIT. Never overwrite a demotion: the REQUIRED members of a demoted group still
+                // run, and they must not carry the group back in.
+                effectGroups.putIfAbsent(effectGroup, EffectGroupState.RUNNING)
+            } else {
+                effectGroups[effectGroup] = EffectGroupState.DEMOTED
+            }
         }
         return modelAdmit
     }
@@ -36,7 +43,7 @@ class DraftSequenceAdmissionPolicy {
     /** What this burst will actually run: [workloadSequenceKey] minus the workloads whose group is demoted. */
     @Synchronized
     fun resolveDraftSequenceKey(workloadSequenceKey: WorkloadSequenceKey): WorkloadSequenceKey {
-        if (effectGroups.containsAll(AdmissionGroup.entries)) {
+        if (!effectGroups.containsValue(EffectGroupState.DEMOTED)) {
             return workloadSequenceKey
         }
 
@@ -53,7 +60,7 @@ class DraftSequenceAdmissionPolicy {
 
     /** Returns whether the group is already demoted in this burst session. */
     @Synchronized
-    fun isDemoted(group: AdmissionGroup): Boolean = group !in effectGroups
+    fun isDemoted(group: AdmissionGroup): Boolean = effectGroups[group] == EffectGroupState.DEMOTED
 
     /**
      * Whether the sticky demotions take this workload out of the burst. Frame Watermark and the Decoding it forces
@@ -70,14 +77,17 @@ class DraftSequenceAdmissionPolicy {
             return false
         }
         val group = AdmissionGroup.of(workloadKey) ?: return false
-        return group !in effectGroups
+        return effectGroups[group] == EffectGroupState.DEMOTED
     }
 
-    /** Restores every effect group when the burst session ends. */
+    /** Forgets this burst's effect groups when the session ends; the next burst enters its own. */
     @Synchronized
     fun reset() {
-        effectGroups.addAll(AdmissionGroup.entries)
+        effectGroups.clear()
     }
+
+    /** Whether an effect group this burst entered still runs, or a skip has taken it out until [reset]. */
+    private enum class EffectGroupState { RUNNING, DEMOTED }
 }
 
 /** Workload groups admitted or demoted as one unit; a demotion sticks until [DraftSequenceAdmissionPolicy.reset]. */
