@@ -71,14 +71,17 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     /**
-     * Profiles one predictable node execution. OPTIONAL workloads are admitted by their remaining suffix upper bound,
-     * hardened by the sticky group demotion in [DraftSequenceAdmissionPolicy] so one burst never alternates effects
-     * between shots. REQUIRED work (DynamicFunction, Frame Watermark) always runs but is not reserve-protected; the
-     * RESERVED workload is the mandatory tail.
+     * Profiles one predictable node execution. OPTIONAL workloads are admitted by the upper bound of the suffix this
+     * burst will actually run - the demoted shape the pacer already reserves for - and that decision is then hardened
+     * by the sticky group demotion in [DraftSequenceAdmissionPolicy] so one burst never alternates effects between
+     * shots. REQUIRED work (DynamicFunction, Frame Watermark) always runs but is not reserve-protected; the RESERVED
+     * workload is the mandatory tail.
      */
     fun profileNodeExecution(node: Node): DraftSequenceExecutionSession? {
         val workloadKey = resolveWorkloadKey(node, requireReadyToRun = true) ?: return null
-        val workloadSequenceKey = WorkloadSequenceKey(resolveWorkloadSequenceKey(node, workloadKey))
+        val workloadSequenceKey = admissionPolicy.resolveDraftSequenceKey(
+            WorkloadSequenceKey(resolveWorkloadSequenceKey(node, workloadKey)),
+        )
         val preExecutionMetrics = readPreExecutionMetrics()
         val nodeExecutionMetrics = metricsRecorder.onNodeExecutionStart(
             nodeName = node.javaClass.simpleName,

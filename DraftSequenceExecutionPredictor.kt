@@ -67,18 +67,14 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * The sequence's point sum inflated by the residual margin learned for that exact sequence: a multiplicative
-     * log-residual, so the bound scales with the prediction instead of adding a fixed pad. A sequence predicted at
-     * zero has nothing to inflate.
+     * log-residual, so the bound scales with the prediction instead of adding a fixed pad. The margin never drops
+     * below 1, so a sequence predicted at zero stays at zero and a cold one is bounded by its own point sum.
      */
     private fun estimateUpperBoundMs(
         workloadSequenceKey: WorkloadSequenceKey,
         workloadSequencePredictedMs: Double,
     ): Double {
-        return if (workloadSequencePredictedMs <= 0.0) {
-            0.0
-        } else {
-            workloadSequencePredictedMs * exp(workloadSequenceResidual.estimateScore(workloadSequenceKey))
-        }
+        return workloadSequencePredictedMs * exp(workloadSequenceResidual.estimateScore(workloadSequenceKey))
     }
 
     private fun sumPredictedMs(
@@ -284,13 +280,15 @@ class DraftSequenceExecutionPredictor {
     }
 
     /**
-     * Upper-bound residuals per sequence, pooled globally as the cold-sequence fallback: a sequence with its own
-     * residual history is bounded by it, everything else by the pool.
+     * Upper-bound residual scores per sequence, pooled globally as the cold-sequence fallback: a sequence with its
+     * own history is bounded by it, everything else by the pool. A score is ln(actual/predicted) floored at 0, so the
+     * bound this feeds can only inflate a prediction, never shrink one.
      */
     private class WorkloadSequenceResidual {
         private val residualsBySequence = mutableMapOf<WorkloadSequenceKey, RecencyWeightedDistribution>()
         private val globalResiduals = RecencyWeightedDistribution()
 
+        /** Log-residual the prediction is inflated by; 0 while both histories are empty. */
         fun estimateScore(workloadSequenceKey: WorkloadSequenceKey): Double {
             val sequenceResiduals = residualsBySequence[workloadSequenceKey]
             val residuals = if (sequenceResiduals == null || sequenceResiduals.isEmpty()) {
@@ -305,14 +303,26 @@ class DraftSequenceExecutionPredictor {
             workloadDurations: Map<WorkloadKey, Long>,
             admissionDecisions: Collection<AdmissionDecision>,
         ) {
+            // A skipped workload leaves no observation, so score the shape that was measured and key the sample by
+            // that shape - the sequence as decided never ran, so its actual would be counterfactual. Measured rather
+            // than executed: charging a workload with no positive measurement its own prediction pulls the ratio to 1
+            // and quietly shaves the tail the bound reads. One capture runs one shape once, so two decisions that
+            // project onto the same shape carry one sample.
             val residualScores = admissionDecisions.mapNotNull { decision ->
-                val actualMs = sumFlooredActualMs(decision, workloadDurations) ?: return@mapNotNull null
-                val predictedMs = decision.executionPrediction.sequencePredictedDurationMs
+                val measuredWorkloadKeys = decision.workloadSequenceKey.workloadKeys
+                    .filter { it in workloadDurations }
+                val predictedMs = measuredWorkloadKeys.sumOf { decision.workloadPredictedMs[it] ?: 0.0 }
                 if (predictedMs <= 0.0) {
                     return@mapNotNull null
                 }
-                decision.workloadSequenceKey to maxOf(0.0, ln(actualMs / predictedMs))
-            }
+                // Each workload contributes max(decision-time prediction, actual), so one overrun survives another
+                // workload happening to run fast.
+                val flooredActualMs = measuredWorkloadKeys.sumOf {
+                    maxOf(decision.workloadPredictedMs[it] ?: 0.0, workloadDurations.getValue(it).toDouble())
+                }
+                WorkloadSequenceKey(measuredWorkloadKeys) to
+                    maxOf(BASE_RESIDUAL_SCORE, ln(flooredActualMs / predictedMs))
+            }.distinctBy { (workloadSequenceKey, _) -> workloadSequenceKey }
             if (residualScores.isEmpty()) {
                 return
             }
@@ -322,23 +332,6 @@ class DraftSequenceExecutionPredictor {
                 globalResiduals.add(score)
                 residualsBySequence.getOrPut(workloadSequenceKey) { RecencyWeightedDistribution() }.add(score)
             }
-        }
-
-        /**
-         * Each workload contributes max(decision-time prediction, actual), so one overrun survives another workload
-         * happening to run fast. Null for an incomplete sequence, which cannot be scored.
-         */
-        private fun sumFlooredActualMs(
-            decision: AdmissionDecision,
-            workloadDurations: Map<WorkloadKey, Long>,
-        ): Double? {
-            var flooredTotalMs = 0.0
-            for (workloadKey in decision.workloadSequenceKey.workloadKeys) {
-                val actualMs = workloadDurations[workloadKey] ?: return null
-                val predictedMs = decision.workloadPredictedMs[workloadKey] ?: 0.0
-                flooredTotalMs += maxOf(predictedMs, actualMs.toDouble())
-            }
-            return flooredTotalMs.takeIf { it > 0.0 }
         }
 
         private fun decay() {
@@ -351,6 +344,14 @@ class DraftSequenceExecutionPredictor {
                     sequenceIterator.remove()
                 }
             }
+        }
+
+        private companion object {
+            /**
+             * The score that leaves a prediction as it is - exp(0) = 1, no inflation. It floors the samples, so a
+             * capture that ran faster than predicted teaches no shrink, and it is what an empty history reads as.
+             */
+            const val BASE_RESIDUAL_SCORE = 0.0
         }
     }
 
@@ -377,7 +378,7 @@ class DraftSequenceExecutionPredictor {
  */
 data class AdmissionDecision(
     val executionPrediction: ExecutionPrediction,
-    /** Sequence this decision was made for; capture-end score samples are keyed by it. */
+    /** Sequence this decision was made for; capture-end score samples are keyed by the part of it that ran. */
     val workloadSequenceKey: WorkloadSequenceKey,
     /** Per-workload decision-time prediction, clamping workload underruns so one workload's spike is not diluted. */
     val workloadPredictedMs: Map<WorkloadKey, Double>,
