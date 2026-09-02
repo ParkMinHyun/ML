@@ -6,9 +6,9 @@ package com.samsung.android.camera.core2.ml
  * outweigh its first without any trend carrying its own smoothing factor. Bounded, because ageing prunes the
  * samples that can no longer move a read.
  *
- * Every learned trend keeps one of these and reads the statistic its role calls for - [median] for a robust centre,
- * [mean] for a right-skewed quantity that must not be under-estimated, [expectedMaximum] for a safety bound. Each is a
- * named statistic rather than a tunable fraction, so no caller has a percentile to pick.
+ * Every learned trend keeps one of these and reads the statistic its role calls for - [mean] for a right-skewed
+ * quantity that must not be under-estimated, [expectedMaximum] for a safety bound. Each is a named statistic rather
+ * than a tunable fraction, so no caller has a percentile to pick.
  *
  * Scores are kept in ascending order on insertion, so a read walks the samples once and never filters, maps, or
  * sorts them. Mean reads are order-independent and share the same ordered storage.
@@ -34,9 +34,6 @@ internal class RecencyWeightedDistribution {
         // than ~130 captures weighs < 1e-6 and can no longer move any read.
         samples.removeAll { it.weight < WEIGHT_PRUNE_THRESHOLD }
     }
-
-    /** Robust centre: the score with half the weight on either side. Prefer over [mean] for a spike-prone quantity. */
-    fun median(): Double = quantile(0.5)
 
     fun mean(): Double {
         if (samples.isEmpty()) {

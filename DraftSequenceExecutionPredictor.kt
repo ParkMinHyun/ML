@@ -200,16 +200,17 @@ class DraftSequenceExecutionPredictor {
      * Per-workload duration trend as a multiplicative decomposition:
      * duration(size) ≈ base(size) × shared condition.
      *
-     * The per-size base duration is condition-stripped and structurally stable; the shared condition is the
-     * recency-weighted median of recent duration/base ratios, robust to one stalled draft while carrying sustained
-     * thermal throttling across workload families and sizes.
+     * The per-size base duration is condition-stripped and structurally stable; the shared condition is the median of
+     * the duration/base ratios the latest capture measured - robust to one stalled workload within that capture, and
+     * carrying no history of its own, so sustained thermal throttling reaches the estimate at the capture it appears
+     * in rather than after a decayed history has been out-weighed. Continuous shooting feels this on the pacing side:
+     * admission is bounded by its own residual, which already tracks the overrun.
      */
     private class WorkloadDurationTrend {
         private val baseDurationByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
-        private val conditionFactors = RecencyWeightedDistribution()
         private var learnedConditionFactor = 1.0
 
-        /** Reads one condition snapshot and estimates every workload without recomputing its weighted median. */
+        /** Reads one condition snapshot and estimates every workload against the same one. */
         fun estimateDurationMsByWorkload(workloadKeys: List<WorkloadKey>): Map<WorkloadKey, Double> {
             val conditionFactorSnapshot = learnedConditionFactor
             return workloadKeys.associateWith { estimateDurationMs(it, conditionFactorSnapshot) }
@@ -218,17 +219,19 @@ class DraftSequenceExecutionPredictor {
         fun observe(workloadDurations: Map<WorkloadKey, Long>) {
             // Both halves read the PRE-update condition so they cannot feed back within one capture.
             val conditionFactorSnapshot = learnedConditionFactor
-            conditionFactors.decay()
+            val conditionFactorSamples = mutableListOf<Double>()
             workloadDurations.forEach { (workloadKey, durationMs) ->
                 val observedMs = durationMs.toDouble()
                 val baseDurationSnapshotMs = baseDurationByWorkload[workloadKey]?.meanMs()
                 if (baseDurationSnapshotMs != null && baseDurationSnapshotMs > 0.0) {
-                    conditionFactors.add(observedMs / baseDurationSnapshotMs)
+                    conditionFactorSamples.add(observedMs / baseDurationSnapshotMs)
                 }
                 baseDurationByWorkload.getOrPut(workloadKey) { EqualWeightedMean() }
                     .observe(observedMs / conditionFactorSnapshot)
             }
-            learnedConditionFactor = conditionFactors.median().takeIf { it > 0.0 } ?: 1.0
+            // A capture whose every workload was cold teaches no ratio; the last learned condition stands rather
+            // than resetting to "nominal" in the middle of a throttle.
+            medianOf(conditionFactorSamples).takeIf { it > 0.0 }?.let { learnedConditionFactor = it }
         }
 
         private fun estimateDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
@@ -258,10 +261,24 @@ class DraftSequenceExecutionPredictor {
             return siblingBaseDurationMs * megaPixelRatio * conditionFactor
         }
 
+        /** Median of [samples], the mean of the middle two when the count is even; 0.0 while empty. */
+        private fun medianOf(samples: MutableList<Double>): Double {
+            if (samples.isEmpty()) {
+                return 0.0
+            }
+            samples.sort()
+            val middleIndex = samples.size / 2
+            return if (samples.size % 2 == 1) {
+                samples[middleIndex]
+            } else {
+                (samples[middleIndex - 1] + samples[middleIndex]) / 2.0
+            }
+        }
+
         /**
          * Running mean of duration with the capture's shared condition divided out. Equal 1/n weights, the deliberate
-         * opposite of the recency-weighted condition it pairs with: the base duration converges to a stable per-size
-         * anchor instead of chasing a transient, so a size not shot for a while keeps its structure.
+         * opposite of the latest-capture condition it pairs with: the base duration converges to a stable per-size
+         * anchor instead of chasing a transient, so the transient lives in the condition alone.
          */
         private class EqualWeightedMean {
             private var sampleCount: Int = 0
