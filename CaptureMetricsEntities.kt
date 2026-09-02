@@ -93,6 +93,9 @@ data class CaptureAvailablePacingMetricsEntity(
     @ColumnInfo(name = "backlog_ms")
     val backlogMs: Long,
 
+    @ColumnInfo(name = "backlog_growth_ms")
+    val backlogGrowthMs: Double,
+
     @ColumnInfo(name = "queued_draft_count")
     val queuedDraftCount: Int,
 

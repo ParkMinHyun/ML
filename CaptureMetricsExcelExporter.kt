@@ -1757,6 +1757,7 @@ class CaptureMetricsExcelExporter(
         )
         val afterAppliedDelayMs: Long = computePacingDelayMs(
             backlogMs = before.backlogMs,
+            backlogGrowthMs = before.backlogGrowthMs,
             timeToDeadlineMs = before.timeToDeadlineMs,
             draftSequenceReservedDurationMs = before.draftSequenceReservedDurationMs,
         )
@@ -2527,6 +2528,7 @@ class CaptureMetricsExcelExporter(
                 it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.let { pacing ->
                     computePacingDelayMs(
                         backlogMs = pacing.backlogMs,
+                        backlogGrowthMs = pacing.backlogGrowthMs,
                         timeToDeadlineMs = pacing.timeToDeadlineMs,
                         draftSequenceReservedDurationMs = pacing.draftSequenceReservedDurationMs,
                     )
@@ -2536,6 +2538,7 @@ class CaptureMetricsExcelExporter(
                 it.capture.metrics.draftSequenceMetrics?.captureAvailablePacing?.let { pacing ->
                     computePacingDelayMs(
                         backlogMs = pacing.backlogMs,
+                        backlogGrowthMs = pacing.backlogGrowthMs,
                         timeToDeadlineMs = pacing.timeToDeadlineMs,
                         draftSequenceReservedDurationMs = pacing.draftSequenceReservedDurationMs,
                     ) > 0L
@@ -2757,6 +2760,9 @@ class CaptureMetricsExcelExporter(
                 it.row.pacingReplay?.before?.draftSequenceReservedDurationMs
             },
             Column("beforeBacklogMs") { it.row.pacingReplay?.before?.backlogMs },
+            // Learned per-callback queue growth the decision added to its completion-time estimate. Without it a
+            // replay of these rows prices a proportional-only controller, not the one that ran.
+            Column("beforeBacklogGrowthMs") { it.row.pacingReplay?.before?.backlogGrowthMs },
             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
             Column("beforeQueuedPredictedWorkMs") {
                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
@@ -2862,6 +2868,14 @@ class CaptureMetricsExcelExporter(
                     "captureTimeoutMs. On legacy rows carrying neither, a positive backlog deficit recovers the spent " +
                     "part exactly; a zero deficit only provides a min/max range, so after delay is reported as a range " +
                     "unless both bounds produce the same result.",
+            ),
+            ReplayNote(
+                topic = "Pacing queue growth",
+                note = "beforeBacklogGrowthMs is the learned per-callback growth of the admitted backlog within the " +
+                    "burst, added once to the completion-time estimate because the callback a decision gates joins " +
+                    "the queue one arrival after the decision prices it. Any replay that omits it scores a " +
+                    "proportional-only controller against rows produced by a proportional-plus-lead one. Rows " +
+                    "exported before this column exists carry no growth and must be replayed as 0.",
             ),
             ReplayNote(
                 topic = "Pacing prediction scope",

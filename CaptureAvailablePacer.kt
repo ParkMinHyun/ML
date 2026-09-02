@@ -51,9 +51,11 @@ class CaptureAvailablePacer(
         val nowUptimeMs = SystemClock.uptimeMillis()
         val timeToDeadlineMs = session.timeToDeadlineMsAt(nowUptimeMs)
         val backlogMs = session.backlogMsAt(nowUptimeMs)
+        val backlogGrowthMs = session.observeBacklogGrowthMs(backlogMs)
         val draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs
         val pacingDelayMs = computePacingDelayMs(
             backlogMs = backlogMs,
+            backlogGrowthMs = backlogGrowthMs,
             timeToDeadlineMs = timeToDeadlineMs,
             draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
         )
@@ -61,6 +63,7 @@ class CaptureAvailablePacer(
         val decision = CaptureAvailablePacingDecision(
             delayMs = pacingDelayMs,
             backlogMs = backlogMs,
+            backlogGrowthMs = backlogGrowthMs,
             queuedDraftCount = session.queuedDraftCount,
             queuedPredictedWorkMs = session.queuedPredictedWorkMs,
             timeToDeadlineMs = timeToDeadlineMs,
@@ -162,13 +165,22 @@ internal fun computeLevelDeficitMs(
  * this decision and the future Draft admitted by the delayed callback. This is an intuitive coordination heuristic,
  * not an exact fixed-point derivation, and no half-deficit value is transferred to Admission. Pacing relies on
  * Admission's later ordinary node-time budget test to shed optional work if residual pressure remains.
+ *
+ * [backlogGrowthMs] completes the completion-time estimate rather than padding it. Every other term is measured at
+ * this instant, but the callback this decision gates joins the queue one arrival later, so on a burst whose Drafts
+ * outrun its shot cadence the estimate is short by exactly one arrival of queue growth. Adding the measured growth
+ * is what lets the delay land on a shutter that has not fired yet; without it the decision trails the ramp and its
+ * delay arrives after the capture it was meant to save. It is a difference and never a running total, so it cannot
+ * wind up: once pacing holds the queue flat the samples fall to zero and the term retires itself.
  */
 internal fun computePacingDelayMs(
     backlogMs: Long,
+    backlogGrowthMs: Double,
     timeToDeadlineMs: Long,
     draftSequenceReservedDurationMs: Double,
 ): Long {
-    val estimatedCompletionTimeMs = backlogMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
+    val estimatedCompletionTimeMs =
+        backlogMs + backlogGrowthMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
     val deadlineDeficitMs = estimatedCompletionTimeMs - timeToDeadlineMs.coerceAtLeast(0L)
     val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT
 
@@ -194,6 +206,8 @@ data class CaptureAvailablePacingSnapshot(
 data class CaptureAvailablePacingDecision(
     val delayMs: Long,
     val backlogMs: Long,
+    /** Learned per-callback growth of [backlogMs] in this burst, added once to the completion-time estimate. */
+    val backlogGrowthMs: Double,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
     /** Window remaining on the newest committed capture deadline when this decision was made. */

@@ -49,6 +49,18 @@ internal class CaptureAvailablePacingSession {
      */
     private var backlogDeadlineMs: Long? = null
 
+    /**
+     * How much the admitted backlog grew between each pair of this burst's callbacks. The decision prices the queue
+     * as it stands, but the callback it gates is released one arrival later, so a burst filling faster than it drains
+     * is already behind by one of these before its delay takes effect. Recency-weighted like every other learned
+     * trend here, so a burst that has begun to converge stops paying for how it started - and per burst, because it
+     * describes this shot cadence against this thermal state, not the device.
+     */
+    private val backlogGrowthsMs = RecencyWeightedDistribution()
+
+    /** The previous callback's backlog, the other half of a difference; null until this burst has decided once. */
+    private var lastBacklogMs: Long? = null
+
     val queuedDraftCount: Int get() = pendingDecisions.size
 
     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
@@ -123,6 +135,24 @@ internal class CaptureAvailablePacingSession {
 
     /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
     fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)
+
+    /**
+     * Teaches [backlogMs] to the growth trend and reads the trend back including it. Call exactly once per decision,
+     * with the value [backlogMsAt] just returned: the trend is a difference of consecutive callbacks, so a caller
+     * that read the backlog without teaching it would silently measure an arbitrary subset of the burst.
+     *
+     * Floored at zero because a draining queue teaches a negative sample and lowers the trend, but pacing may become
+     * more careful within a burst and never less. The mean, not [RecencyWeightedDistribution.expectedMaximum], keeps
+     * the clock the estimate its own contract declares - the safety bound lives in the reserve.
+     */
+    fun observeBacklogGrowthMs(backlogMs: Long): Double {
+        lastBacklogMs?.let { previousBacklogMs ->
+            backlogGrowthsMs.decay()
+            backlogGrowthsMs.add((backlogMs - previousBacklogMs).toDouble())
+        }
+        lastBacklogMs = backlogMs
+        return backlogGrowthsMs.mean().coerceAtLeast(0.0)
+    }
 
     /** Remaining part of the latest committed capture's timeout window, or a fresh window before one is available. */
     fun timeToDeadlineMsAt(nowUptimeMs: Long): Long {

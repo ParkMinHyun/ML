@@ -67,6 +67,12 @@ data class CaptureAvailablePacingMetrics(
     val appliedDelayMs: Long,
     val levelDeficitMs: Long,
     val backlogMs: Long,
+    /**
+     * Learned per-callback growth of [backlogMs] the decision added to its completion-time estimate. Persisted
+     * because the exporter re-evaluates the shared delay formula on these rows, and a missing term would make the
+     * replay a different controller than the one that ran.
+     */
+    val backlogGrowthMs: Double,
     val queuedDraftCount: Int,
     val queuedPredictedWorkMs: Double,
     /** Remaining window on the latest committed capture deadline that the two-Draft pacing decision used. */
