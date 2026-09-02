@@ -28,7 +28,7 @@ internal class CaptureAvailablePacingSession {
         private set
 
     private val pendingDecisions = ArrayDeque<CaptureAvailablePacingDecision>()
-    private val maxDraftSequenceDurationMsBySize = mutableMapOf<SizeBucket, Long>()
+    private var maxDraftSequenceDurationMs = 0L
 
     /**
      * When the admitted queue drains, so an estimate of elapsed work rather than a safety bound: it advances by each
@@ -99,13 +99,12 @@ internal class CaptureAvailablePacingSession {
     }
 
     /**
-     * Updates the duration context used by subsequent pacing decisions. A zero duration represents cancellation and
-     * therefore does not become an observed maximum.
+     * Updates the duration context used by subsequent pacing decisions. A non-positive duration was never measured -
+     * a draft the pipeline never started - so it does not become an observed maximum.
      */
-    fun updateMaxDraftSequenceDurationMs(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
+    fun updateMaxDraftSequenceDurationMs(draftSequenceDurationMs: Long) {
         if (draftSequenceDurationMs > 0L) {
-            maxDraftSequenceDurationMsBySize[sizeBucket] =
-                maxOf(maxDraftSequenceDurationMsBySize[sizeBucket] ?: 0L, draftSequenceDurationMs)
+            maxDraftSequenceDurationMs = maxOf(maxDraftSequenceDurationMs, draftSequenceDurationMs)
         }
     }
 
@@ -115,15 +114,12 @@ internal class CaptureAvailablePacingSession {
     }
 
     /**
-     * Measured max duration to price [sizeBucket] by. Reading the draft's own size keeps a heavy other-size draft (a
-     * MP24 burst) from inflating a MP12 capture's reserve; a size not measured this burst falls back to the heaviest
-     * one that was - conservative while cold, exact once its own size has run, and never above a duration this
-     * pipeline really produced.
+     * The heaviest Draft this burst has measured, whatever frame size produced it. Every Draft in the burst shares
+     * one thermal and memory state, so the heaviest observed occupancy is the honest price of the next one; scoping
+     * it per size only let a lighter size keep a cheap reserve while the heavy one was throttling the same CPU.
+     * Never above a duration this pipeline really produced.
      */
-    fun getMaxDraftSequenceDurationMs(sizeBucket: SizeBucket): Long =
-        maxDraftSequenceDurationMsBySize[sizeBucket]
-            ?: maxDraftSequenceDurationMsBySize.values.maxOrNull()
-            ?: 0L
+    fun getMaxDraftSequenceDurationMs(): Long = maxDraftSequenceDurationMs
 
     /** Admitted work still ahead of [nowUptimeMs] on the backlog clock. */
     fun backlogMsAt(nowUptimeMs: Long): Long = (backlogEndTimeMs - nowUptimeMs).coerceAtLeast(0L)

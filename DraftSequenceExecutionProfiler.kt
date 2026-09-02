@@ -33,7 +33,6 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private val modelUpdate = ModelUpdateBuffer()
     private val metricsRecorder = MetricsRecorder(captureMetrics, draftSequenceMetrics, isPendingRequest)
     private val draftNodeChainLifecycle = DraftNodeChainLifecycle()
-    private val sizeBucket = SizeBucket.of(captureMetrics.resultImageSize)
 
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var draftSequenceExecutionSession: DraftSequenceExecutionSession? = null
@@ -180,18 +179,22 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftSequenceDurationMs)
         }
         // Feed the observed duration into the context used by subsequent two-Draft pacing decisions.
-        captureAvailablePacer.endDraftSequence(sizeBucket, draftSequenceDurationMs)
+        captureAvailablePacer.endDraftSequence(draftSequenceDurationMs)
 
         val isTimeout = captureMetrics.timeoutTimestampMsOrDefault < SystemClock.uptimeMillis()
         metricsRecorder.onCaptureEnd(isTimeout)
         return isTimeout
     }
 
-    /** Cancels the pending RESERVED workload without discarding collected samples. */
+    /**
+     * Cancels the pending RESERVED workload without discarding collected samples. The pacer needs no cancellation
+     * hook: this draft's admission was already consumed at its start, and a draft that never ran teaches the
+     * session maximum nothing, which [CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs] enforces on
+     * the duration itself.
+     */
     fun cancelDraftSequenceExecution() {
         draftSequenceExecutionSession?.cancel()
         draftSequenceExecutionSession = null
-        captureAvailablePacer.cancelDraftSequence(sizeBucket)
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {
@@ -205,16 +208,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     private fun resolveWorkloadKey(node: Node, requireReadyToRun: Boolean): WorkloadKey? {
         return when (node) {
-            is SecDualBokehNodeBase -> WorkloadKey.Bokeh(sizeBucket)
+            is SecDualBokehNodeBase -> WorkloadKey.Bokeh
                 .takeIf { !requireReadyToRun || node.isMaxInputCount() }
-            is SecFilterNode -> WorkloadKey.Filter(sizeBucket)
-            is DynamicFunctionNode -> WorkloadKey.DynamicFunction(sizeBucket)
-            is WatermarkNode -> WorkloadKey.Watermark(sizeBucket, node.watermarkType)
+            is SecFilterNode -> WorkloadKey.Filter
+            is DynamicFunctionNode -> WorkloadKey.DynamicFunction
+            is WatermarkNode -> WorkloadKey.Watermark(node.watermarkType)
             is SecImageCodecNodeBase -> {
                 when (node.codecUsage) {
-                    CodecConfiguration.DECODE -> WorkloadKey.Decoding(sizeBucket)
+                    CodecConfiguration.DECODE -> WorkloadKey.Decoding
                     CodecConfiguration.ENCODE -> WorkloadKey.Encoding(
-                        sizeBucket,
                         captureMetrics.resultImageFormat,
                         isPendingRequest,
                     )

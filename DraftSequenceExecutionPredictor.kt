@@ -198,13 +198,13 @@ class DraftSequenceExecutionPredictor {
 
     /**
      * Per-workload duration trend as a multiplicative decomposition:
-     * duration(size) ≈ base(size) × shared condition.
+     * duration ≈ base × shared condition.
      *
-     * The per-size base duration is condition-stripped and structurally stable; the shared condition is the median of
-     * the duration/base ratios the latest capture measured - robust to one stalled workload within that capture, and
-     * carrying no history of its own, so sustained thermal throttling reaches the estimate at the capture it appears
-     * in rather than after a decayed history has been out-weighed. Continuous shooting feels this on the pacing side:
-     * admission is bounded by its own residual, which already tracks the overrun.
+     * The base duration is condition-stripped and structurally stable; the shared condition is the median of the
+     * duration/base ratios the latest capture measured - robust to one stalled workload within that capture, and
+     * carrying no history of its own, so sustained thermal throttling reaches the estimate at the capture it
+     * appears in rather than after a decayed history has been out-weighed. Continuous shooting feels this on the
+     * pacing side: admission is bounded by its own residual, which already tracks the overrun.
      */
     private class WorkloadDurationTrend {
         private val baseDurationByWorkload = mutableMapOf<WorkloadKey, EqualWeightedMean>()
@@ -235,30 +235,10 @@ class DraftSequenceExecutionPredictor {
         }
 
         private fun estimateDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
-            baseDurationByWorkload[workloadKey]?.let { return it.meanMs() * conditionFactor }
-            return estimateColdDurationMs(workloadKey, conditionFactor)
-        }
-
-        /**
-         * A size with no base duration yet: scale the slowest same-family sibling by the megapixel ratio, so a cold
-         * size is priced from an observed one rather than from nothing (a MP24 sibling prices cold MP12 at half). Zero
-         * only when the family has never run at any size. Unreachable once this size has been observed once.
-         */
-        private fun estimateColdDurationMs(workloadKey: WorkloadKey, conditionFactor: Double): Double {
-            var siblingBaseDurationMs = 0.0
-            var siblingMegaPixels = 0
-            for ((candidateKey, candidateBaseDuration) in baseDurationByWorkload) {
-                val candidateMs = candidateBaseDuration.meanMs()
-                if (candidateKey.isWorkloadFamily(workloadKey) && candidateMs > siblingBaseDurationMs) {
-                    siblingBaseDurationMs = candidateMs
-                    siblingMegaPixels = candidateKey.sizeBucket.megaPixels
-                }
-            }
-            if (siblingMegaPixels <= 0) {
-                return 0.0
-            }
-            val megaPixelRatio = workloadKey.sizeBucket.megaPixels.toDouble() / siblingMegaPixels.toDouble()
-            return siblingBaseDurationMs * megaPixelRatio * conditionFactor
+            // Zero until this workload has been measured once. With no size axis left there is no observed
+            // neighbour to price a cold workload from, and one capture earns every key its own base duration.
+            val baseDurationMs = baseDurationByWorkload[workloadKey]?.meanMs() ?: return 0.0
+            return baseDurationMs * conditionFactor
         }
 
         /** Median of [samples], the mean of the middle two when the count is even; 0.0 while empty. */
@@ -277,7 +257,7 @@ class DraftSequenceExecutionPredictor {
 
         /**
          * Running mean of duration with the capture's shared condition divided out. Equal 1/n weights, the deliberate
-         * opposite of the latest-capture condition it pairs with: the base duration converges to a stable per-size
+         * opposite of the latest-capture condition it pairs with: the base duration converges to a stable per-workload
          * anchor instead of chasing a transient, so the transient lives in the condition alone.
          */
         private class EqualWeightedMean {

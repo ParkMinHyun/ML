@@ -90,8 +90,7 @@ class CaptureAvailablePacer(
         // The burst's measured max was measured on undemoted drafts, so drop what demotion took out of this one, and
         // floor it by the whole-draft estimate - all a burst's first capture has, and the same occupancy the backlog
         // clock charges per queued draft, which the node point sum alone would under-price.
-        val maxDraftSequenceDurationMs =
-            session.getMaxDraftSequenceDurationMs(workloadSequenceKey.headWorkloadKey.sizeBucket)
+        val maxDraftSequenceDurationMs = session.getMaxDraftSequenceDurationMs()
         val demotedWorkloadPredictedDurationMs =
             predictor.estimateDemotedWorkloadDurationMs(workloadSequenceKey, draftSequenceKey)
         val draftSequenceReservedDurationMs = maxOf(
@@ -112,14 +111,8 @@ class CaptureAvailablePacer(
 
     /** Pairs with [startDraftSequence] and records the result for subsequent pacing decisions. */
     @Synchronized
-    fun endDraftSequence(sizeBucket: SizeBucket, draftSequenceDurationMs: Long) {
-        captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(sizeBucket, draftSequenceDurationMs)
-    }
-
-    /** Completes a cancelled FIFO draft without feeding a non-observation into the size-scoped maximum. */
-    @Synchronized
-    fun cancelDraftSequence(sizeBucket: SizeBucket) {
-        captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(sizeBucket, 0L)
+    fun endDraftSequence(draftSequenceDurationMs: Long) {
+        captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(draftSequenceDurationMs)
     }
 
     /**
