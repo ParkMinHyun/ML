@@ -15,11 +15,18 @@ Ship the **queue-growth lead term** (`G` below). One extra addend in `computePac
 learned with the trend class the codebase already has, no new constant.
 
 ```
-estimatedCompletionTimeMs = backlogMs + backlogGrowthMs + reserved * PACING_WINDOW_DRAFT_COUNT
+delayMs = ceil( (backlogMs + reserved * PACING_WINDOW_DRAFT_COUNT - timeToDeadlineMs)
+                / PACING_WINDOW_DRAFT_COUNT
+                + backlogGrowthMs )
 ```
 
 where `backlogGrowthMs` is the recency-weighted mean of `backlogMs(k) - backlogMs(k-1)` inside the
 current burst, floored at 0.
+
+**The growth is added after the split, not inside it.** The deficit is a one-off shortfall, so
+halving it hands the other half to the future Draft that shares the window. The growth is a rate:
+the delay that holds a queue rising by G per callback flat is G per callback, and halving it leaves
+a residual ramp of G/2 on every shot. Both forms were measured; §4.1 has the comparison.
 
 Rejected after measurement: pricing against the oldest queued deadline (`D`, 2x the total delay),
 a three-draft horizon (`H3`, needs a new constant), and the clock-price fixes from handoff §6.1
@@ -97,10 +104,10 @@ policy including commit `9217444`.
 
 ### Open loop (handoff §4.3 bounds; `lo` is the conservative one)
 
-| workbook | runs | timeouts | G total delay | TO lo | TO relaxed |
+| workbook | runs | timeouts | total delay | TO lo | TO relaxed |
 |---|---|---|---|---|---|
-| `24MP_memory_0829_original` (selection) | 69 | 14 | +24% | **8 / 14** | 6 / 14 |
-| `12MP_normal_baseline_0829` (holdout) | 59 | 46 | +29% | **19 / 46** | 15 / 46 |
+| `24MP_memory_0829_original` (selection) | 69 | 14 | +51% | **9 / 14** | 7 / 14 |
+| `12MP_normal_baseline_0829` (holdout) | 59 | 46 | +62% | **21 / 46** | 22 / 46 |
 
 Baseline is 0 in every `lo` and `relaxed` cell by construction.
 
@@ -111,10 +118,10 @@ handoff §2 lists it. It scores 8/9, 6/9 and 6/9, which is the selection set res
 
 ### Closed loop
 
-| workbook | HEAD cleared | G cleared | G total delay | new timeouts under G |
+| workbook | HEAD cleared | cleared | total delay | new timeouts |
 |---|---|---|---|---|
-| `24MP_memory_0829_original` | 1 / 14 (5 new) | **6 / 14** | +8% | 2, margins −37 and −8 ms |
-| `12MP_normal_baseline_0829` | 2 / 46 (0 new) | **19 / 46** | +28% | 0 |
+| `24MP_memory_0829_original` | 1 / 14 (5 new) | **4 / 14** | +26% | **0** |
+| `12MP_normal_baseline_0829` | 2 / 46 (0 new) | **22 / 46** | +54% | **0** |
 
 So the honest evidence base is **60 distinct capture timeouts over two independent recordings**: the
 24MP memory set the candidates were chosen on, and the 12MP normal set, which is a different
@@ -126,13 +133,42 @@ and lowers the delay, and where it lowers it early in a burst the shutters move 
 queue deepens sooner. `G` more than compensates (it never lowers the delay) and takes that count to
 2 marginal ones.
 
+### 4.1 Halve the growth, or apply it whole?
+
+Both were measured. `G` halves the growth with the rest of the deficit; `Gw`, what ships, adds it
+after the split.
+
+| | 24MP, 14 timeouts | | 12MP holdout, 46 timeouts | |
+|---|---|---|---|---|
+| | G halved | **Gw whole** | G halved | **Gw whole** |
+| open loop, conservative | 8 | **9** | 19 | **21** |
+| open loop, pessimistic | 6 | **7** | 15 | **22** |
+| closed loop | **6** | 4 | 19 | **22** |
+| new timeouts | 2 | **0** | 0 | **0** |
+| total delay, open loop | +24% | +51% | +29% | +62% |
+| healthy runs, per shot | +58 ms | +121 ms | +0 ms | +0 ms |
+
+`Gw` is more preemptive where it should be: delay in the first half of a burst rises 74% (24MP) and
+112% (12MP) against `G`, but only 13-18% in the second half.
+
+The one place `Gw` loses is the 24MP closed loop, 4 against 6. Two of the 14 runs receive *less*
+total delay under `Gw`: braking harder early flattens the queue, the learned growth collapses to
+zero, and the term has retired itself by the time the queue ramps again. The other 12 runs behave
+as expected. That is a 2-run reversal at n=14 inside the instrument built to evaluate this change,
+against a 3-of-3 win on a holdout with three times the events, so `Gw` was taken. **Watch for it in
+the device A/B** — if the stand-down is real rather than an artefact it will show as a burst that
+paces hard early and then stops.
+
 ### Cost, where it lands (`24MP_memory_0829_original`)
 
 | | healthy runs | runs that timed out |
 |---|---|---|
-| extra delay per shot | +58 ms (p95 +262) | +90 ms (p95 +341) |
-| closed-loop delay p50 / p95 on healthy runs | 0 → 0 ms / 1097 → 1175 ms | |
-| shots carrying any delay, healthy runs | 48% → 52% | |
+| extra delay per shot | +121 ms | +194 ms |
+| closed-loop delay p50 / p95 on healthy runs | 0 → 0 ms / 1097 → 1341 ms | |
+
+This is the change's weakest point against the brief, which asked for the delay not to rise much.
+`G` costs half as much and clears one fewer timeout on each recording. On the 12MP workload the
+question does not arise: healthy bursts there are never paced under either form.
 
 Within a healthy burst the extra concentrates at the front and fades:
 
@@ -141,8 +177,9 @@ Within a healthy burst the extra concentrates at the front and fades:
 | extra ms/shot | +59 | +129 | +100 | +60 | +53 | +48 | +37 | +27 | +28 | +27 |
 
 That shape is the intended behaviour: act while the queue is still shallow, then stop, because the
-queue never gets deep. On `12MP_normal_baseline` the healthy runs pay **0 ms** — they are never
-paced at all — and the whole cost lands on the runs that timed out (+82 ms/shot).
+queue never gets deep. (The decile figures are `G`'s; `Gw` roughly doubles each while keeping the
+same shape.) On `12MP_normal_baseline` the healthy runs pay **0 ms** — they are never paced at all
+— and the whole cost lands on the runs that timed out.
 
 ### Onset — the mechanism
 
@@ -184,7 +221,7 @@ whatever clock price is chosen, so §6.1 does not block it, and shipping `G` doe
 
 ## 6. Implementation — applied 2026-09-02, not committed
 
-Seven files, 72 lines added, 1 changed, 0 deleted. No new file, no new class, no new constant, no
+Seven files, 72 lines added, 1 changed, 0 deleted, plus a one-line follow-up moving the growth outside the split. No new file, no new class, no new constant, no
 migration (`CaptureMetricsDatabase` is pinned at `version = 1` with `fallbackToDestructiveMigration`,
 which is the project's standing arrangement).
 

@@ -166,12 +166,13 @@ internal fun computeLevelDeficitMs(
  * not an exact fixed-point derivation, and no half-deficit value is transferred to Admission. Pacing relies on
  * Admission's later ordinary node-time budget test to shed optional work if residual pressure remains.
  *
- * [backlogGrowthMs] completes the completion-time estimate rather than padding it. Every other term is measured at
- * this instant, but the callback this decision gates joins the queue one arrival later, so on a burst whose Drafts
- * outrun its shot cadence the estimate is short by exactly one arrival of queue growth. Adding the measured growth
- * is what lets the delay land on a shutter that has not fired yet; without it the decision trails the ramp and its
- * delay arrives after the capture it was meant to save. It is a difference and never a running total, so it cannot
- * wind up: once pacing holds the queue flat the samples fall to zero and the term retires itself.
+ * [backlogGrowthMs] is added AFTER that split, deliberately, because the two quantities are not the same kind of
+ * thing. The deficit is a one-off shortfall, so halving it hands the other half to the future Draft that shares the
+ * window. The growth is a rate: the delay that holds a queue rising by G per callback flat is G per callback, and
+ * halving it leaves a residual ramp of G/2 on every shot, which is the case the pacer keeps losing. It is what lets
+ * the delay land on a shutter that has not fired yet; without it the decision trails the ramp and its delay arrives
+ * after the capture it was meant to save. It is a difference and never a running total, so it cannot wind up: once
+ * pacing holds the queue flat the samples fall to zero and the term retires itself.
  */
 internal fun computePacingDelayMs(
     backlogMs: Long,
@@ -179,10 +180,9 @@ internal fun computePacingDelayMs(
     timeToDeadlineMs: Long,
     draftSequenceReservedDurationMs: Double,
 ): Long {
-    val estimatedCompletionTimeMs =
-        backlogMs + backlogGrowthMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
+    val estimatedCompletionTimeMs = backlogMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
     val deadlineDeficitMs = estimatedCompletionTimeMs - timeToDeadlineMs.coerceAtLeast(0L)
-    val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT
+    val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT + backlogGrowthMs
 
     return ceil(pacingDelayMs).toLong().coerceAtLeast(0L)
 }
