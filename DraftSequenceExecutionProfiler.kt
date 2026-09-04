@@ -37,7 +37,8 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     private var draftSequenceNodeList: List<Node> = emptyList()
     private var draftSequenceExecutionSession: DraftSequenceExecutionSession? = null
     private var deviceStateSnapshot: DeviceStateSnapshot? = null
-    private var draftSequenceStartTimeMs = 0L
+    /** When [initialize] started this draft sequence; null until then, which is what "never ran" is read off. */
+    private var draftSequenceStartTimeMs: Long? = null
 
     /**
      * Initializes draft-node-chain profiling and, before any node executes, starts this draft sequence on the pacer -
@@ -170,14 +171,14 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
         draftSequenceExecutionSession?.complete()
         draftSequenceExecutionSession = null
 
-        val draftSequenceDurationMs = if (draftSequenceStartTimeMs > 0L) {
-            (SystemClock.uptimeMillis() - draftSequenceStartTimeMs).coerceAtLeast(0L)
-        } else {
-            0L
-        }
+        val draftSequenceDurationMs = draftSequenceStartTimeMs?.let { startUptimeMs ->
+            (SystemClock.uptimeMillis() - startUptimeMs).coerceAtLeast(0L)
+        } ?: 0L
         modelUpdate.drainOnce()?.let { (workloadDurations, admissionDecisions) ->
             predictor.learnFromCapture(workloadDurations, admissionDecisions, draftSequenceDurationMs)
         }
+        // Before the clock is re-anchored, so a slot this capture never used is not in the queue it is rebuilt from.
+        consumeAdmissionIfNeverStarted()
         // Feed the observed duration into the context used by subsequent two-Draft pacing decisions.
         captureAvailablePacer.endDraftSequence(draftSequenceDurationMs)
 
@@ -188,14 +189,31 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
 
     /**
      * Cancels the pending RESERVED workload without discarding collected samples. A draft that never ran teaches the
-     * session maximum nothing, but its admission was consumed at its start and the backlog clock was advanced by its
-     * predicted work, so the pacer is told rather than left to infer it: the draft end is the clock's only correction
-     * point and this draft will never reach one.
+     * session maximum nothing, which [CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs] enforces on the
+     * duration itself, so the pacer hears nothing here about the model - only about the admission, and only when
+     * there was no draft to consume it. The backlog clock is left to the next draft end.
      */
     fun cancelDraftSequenceExecution() {
         draftSequenceExecutionSession?.cancel()
         draftSequenceExecutionSession = null
-        captureAvailablePacer.cancelDraftSequence()
+        consumeAdmissionIfNeverStarted()
+    }
+
+    /**
+     * Hands back the pacing slot of a capture that entered the Draft pipeline and never started a draft sequence -
+     * one saved as its original image, which is what every task still queued behind a capture timeout is marked to
+     * be. [initialize] consumes that slot for every capture that does start one, and it is the only other consumer,
+     * so without this the capture sits in the admitted queue for the rest of the burst and shifts every later
+     * decision onto the wrong Draft.
+     *
+     * Both terminal paths call it because either can be reached without [initialize]: such a capture is completed on
+     * a watchdog drain and cancelled everywhere else. A null start time is what distinguishes it, the same field
+     * [completeDraftSequenceExecution] already reads for the duration it would otherwise report.
+     */
+    private fun consumeAdmissionIfNeverStarted() {
+        if (draftSequenceStartTimeMs == null) {
+            captureAvailablePacer.skipDraftSequence()
+        }
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {

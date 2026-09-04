@@ -126,16 +126,20 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * A draft that left the queue and then never ran. It teaches the session maximum nothing - the positive-duration
-     * guard in [CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs] would drop it anyway - but the clock
-     * was advanced by its predicted work when its callback was admitted, so it needs the same re-anchor
-     * [endDraftSequence] performs. Without one the cancelled draft's price outlives the draft for the rest of the
-     * burst, and nothing else will notice: the draft end is the clock's only correction point.
+     * A capture that entered the Draft pipeline and will run no draft sequence at all - the original image is saved as
+     * it stands, which is what every task still queued behind a capture timeout is marked to do. It consumes the
+     * admission [startDraftSequence] would have consumed, because the FIFO pairs admissions with pipeline entries
+     * rather than with node chains, and this is the only other way out of it: a capture that took a slot and never
+     * gave it back would sit in the admitted queue for the rest of the burst and shift every later decision onto the
+     * wrong Draft.
+     *
+     * It leaves the clock alone deliberately. [endDraftSequence] rebuilds it from the admitted queue at the next draft
+     * end, so a price this pop just retired cannot outlive one draft, and re-anchoring here would only move that
+     * correction earlier by less than one draft wall.
      */
     @Synchronized
-    fun cancelDraftSequence() {
-        val session = captureAvailablePacingSession ?: return
-        rebaseBacklogClock(session)
+    fun skipDraftSequence() {
+        captureAvailablePacingSession?.dequeuePacingDecision(null)
     }
 
     /**
