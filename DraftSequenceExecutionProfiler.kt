@@ -187,14 +187,15 @@ class DraftSequenceExecutionProfiler @JvmOverloads constructor(
     }
 
     /**
-     * Cancels the pending RESERVED workload without discarding collected samples. The pacer needs no cancellation
-     * hook: this draft's admission was already consumed at its start, and a draft that never ran teaches the
-     * session maximum nothing, which [CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs] enforces on
-     * the duration itself.
+     * Cancels the pending RESERVED workload without discarding collected samples. A draft that never ran teaches the
+     * session maximum nothing, but its admission was consumed at its start and the backlog clock was advanced by its
+     * predicted work, so the pacer is told rather than left to infer it: the draft end is the clock's only correction
+     * point and this draft will never reach one.
      */
     fun cancelDraftSequenceExecution() {
         draftSequenceExecutionSession?.cancel()
         draftSequenceExecutionSession = null
+        captureAvailablePacer.cancelDraftSequence()
     }
 
     private fun resolveWorkloadSequenceKey(node: Node, workloadKey: WorkloadKey): List<WorkloadKey> {

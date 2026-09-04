@@ -108,14 +108,34 @@ class CaptureAvailablePacer(
                 draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
                 draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
                 workloadSequencePredictedDurationMs = predictor.estimateWorkloadSequenceDurationMs(draftSequenceKey),
+                draftSequenceWorkloadKey = draftSequenceKey,
             ),
         )
     }
 
-    /** Pairs with [startDraftSequence] and records the result for subsequent pacing decisions. */
+    /**
+     * Pairs with [startDraftSequence]: records the measured wall for subsequent reserves, then re-anchors the backlog
+     * clock. This is the instant the pipeline knows the most - the predictor has just learned from this draft, one
+     * line before this call - and with nothing running the admitted queue is the whole of the remaining work.
+     */
     @Synchronized
     fun endDraftSequence(draftSequenceDurationMs: Long) {
-        captureAvailablePacingSession?.updateMaxDraftSequenceDurationMs(draftSequenceDurationMs)
+        val session = captureAvailablePacingSession ?: return
+        session.updateMaxDraftSequenceDurationMs(draftSequenceDurationMs)
+        rebaseBacklogClock(session)
+    }
+
+    /**
+     * A draft that left the queue and then never ran. It teaches the session maximum nothing - the positive-duration
+     * guard in [CaptureAvailablePacingSession.updateMaxDraftSequenceDurationMs] would drop it anyway - but the clock
+     * was advanced by its predicted work when its callback was admitted, so it needs the same re-anchor
+     * [endDraftSequence] performs. Without one the cancelled draft's price outlives the draft for the rest of the
+     * burst, and nothing else will notice: the draft end is the clock's only correction point.
+     */
+    @Synchronized
+    fun cancelDraftSequence() {
+        val session = captureAvailablePacingSession ?: return
+        rebaseBacklogClock(session)
     }
 
     /**
@@ -143,6 +163,18 @@ class CaptureAvailablePacer(
     @Synchronized
     fun clear() {
         captureAvailablePacingSession = null
+    }
+
+    /**
+     * Rebuilds the backlog clock from the admitted queue at the predictor's current state. The predictor is asked
+     * again per queued draft rather than trusting the snapshot each one was admitted with, because those snapshots
+     * are as old as the queue is deep and a heating pipeline makes all of them cheap.
+     */
+    private fun rebaseBacklogClock(session: CaptureAvailablePacingSession) {
+        session.rebaseBacklogClock(
+            draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
+            estimateWorkloadSequenceDurationMs = predictor::estimateWorkloadSequenceDurationMs,
+        )
     }
 
     /** Returns the burst session, opening it for the first pacing callback. */
@@ -200,6 +232,12 @@ data class CaptureAvailablePacingSnapshot(
      */
     val draftSequenceReservedDurationMs: Double,
     val draftSequenceKey: String,
+    /**
+     * The demoted shape [draftSequenceKey] spells out, kept typed so a queued draft can be re-priced against a
+     * predictor that has learned since it was admitted. [draftSequenceKey] stays a string because it is what the
+     * metrics store and the offline replay read, and neither can hold a live key.
+     */
+    val draftSequenceWorkloadKey: WorkloadSequenceKey,
 )
 
 /** One captureAvailable pacing decision and the inputs that produced it. */
