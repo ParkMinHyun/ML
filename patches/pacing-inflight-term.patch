@@ -1,0 +1,418 @@
+Pacing: the in-flight capture term (unseenCaptureWorkMs) plus the three 2026-09-04 follow-ups.
+
+Set aside on 2026-09-04 so the backlog-clock rebase change could be measured separately.
+Base commit: 8d5e55d  ("Stop halving the queue growth with the deficit")
+Design document: PacingInFlightHandoff.md  (sections 4-6 describe exactly this diff)
+Status when set aside: never compiled, never measured on device.
+
+Re-apply with a three-way merge, not a plain apply. Measured on 2026-09-04 against the
+backlog-clock change that replaced this in the tree: seven of the eight files apply cleanly, and
+CaptureAvailablePacer.kt conflicts once - where this patch's setCaptureDeadlineMs and snapshot
+hunks meet that change's endDraftSequence and cancelDraftSequence.
+
+    git add -A && git apply -3 patches/pacing-inflight-term.patch
+
+"git apply -3" needs the index to match the worktree, so commit or stage first, or it stops at
+"does not match index" before merging anything. "git stash apply" is the equivalent route.
+
+An identical copy is in the stash entry made at the same moment (git stash list), verified byte
+for byte against this file.
+
+diff --git a/CaptureAvailablePacer.kt b/CaptureAvailablePacer.kt
+index 0289095..9abcce1 100644
+--- a/CaptureAvailablePacer.kt
++++ b/CaptureAvailablePacer.kt
+@@ -30,8 +30,9 @@ class CaptureAvailablePacer(
+      * The burst in progress and the pacer's only mutable state, so [clear] resets everything by dropping it. The pacer
+      * outlives every session: the APM side holds this one reference and must stay able to answer "no delay".
+      *
+-     * Only [decideDelay] opens a session. The deadline setter intentionally drops values received before that first
+-     * callback: without a pacing snapshot there is no decision they could affect. The session's
++     * A burst begins at whichever comes first, [decideDelay] or [setCaptureDeadlineMs] - the first capture committed to
++     * the pipeline is as much this burst's beginning as the first callback that priced one, and the deadlines arriving
++     * before that callback are what the shutter cadence is learned from. The session's
+      * [CaptureAvailablePacingSession.createdUptimeMs] remains the burst identity offline grouping reads.
+      */
+     private var captureAvailablePacingSession: CaptureAvailablePacingSession? = null
+@@ -53,9 +54,14 @@ class CaptureAvailablePacer(
+         val backlogMs = session.backlogMsAt(nowUptimeMs)
+         val backlogGrowthMs = session.observeBacklogGrowthMs(backlogMs)
+         val draftSequenceReservedDurationMs = snapshot.draftSequenceReservedDurationMs
++        val shutterIntervalMs = session.getShutterIntervalMs()
++        val shutterLagMs = session.observeShutterLagMs(timeToDeadlineMs)
+         val pacingDelayMs = computePacingDelayMs(
+             backlogMs = backlogMs,
+             backlogGrowthMs = backlogGrowthMs,
++            queuedDraftCount = session.queuedDraftCount,
++            shutterIntervalMs = shutterIntervalMs,
++            shutterLagMs = shutterLagMs,
+             timeToDeadlineMs = timeToDeadlineMs,
+             draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
+         )
+@@ -64,6 +70,8 @@ class CaptureAvailablePacer(
+             delayMs = pacingDelayMs,
+             backlogMs = backlogMs,
+             backlogGrowthMs = backlogGrowthMs,
++            shutterIntervalMs = shutterIntervalMs,
++            shutterLagMs = shutterLagMs,
+             queuedDraftCount = session.queuedDraftCount,
+             queuedPredictedWorkMs = session.queuedPredictedWorkMs,
+             timeToDeadlineMs = timeToDeadlineMs,
+@@ -119,13 +127,15 @@ class CaptureAvailablePacer(
+     }
+ 
+     /**
+-     * Replaces the deadline that the admitted backlog is priced against with the newest committed capture's deadline.
+-     * A missing session means the first pacing callback has not opened this burst yet, so the value is intentionally
+-     * dropped rather than opening state from this secondary hook.
++     * Replaces the deadline that the admitted backlog is priced against with the newest committed capture's deadline,
++     * opening the burst session if this commit is the first thing the pacer has seen. It opens one because the deadline
++     * stream is where the shutter cadence is learned, and a burst that outruns the pipeline commits several captures
++     * before its first callback reaches the decider - dropping those deadlines leaves the earliest decisions, the only
++     * ones whose delay can still reach an unfired shutter, with no cadence to count in-flight captures against.
+      */
+     @Synchronized
+     fun setCaptureDeadlineMs(timeoutTimestampMs: Long) {
+-        captureAvailablePacingSession?.updateBacklogDeadlineMs(timeoutTimestampMs)
++        openSession().updateBacklogDeadlineMs(timeoutTimestampMs)
+     }
+ 
+     /**
+@@ -145,7 +155,7 @@ class CaptureAvailablePacer(
+         captureAvailablePacingSession = null
+     }
+ 
+-    /** Returns the burst session, opening it for the first pacing callback. */
++    /** Returns the burst session, opening it for this burst's first committed capture or first pacing callback. */
+     private fun openSession(): CaptureAvailablePacingSession =
+         captureAvailablePacingSession
+             ?: CaptureAvailablePacingSession().also { captureAvailablePacingSession = it }
+@@ -177,16 +187,61 @@ internal fun computeLevelDeficitMs(
+ internal fun computePacingDelayMs(
+     backlogMs: Long,
+     backlogGrowthMs: Double,
++    queuedDraftCount: Int,
++    shutterIntervalMs: Double,
++    shutterLagMs: Double,
+     timeToDeadlineMs: Long,
+     draftSequenceReservedDurationMs: Double,
+ ): Long {
+-    val estimatedCompletionTimeMs = backlogMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
++    val unseenCaptureWorkMs = estimateUnseenCaptureWorkMs(
++        queuedDraftCount = queuedDraftCount,
++        shutterIntervalMs = shutterIntervalMs,
++        shutterLagMs = shutterLagMs,
++        timeToDeadlineMs = timeToDeadlineMs,
++        draftSequenceReservedDurationMs = draftSequenceReservedDurationMs,
++    )
++    val estimatedCompletionTimeMs =
++        backlogMs + unseenCaptureWorkMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
+     val deadlineDeficitMs = estimatedCompletionTimeMs - timeToDeadlineMs.coerceAtLeast(0L)
+     val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT + backlogGrowthMs
+ 
+     return ceil(pacingDelayMs).toLong().coerceAtLeast(0L)
+ }
+ 
++/**
++ * Committed work the backlog clock cannot see yet. The clock counts only what pacing has admitted, but a decision
++ * describes a capture shot [shutterLagMs] ago, and every shot taken since is already committed to this pipeline.
++ * Divide that lag by the burst's shutter cadence and the count falls out.
++ *
++ * The two subtractions are what keep this at zero on a burst the pipeline is keeping up with, rather than taxing it:
++ * [PACING_WINDOW_DRAFT_COUNT] of those captures are the reserves the deficit already prices, and
++ * [queuedDraftCount] more are already inside [backlogMs]. Only the remainder is unpriced.
++ *
++ * It is the feedforward half of the pair: the growth trend has to watch the queue rise before it can report one, and
++ * a burst that outruns the pipeline is over before it has watched enough. This needs two deadlines, which arrive
++ * before the burst's first Draft has finished.
++ *
++ * The count is capped by the arrivals [timeToDeadlineMs] still has room for, which is what keeps a stalled deadline
++ * stream from reading as an enormous burst: the lag grows without bound once commits stop arriving, and the window it
++ * is charged against is the same window that is closing. On a burst still filling, the lag is far shorter than the
++ * window and the cap is inert.
++ */
++private fun estimateUnseenCaptureWorkMs(
++    queuedDraftCount: Int,
++    shutterIntervalMs: Double,
++    shutterLagMs: Double,
++    timeToDeadlineMs: Long,
++    draftSequenceReservedDurationMs: Double,
++): Double {
++    if (shutterIntervalMs <= 0.0) {
++        return 0.0
++    }
++    val remainingWindowCaptureCount = timeToDeadlineMs.coerceAtLeast(0L) / shutterIntervalMs
++    val inFlightCaptureCount = (shutterLagMs / shutterIntervalMs).coerceAtMost(remainingWindowCaptureCount)
++    val unseenCaptureCount = inFlightCaptureCount - PACING_WINDOW_DRAFT_COUNT - queuedDraftCount
++    return (unseenCaptureCount * draftSequenceReservedDurationMs).coerceAtLeast(0.0)
++}
++
+ /** What one draft start hands the next captureAvailable decision to price with. */
+ data class CaptureAvailablePacingSnapshot(
+     val draftSequenceBudgetMs: Long,
+@@ -208,6 +263,10 @@ data class CaptureAvailablePacingDecision(
+     val backlogMs: Long,
+     /** Learned per-callback growth of [backlogMs] in this burst, added once to the completion-time estimate. */
+     val backlogGrowthMs: Double,
++    /** Learned shot-to-shot of this burst; with [shutterLagMs] it counts the captures the backlog cannot see. */
++    val shutterIntervalMs: Double,
++    /** Learned age of the capture a decision prices - how far behind the shutter stream this burst's decisions run. */
++    val shutterLagMs: Double,
+     val queuedDraftCount: Int,
+     val queuedPredictedWorkMs: Double,
+     /** Window remaining on the newest committed capture deadline when this decision was made. */
+diff --git a/CaptureAvailablePacingSession.kt b/CaptureAvailablePacingSession.kt
+index 84dbbe4..741aa96 100644
+--- a/CaptureAvailablePacingSession.kt
++++ b/CaptureAvailablePacingSession.kt
+@@ -52,15 +52,32 @@ internal class CaptureAvailablePacingSession {
+     /**
+      * How much the admitted backlog grew between each pair of this burst's callbacks. The decision prices the queue
+      * as it stands, but the callback it gates is released one arrival later, so a burst filling faster than it drains
+-     * is already behind by one of these before its delay takes effect. Recency-weighted like every other learned
+-     * trend here, so a burst that has begun to converge stops paying for how it started - and per burst, because it
+-     * describes this shot cadence against this thermal state, not the device.
++     * is already behind by one of these before its delay takes effect. A shrinking queue is a real observation, so a
++     * negative difference is kept and lowers the trend.
+      */
+     private val backlogGrowthsMs = RecencyWeightedDistribution()
+ 
+     /** The previous callback's backlog, the other half of a difference; null until this burst has decided once. */
+     private var lastBacklogMs: Long? = null
+ 
++    /**
++     * Shot-to-shot time of this burst, learned from the deadline stream. Every capture committed to the pipeline
++     * announces its deadline through [updateBacklogDeadlineMs], so consecutive deadlines give the cadence from this
++     * burst's second capture - before any Draft has finished, and long before the growth trend has two decisions to
++     * difference. That is the whole reason it is read from here rather than from the decisions: on a burst that
++     * outruns the pipeline the decisions arrive far too late to describe how fast the user is shooting.
++     */
++    private val shutterIntervalsMs = RecencyWeightedDistribution()
++
++    /**
++     * How far behind the shutter stream this burst's decisions run: the age of the capture each decision prices, which
++     * is the part of its timeout window already spent when the pacer first sees it. Recency-weighted like every other
++     * trend here, because one deadline is one sample - [backlogDeadlineMs] tracks whichever capture was committed most
++     * recently, so a commit landing just before a decision resets the raw value and would switch the unseen-capture
++     * term off in the middle of a burst that is still filling.
++     */
++    private val shutterLagsMs = RecencyWeightedDistribution()
++
+     val queuedDraftCount: Int get() = pendingDecisions.size
+ 
+     /** Point work of every queued draft - the part of pending occupancy the metrics report separately. */
+@@ -120,11 +137,42 @@ internal class CaptureAvailablePacingSession {
+         }
+     }
+ 
+-    /** Replaces the backlog deadline with the newest committed capture's timeout timestamp. */
++    /**
++     * Replaces the backlog deadline with the newest committed capture's timeout timestamp, and teaches the gap to
++     * the shutter cadence on the way past - this is the only place a burst's shot rate is observable before its
++     * first Draft has finished.
++     */
+     fun updateBacklogDeadlineMs(deadlineUptimeMs: Long) {
++        // A deadline that has not moved forward is the same capture announced twice, not another shot. The deadline
++        // this is about to replace is the previous one, so the cadence needs no second copy of it to compare with.
++        val previousDeadlineUptimeMs = backlogDeadlineMs
++        if (previousDeadlineUptimeMs != null && deadlineUptimeMs > previousDeadlineUptimeMs) {
++            shutterIntervalsMs.decay()
++            shutterIntervalsMs.add((deadlineUptimeMs - previousDeadlineUptimeMs).toDouble())
++        }
+         backlogDeadlineMs = deadlineUptimeMs
+     }
+ 
++    /**
++     * Mean shot-to-shot of this burst, 0 until two captures have been committed. Zero disables the unseen-capture
++     * term rather than defaulting it, because a cadence nothing has measured is not a cadence.
++     */
++    fun getShutterIntervalMs(): Double = shutterIntervalsMs.mean()
++
++    /**
++     * Teaches this decision's shutter lag to the trend and reads the trend back including it. Call exactly once per
++     * decision, with the [timeToDeadlineMs] that decision was priced against - like [observeBacklogGrowthMs], a caller
++     * that read the trend without teaching it would describe an arbitrary subset of the burst.
++     *
++     * Not floored: the lag is an age, always non-negative, and a burst whose callbacks are catching up on the shutter
++     * stream is entitled to have the term relax.
++     */
++    fun observeShutterLagMs(timeToDeadlineMs: Long): Double {
++        shutterLagsMs.decay()
++        shutterLagsMs.add((MakerFeature.CAPTURE_TIMEOUT_MS - timeToDeadlineMs.coerceAtLeast(0L)).toDouble())
++        return shutterLagsMs.mean()
++    }
++
+     /**
+      * The heaviest Draft this burst has measured, whatever frame size produced it. Every Draft in the burst shares
+      * one thermal and memory state, so the heaviest observed occupancy is the honest price of the next one; scoping
+diff --git a/CaptureMetrics.kt b/CaptureMetrics.kt
+index 19f0421..c715e34 100644
+--- a/CaptureMetrics.kt
++++ b/CaptureMetrics.kt
+@@ -73,6 +73,16 @@ data class CaptureAvailablePacingMetrics(
+      * replay a different controller than the one that ran.
+      */
+     val backlogGrowthMs: Double,
++    /**
++     * Learned shot-to-shot of the burst. With [shutterLagMs] it counts the captures already committed to the
++     * pipeline that [backlogMs] cannot see, so the exporter needs it to re-evaluate the shared delay formula.
++     */
++    val shutterIntervalMs: Double,
++    /**
++     * Learned age of the capture this decision priced. A trend, not [timeToDeadlineMs]'s complement on this one row,
++     * so the exporter cannot recover it from the other columns and has to read it back to replay the same controller.
++     */
++    val shutterLagMs: Double,
+     val queuedDraftCount: Int,
+     val queuedPredictedWorkMs: Double,
+     /** Remaining window on the latest committed capture deadline that the two-Draft pacing decision used. */
+diff --git a/CaptureMetricsEntities.kt b/CaptureMetricsEntities.kt
+index 84c3e38..655dd43 100644
+--- a/CaptureMetricsEntities.kt
++++ b/CaptureMetricsEntities.kt
+@@ -96,6 +96,12 @@ data class CaptureAvailablePacingMetricsEntity(
+     @ColumnInfo(name = "backlog_growth_ms")
+     val backlogGrowthMs: Double,
+ 
++    @ColumnInfo(name = "shutter_interval_ms")
++    val shutterIntervalMs: Double,
++
++    @ColumnInfo(name = "shutter_lag_ms")
++    val shutterLagMs: Double,
++
+     @ColumnInfo(name = "queued_draft_count")
+     val queuedDraftCount: Int,
+ 
+diff --git a/CaptureMetricsExcelExporter.kt b/CaptureMetricsExcelExporter.kt
+index 31fa780..d3fe137 100644
+--- a/CaptureMetricsExcelExporter.kt
++++ b/CaptureMetricsExcelExporter.kt
+@@ -1758,6 +1758,9 @@ class CaptureMetricsExcelExporter(
+         val afterAppliedDelayMs: Long = computePacingDelayMs(
+             backlogMs = before.backlogMs,
+             backlogGrowthMs = before.backlogGrowthMs,
++            queuedDraftCount = before.queuedDraftCount,
++            shutterIntervalMs = before.shutterIntervalMs,
++            shutterLagMs = before.shutterLagMs,
+             timeToDeadlineMs = before.timeToDeadlineMs,
+             draftSequenceReservedDurationMs = before.draftSequenceReservedDurationMs,
+         )
+@@ -2529,6 +2532,9 @@ class CaptureMetricsExcelExporter(
+                     computePacingDelayMs(
+                         backlogMs = pacing.backlogMs,
+                         backlogGrowthMs = pacing.backlogGrowthMs,
++                        queuedDraftCount = pacing.queuedDraftCount,
++                        shutterIntervalMs = pacing.shutterIntervalMs,
++                        shutterLagMs = pacing.shutterLagMs,
+                         timeToDeadlineMs = pacing.timeToDeadlineMs,
+                         draftSequenceReservedDurationMs = pacing.draftSequenceReservedDurationMs,
+                     )
+@@ -2539,6 +2545,9 @@ class CaptureMetricsExcelExporter(
+                     computePacingDelayMs(
+                         backlogMs = pacing.backlogMs,
+                         backlogGrowthMs = pacing.backlogGrowthMs,
++                        queuedDraftCount = pacing.queuedDraftCount,
++                        shutterIntervalMs = pacing.shutterIntervalMs,
++                        shutterLagMs = pacing.shutterLagMs,
+                         timeToDeadlineMs = pacing.timeToDeadlineMs,
+                         draftSequenceReservedDurationMs = pacing.draftSequenceReservedDurationMs,
+                     ) > 0L
+@@ -2763,6 +2772,22 @@ class CaptureMetricsExcelExporter(
+             // Learned per-callback queue growth the decision added to its completion-time estimate. Without it a
+             // replay of these rows prices a proportional-only controller, not the one that ran.
+             Column("beforeBacklogGrowthMs") { it.row.pacingReplay?.before?.backlogGrowthMs },
++            // Learned shot-to-shot of the burst. Divided into beforeShutterLagMs it gives the captures already
++            // committed to the pipeline that the backlog clock has not seen.
++            Column("beforeShutterIntervalMs") { it.row.pacingReplay?.before?.shutterIntervalMs },
++            // The trend, not this row's beforeShutterToDecisionMs: the decision counted in-flight captures against the
++            // burst's learned lag, so a replay reading the single-row complement scores a different controller.
++            Column("beforeShutterLagMs") { it.row.pacingReplay?.before?.shutterLagMs },
++            Column("beforeUnseenCaptureCount") {
++                val p = it.row.pacingReplay?.before
++                val intervalMs = p?.shutterIntervalMs
++                if (p == null || intervalMs == null || intervalMs <= 0.0) {
++                    null
++                } else {
++                    minOf(p.shutterLagMs, p.timeToDeadlineMs.coerceAtLeast(0L).toDouble()) / intervalMs -
++                        PACING_WINDOW_DRAFT_COUNT - p.queuedDraftCount
++                }
++            },
+             Column("beforeQueuedDraftCount") { it.row.pacingReplay?.before?.queuedDraftCount },
+             Column("beforeQueuedPredictedWorkMs") {
+                 it.row.pacingReplay?.before?.queuedPredictedWorkMs
+@@ -2877,6 +2902,16 @@ class CaptureMetricsExcelExporter(
+                     "proportional-only controller against rows produced by a proportional-plus-lead one. Rows " +
+                     "exported before this column exists carry no growth and must be replayed as 0.",
+             ),
++            ReplayNote(
++                topic = "Pacing in-flight captures",
++                note = "beforeShutterLagMs over beforeShutterIntervalMs is how many captures were already committed " +
++                    "to the pipeline when a decision was priced; the ones past the two-Draft horizon and past " +
++                    "beforeQueuedDraftCount are charged a reserve each, because the backlog clock counts only what " +
++                    "pacing admitted. Both are learned trends of the burst, so a replay that recomputes the lag as " +
++                    "captureTimeoutMs minus this row's beforeTimeToDeadlineMs scores a different controller. The " +
++                    "count is capped by the arrivals the remaining window has room for. Rows exported before these " +
++                    "columns exist carry no cadence and must be replayed with the term at 0.",
++            ),
+             ReplayNote(
+                 topic = "Pacing prediction scope",
+                 note = "after pacing reuses the recorded draft-sequence prediction, ceiling, and backlog. Changes to " +
+diff --git a/CaptureMetricsMappers.kt b/CaptureMetricsMappers.kt
+index 2523a2a..1a8e661 100644
+--- a/CaptureMetricsMappers.kt
++++ b/CaptureMetricsMappers.kt
+@@ -16,6 +16,8 @@ fun CaptureAvailablePacingDecision.toCaptureAvailablePacingMetrics(): CaptureAva
+         ),
+         backlogMs = backlogMs,
+         backlogGrowthMs = backlogGrowthMs,
++        shutterIntervalMs = shutterIntervalMs,
++        shutterLagMs = shutterLagMs,
+         queuedDraftCount = queuedDraftCount,
+         queuedPredictedWorkMs = queuedPredictedWorkMs,
+         timeToDeadlineMs = timeToDeadlineMs,
+@@ -61,6 +63,8 @@ fun CaptureAvailablePacingMetrics.toEntity(): CaptureAvailablePacingMetricsEntit
+         levelDeficitMs = levelDeficitMs,
+         backlogMs = backlogMs,
+         backlogGrowthMs = backlogGrowthMs,
++        shutterIntervalMs = shutterIntervalMs,
++        shutterLagMs = shutterLagMs,
+         queuedDraftCount = queuedDraftCount,
+         queuedPredictedWorkMs = queuedPredictedWorkMs,
+         timeToDeadlineMs = timeToDeadlineMs,
+@@ -220,6 +224,8 @@ fun CaptureAvailablePacingMetricsEntity.toModel(): CaptureAvailablePacingMetrics
+         levelDeficitMs = levelDeficitMs,
+         backlogMs = backlogMs,
+         backlogGrowthMs = backlogGrowthMs,
++        shutterIntervalMs = shutterIntervalMs,
++        shutterLagMs = shutterLagMs,
+         queuedDraftCount = queuedDraftCount,
+         queuedPredictedWorkMs = queuedPredictedWorkMs,
+         timeToDeadlineMs = timeToDeadlineMs,
+diff --git a/external/apm/policy/CaptureAvailableApmPolicy.java b/external/apm/policy/CaptureAvailableApmPolicy.java
+index db7a81f..39d54f3 100644
+--- a/external/apm/policy/CaptureAvailableApmPolicy.java
++++ b/external/apm/policy/CaptureAvailableApmPolicy.java
+@@ -163,6 +163,7 @@ public class CaptureAvailableApmPolicy extends ApmPolicy {
+                     + ", draftSequenceReservedDuration=" + pacingSnapshot.getDraftSequenceReservedDurationMs() + "ms"
+                     + ", admittedBacklog=" + pacingDecision.getBacklogMs() + "ms"
+                     + ", backlogGrowth=" + pacingDecision.getBacklogGrowthMs() + "ms"
++                    + ", shutterInterval=" + pacingDecision.getShutterIntervalMs() + "ms"
+                     + ", draftSequenceKey=" + pacingSnapshot.getDraftSequenceKey();
+         }
+ 
+diff --git a/external/draftSaving/SavingDraftImageTaskManager.java b/external/draftSaving/SavingDraftImageTaskManager.java
+index 0dc2c48..a945174 100644
+--- a/external/draftSaving/SavingDraftImageTaskManager.java
++++ b/external/draftSaving/SavingDraftImageTaskManager.java
+@@ -133,8 +133,9 @@ public class SavingDraftImageTaskManager {
+             // scheduling time so multi-draft captures do not build one dead profiler per intermediate request.
+             final CaptureMetrics captureMetrics = savingDraftImageTask.extraBundle.get(ExtraBundle.DATA_CAPTURE_METRICS);
+             ConditionChecker.checkNotNull(captureMetrics, "captureMetrics");
+-            // Keep the session's single backlog deadline on the newest capture accepted by the Draft pipeline.
+-            // decideDelay opens the session earlier in this path; the non-null getter also covers delayed timestamps.
++            // Keep the session's single backlog deadline on the newest capture accepted by the Draft pipeline, and
++            // teach the burst's shutter cadence. This path runs whether or not APM has published the decider yet, so
++            // it opens the session when it is first; the non-null getter also covers delayed timestamps.
+             captureAvailablePacer.setCaptureDeadlineMs(captureMetrics.getTimeoutTimestampMsOrDefault());
+             savingDraftImageTask.extraBundle.put(ExtraBundle.DATA_DRAFT_SEQUENCE_EXECUTION_PROFILER,
+                     new DraftSequenceExecutionProfiler(
