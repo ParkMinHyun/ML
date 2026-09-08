@@ -204,9 +204,9 @@ internal fun computePacingDelayMs(
     timeToDeadlineMs: Long,
     draftSequenceReservedDurationMs: Double,
 ): Long {
-    val estimatedCompletionTimeMs = backlogMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
+    val estimatedCompletionTimeMs = backlogMs + backlogGrowthMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
     val deadlineDeficitMs = estimatedCompletionTimeMs - timeToDeadlineMs.coerceAtLeast(0L)
-    val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT + backlogGrowthMs
+    val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT
 
     return ceil(pacingDelayMs).toLong().coerceAtLeast(0L)
 }

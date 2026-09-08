@@ -1,5 +1,4 @@
 .codex/
-.codex_tmp_xlsx/
-.codex_sheet_analysis/
+.codex*/
 .agents/
 .claude/settings.local.json
