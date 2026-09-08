@@ -90,14 +90,11 @@ class CaptureAvailablePacer(
             return session.dequeuePacingDecision(null)
         }
         val draftSequenceKey = admissionPolicy.resolveDraftSequenceKey(workloadSequenceKey)
-        // The burst's measured max was measured on undemoted drafts, so drop what demotion took out of this one, and
-        // floor it by the whole-draft estimate - all a burst's first capture has, and the same occupancy the backlog
-        // clock charges per queued draft, which the node point sum alone would under-price.
-        val maxDraftSequenceDurationMs = session.getMaxDraftSequenceDurationMs()
+        val expectedDraftSequenceDurationMs = session.getReservedDraftSequenceDurationMs()
         val demotedWorkloadPredictedDurationMs =
             predictor.estimateDemotedWorkloadDurationMs(workloadSequenceKey, draftSequenceKey)
         val draftSequenceReservedDurationMs = maxOf(
-            maxDraftSequenceDurationMs - demotedWorkloadPredictedDurationMs,
+            expectedDraftSequenceDurationMs - demotedWorkloadPredictedDurationMs,
             predictor.estimateDraftSequenceDurationMs(draftSequenceKey),
         )
 
@@ -114,15 +111,18 @@ class CaptureAvailablePacer(
     }
 
     /**
-     * Pairs with [startDraftSequence]: records the measured wall for subsequent reserves, then re-anchors the backlog
+     * Pairs with [startDraftSequence]: teaches the measured wall to subsequent reserves, then re-anchors the backlog
      * clock. This is the instant the pipeline knows the most - the predictor has just learned from this draft, one
      * line before this call - and with nothing running the admitted queue is the whole of the remaining work.
      */
     @Synchronized
     fun endDraftSequence(draftSequenceDurationMs: Long) {
         val session = captureAvailablePacingSession ?: return
-        session.updateMaxDraftSequenceDurationMs(draftSequenceDurationMs)
-        rebaseBacklogClock(session)
+        session.observeDraftSequenceDurationMs(draftSequenceDurationMs)
+        session.rebaseBacklogClock(
+            draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
+            estimateWorkloadSequenceDurationMs = predictor::estimateWorkloadSequenceDurationMs,
+        )
     }
 
     /**
@@ -167,18 +167,6 @@ class CaptureAvailablePacer(
     @Synchronized
     fun clear() {
         captureAvailablePacingSession = null
-    }
-
-    /**
-     * Rebuilds the backlog clock from the admitted queue at the predictor's current state. The predictor is asked
-     * again per queued draft rather than trusting the snapshot each one was admitted with, because those snapshots
-     * are as old as the queue is deep and a heating pipeline makes all of them cheap.
-     */
-    private fun rebaseBacklogClock(session: CaptureAvailablePacingSession) {
-        session.rebaseBacklogClock(
-            draftSequenceOverheadDurationMs = predictor.estimateDraftSequenceOverheadDurationMs(),
-            estimateWorkloadSequenceDurationMs = predictor::estimateWorkloadSequenceDurationMs,
-        )
     }
 
     /** Returns the burst session, opening it for the first pacing callback. */
