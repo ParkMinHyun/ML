@@ -190,13 +190,18 @@ internal fun computeLevelDeficitMs(
  * not an exact fixed-point derivation, and no half-deficit value is transferred to Admission. Pacing relies on
  * Admission's later ordinary node-time budget test to shed optional work if residual pressure remains.
  *
- * [backlogGrowthMs] is added AFTER that split, deliberately, because the two quantities are not the same kind of
- * thing. The deficit is a one-off shortfall, so halving it hands the other half to the future Draft that shares the
- * window. The growth is a rate: the delay that holds a queue rising by G per callback flat is G per callback, and
- * halving it leaves a residual ramp of G/2 on every shot, which is the case the pacer keeps losing. It is what lets
- * the delay land on a shutter that has not fired yet; without it the decision trails the ramp and its delay arrives
- * after the capture it was meant to save. It is a difference and never a running total, so it cannot wind up: once
- * pacing holds the queue flat the samples fall to zero and the term retires itself.
+ * [backlogGrowthMs] projects the queue one arrival ahead, which is what lets the delay land on a shutter that has not
+ * fired yet; without it the decision trails the ramp and its delay arrives after the capture it was meant to save. It
+ * is a difference and never a running total, so it cannot wind up: once pacing holds the queue flat the samples fall
+ * to zero and the term retires itself.
+ *
+ * The delay is bounded by one representative Draft plus that growth, which is the share this decision is entitled to
+ * hold a shutter for. Reading the delay back as
+ * `draftSequenceReservedDurationMs + (backlogMs + backlogGrowthMs - timeToDeadlineMs) / 2` splits it in two: the
+ * Draft this capture itself adds to the pipeline, and half of however far the admitted queue already overruns the
+ * window. The second part is a debt earlier captures ran up, and holding one shutter cannot retire it - the queued
+ * work does not finish any sooner for waiting, and the deadline being priced belongs to a capture already inside the
+ * queue. So only the growth's worth of it is honoured here; residual pressure past that is Admission's to shed.
  */
 internal fun computePacingDelayMs(
     backlogMs: Long,
@@ -207,8 +212,9 @@ internal fun computePacingDelayMs(
     val estimatedCompletionTimeMs = backlogMs + backlogGrowthMs + (draftSequenceReservedDurationMs * PACING_WINDOW_DRAFT_COUNT)
     val deadlineDeficitMs = estimatedCompletionTimeMs - timeToDeadlineMs.coerceAtLeast(0L)
     val pacingDelayMs = deadlineDeficitMs / PACING_WINDOW_DRAFT_COUNT
+    val pacingDelayUpperBoundMs = (draftSequenceReservedDurationMs + backlogGrowthMs).toLong()
 
-    return ceil(pacingDelayMs).toLong().coerceAtLeast(0L)
+    return ceil(pacingDelayMs).toLong().coerceIn(0L, pacingDelayUpperBoundMs)
 }
 
 /** What one draft start hands the next captureAvailable decision to price with. */
